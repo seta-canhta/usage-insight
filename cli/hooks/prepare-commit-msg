@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Append AI-Run-Id / AI-Agent trailers to a commit made during an agent run.
+
+Installed by ``./insight install-hook``. Git calls this with the path to the
+commit message file.
+
+A marker like ``[AUTH_BY_COPILOT]`` says AI was involved. This trailer says
+*which run*, which is the only thing that lets a commit be joined to its token
+cost. They are not the same claim and must not be treated as one.
+
+Three rules, because a commit hook that gets any of them wrong is worse than no
+hook at all:
+
+1. **Never fail a commit.** Any error here exits 0 and writes nothing. Telemetry
+   that can block someone's commit will be deleted within the week, and rightly.
+2. **Never touch the subject.** The subject carries the provenance markers other
+   tooling parses. Trailers go at the end, after a blank line.
+3. **Never invent a run.** With no open run in the buffer, this does nothing.
+   A fabricated run id would manufacture a join key and put a human commit's
+   cost on an agent's account.
+"""
+
+import json
+import os
+import sys
+
+BUFFER = os.path.join(os.path.expanduser("~"), ".aiep", "telemetry")
+#: Older than this and the run is stale -- someone left a terminal open rather
+#: than being mid-run. Attaching a day-old run to a fresh commit is a wrong
+#: join, and a wrong join is worse than a missing one.
+MAX_AGE_SECONDS = 4 * 60 * 60
+
+
+def buffer_files():
+    """Walk the buffer. emit.py writes into pending/, not the top level.
+
+    Listing only the top level finds the directories and none of the events,
+    which produces "no run is open" on every commit -- correct-looking output
+    from a search that never looked anywhere.
+    """
+    found = []
+    for root, _dirs, files in os.walk(BUFFER):
+        for name in sorted(files):
+            if name.endswith(".ndjson"):
+                found.append(os.path.join(root, name))
+    return sorted(found)
+
+
+def latest_open_run():
+    if not os.path.isdir(BUFFER):
+        return None
+    started, closed = {}, set()
+    for path in buffer_files():
+        with open(path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    event = json.loads(line)
+                except ValueError:
+                    continue
+                run_id = event.get("run_id")
+                if not run_id:
+                    continue
+                kind = event.get("event_type")
+                if kind == "run.started":
+                    started[run_id] = event
+                elif kind in ("run.completed", "run.failed", "run.timeout",
+                              "run.abandoned"):
+                    closed.add(run_id)
+    open_runs = [e for run_id, e in started.items() if run_id not in closed]
+    if not open_runs:
+        return None
+    return max(open_runs, key=lambda e: e.get("event_time") or "")
+
+
+def main(argv):
+    if len(argv) < 2:
+        return 0
+    path = argv[1]
+    # A merge, squash or amend message is not an agent authoring a change.
+    if len(argv) > 2 and argv[2] in ("merge", "squash", "commit"):
+        return 0
+
+    run = latest_open_run()
+    if not run:
+        return 0
+
+    with open(path, "r", encoding="utf-8") as handle:
+        message = handle.read()
+    if "AI-Run-Id:" in message:
+        return 0  # already stamped; --amend and rebase re-run this hook
+
+    trailers = ["AI-Run-Id: {}".format(run["run_id"])]
+    if run.get("trace_id"):
+        trailers.append("AI-Trace-Id: {}".format(run["trace_id"]))
+    agent = (run.get("agent") or {}).get("agent_name")
+    if agent:
+        trailers.append("AI-Agent: {}".format(agent))
+    model = (run.get("attributes") or {}).get("model_declared_id")
+    if model:
+        trailers.append("AI-Model: {}".format(model))
+
+    body = message.rstrip("\n")
+    with open(path, "w", encoding="utf-8") as handle:
+        handle.write(body + "\n\n" + "\n".join(trailers) + "\n")
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv))
+    except Exception:  # noqa: BLE001 - see rule 1
+        # Deliberately bare. There is no failure mode here worth a broken commit.
+        sys.exit(0)

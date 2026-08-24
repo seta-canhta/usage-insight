@@ -1,0 +1,9 @@
+# AI telemetry collector — runtime dependencies.
+#
+# The service itself is stdlib-only. This single wheel is what turns the local
+# NDJSON spill into a real Pub/Sub publish; if it is removed, the collector
+# still starts, still validates, and still keeps every event (file sink).
+#
+# Pin the major/minor and let patch float, so a CVE fix does not need a code
+# change but a breaking client release cannot arrive unannounced.
+google-cloud-pubsub~=2.27

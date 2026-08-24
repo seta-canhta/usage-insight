@@ -1,0 +1,79 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # The client targets 3.9 -- what macOS ships with the Xcode command line
+        # tools -- but the import guard above needs sys.stdlib_module_names,
+        # which arrived in 3.10. compile-on-3.9 below covers the floor instead.
+        python-version: ["3.10", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # The client runs on engineers' machines with no install step, so cli/
+      # must import nothing outside the standard library. The central pipeline
+      # is allowed optional extras -- openpyxl for writing workbooks, requests
+      # and google-cloud for the transports -- because it runs here, and each
+      # of those already degrades to a stdlib path or exits with instructions.
+      # This guards the constraint that actually binds.
+      - name: The client imports nothing outside the standard library
+        run: |
+          python3 - <<'PY'
+          import ast, pathlib, sys
+          stdlib = set(sys.stdlib_module_names)
+          local = {"common", "main", "insight"}
+          bad = []
+          for path in sorted(pathlib.Path("cli").rglob("*.py")):
+              tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+              for node in ast.walk(tree):
+                  names = []
+                  if isinstance(node, ast.Import):
+                      names = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                      names = [node.module.split(".")[0]]
+                  bad += [f"{path}: {n}" for n in names
+                          if n not in stdlib and n not in local]
+          if bad:
+              print("\n".join(sorted(set(bad))))
+              raise SystemExit("cli/ must stay standard library only")
+          print("cli/ is standard library only: confirmed")
+          PY
+
+      - name: Optional extras for the central pipeline
+        run: python3 -m pip install --quiet openpyxl
+
+      # Suites run one at a time. Every tests/ directory would otherwise be
+      # the same package name, and the second one to load shadows the first.
+      - name: The client parses on the 3.9 floor
+        run: |
+          python3 - <<'PY'
+          # macOS ships 3.9 with the Xcode command line tools and the client has
+          # to run on that untouched. Syntax is the part that breaks silently.
+          import pathlib, subprocess, sys
+          files = [str(p) for p in sorted(pathlib.Path("cli").rglob("*.py"))]
+          out = subprocess.run([sys.executable, "-c",
+              "import ast,sys;[ast.parse(open(f).read(), f, feature_version=(3,9)) for f in sys.argv[1:]]",
+              *files], capture_output=True, text=True)
+          print(out.stdout or "cli/ parses under 3.9 syntax")
+          if out.returncode:
+              print(out.stderr)
+              raise SystemExit(1)
+          PY
+
+      - name: Tests
+        run: |
+          set -e
+          for suite in pollers report collector cli importers; do
+            echo "--- $suite"
+            python3 -m unittest discover -s "$suite/tests"
+          done

@@ -1,0 +1,96 @@
+# =============================================================================
+# Cloud Run service — AI telemetry ingestion collector
+#
+# Design: docs/spikes/ai-effectiveness-observability.md §11.1, §11.4
+#
+# NOTHING here is a real value. Every ${...} is substituted by deploy/deploy.sh
+# from the environment. There is no project id, no region, no endpoint and no
+# credential in this file, and none may ever be added.
+#
+# Apply with:
+#     envsubst < cloudrun.yaml | gcloud run services replace - --region "${REGION}"
+# (deploy.sh does this for you and refuses to run without PROJECT_ID.)
+# =============================================================================
+apiVersion: serving.knative.dev/v1
+kind: Service
+metadata:
+  name: aiep-telemetry-collector
+  labels:
+    app: aiep-telemetry-collector
+    component: ingestion
+    owner: ai-platform
+  annotations:
+    # Ingress. `all` is required only if laptops export directly from outside
+    # the VPC; prefer `internal-and-cloud-load-balancing` behind the corporate
+    # load balancer once the network path is decided (see deploy.sh notes).
+    run.googleapis.com/ingress: ${COLLECTOR_INGRESS}
+    run.googleapis.com/ingress-status: ${COLLECTOR_INGRESS}
+spec:
+  template:
+    metadata:
+      annotations:
+        autoscaling.knative.dev/minScale: "0"
+        # A hard ceiling: telemetry must never outbid production workloads for
+        # quota. CONTRACT.md §1.2 — telemetry never degrades anything else.
+        autoscaling.knative.dev/maxScale: "10"
+        run.googleapis.com/execution-environment: gen2
+        run.googleapis.com/startup-cpu-boost: "true"
+    spec:
+      # LEAST PRIVILEGE. This service account holds exactly one data-plane
+      # permission: publish to the ai-run-events topic. See deploy.sh §IAM.
+      serviceAccountName: ${COLLECTOR_SA}@${PROJECT_ID}.iam.gserviceaccount.com
+      containerConcurrency: 80
+      timeoutSeconds: 60
+      containers:
+        - name: collector
+          image: ${IMAGE_URI}
+          ports:
+            - name: http1
+              containerPort: 8080
+          resources:
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          env:
+            - name: AIEP_PUBSUB_PROJECT
+              value: ${PROJECT_ID}
+            - name: AIEP_PUBSUB_TOPIC
+              value: ${PUBSUB_TOPIC}
+            # Crash-window buffer only. Cloud Run's filesystem is in-memory and
+            # is lost when the instance is reclaimed; durability is Pub/Sub's
+            # job. The spill exists so a Pub/Sub outage inside a single request
+            # does not lose the event and does not fail the caller.
+            - name: AIEP_FALLBACK_PATH
+              value: /var/tmp/aiep/ai-run-events.ndjson
+            - name: AIEP_FINDINGS_PATH
+              value: /var/tmp/aiep/dq_findings.ndjson
+            - name: AIEP_DEDUP_TTL_SECONDS
+              value: "900"
+            - name: LOG_LEVEL
+              value: ${LOG_LEVEL}
+            # The shared bearer token. NEVER an inline value — always a Secret
+            # Manager reference, so the token never appears in the service YAML,
+            # in `gcloud run services describe`, or in this repository.
+            - name: AIEP_COLLECTOR_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: ${COLLECTOR_TOKEN_SECRET}
+                  key: latest
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 3
+            timeoutSeconds: 2
+            failureThreshold: 10
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            periodSeconds: 30
+            timeoutSeconds: 3
+            failureThreshold: 3
+  traffic:
+    - percent: 100
+      latestRevision: true

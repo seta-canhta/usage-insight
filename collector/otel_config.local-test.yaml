@@ -1,0 +1,71 @@
+# =============================================================================
+# LOCAL TEST config — verify what GitHub Copilot actually emits over OTel.
+#
+# NOT the production config. See otel_config.yaml for that one.
+#
+# This config deliberately applies NO filtering and NO redaction, because the
+# whole point of the exercise is to see the raw truth:
+#   - are gen_ai.usage.input_tokens / output_tokens actually populated?   (OQ-1b)
+#   - for which models?                                                   (OQ-1b)
+#   - what does gen_ai.conversation.id look like?  (validates the join in
+#     CONTRACT.md §3 — conversation id is a SESSION, not a run)
+#   - is any prompt / response / tool-argument content leaking, i.e. is
+#     captureContent genuinely off by default?                            (§11.3)
+#
+# Everything stays on this machine. Nothing is exported anywhere.
+#
+# Run:
+#   docker run --rm -p 4317:4317 -p 4318:4318 \
+#     -v "$PWD/otel_config.local-test.yaml:/etc/otelcol-contrib/config.yaml" \
+#     -v "$PWD/../../../.tmp/otel:/out" \
+#     otel/opentelemetry-collector-contrib:latest
+# =============================================================================
+
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+        # Copilot's exporter runs in VS Code on the same machine; CORS is not
+        # needed, but a permissive origin avoids a confusing silent failure if a
+        # future client version sends a browser-style preflight.
+        cors:
+          allowed_origins: ["*"]
+      grpc:
+        endpoint: 0.0.0.0:4317
+
+processors:
+  # Keep batches tiny so spans appear immediately rather than after a timeout —
+  # this is an interactive test, not a throughput exercise.
+  batch:
+    timeout: 1s
+    send_batch_size: 1
+
+exporters:
+  # Human-readable dump to the container log.
+  debug:
+    verbosity: detailed
+    sampling_initial: 200
+    sampling_thereafter: 200
+
+  # Machine-readable dump so the spans can be analysed afterwards.
+  file:
+    path: /out/copilot-spans.json
+
+service:
+  telemetry:
+    logs:
+      level: info
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file]
+    metrics:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file]
+    logs:
+      receivers: [otlp]
+      processors: [batch]
+      exporters: [debug, file]

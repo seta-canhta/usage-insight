@@ -1,0 +1,4 @@
+#!/usr/bin/env bash
+# The local collector. Python 3.9+, standard library only -- nothing to install.
+set -euo pipefail
+exec python3 "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/cli/insight.py" "$@"

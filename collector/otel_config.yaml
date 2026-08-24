@@ -1,0 +1,374 @@
+# =============================================================================
+# OpenTelemetry Collector — GitHub Copilot Chat / Copilot CLI ingest
+#
+# Contract : schema/CONTRACT.md  (§1 non-negotiable rules,
+#            §3 event types 5 `model.call` and 6 `tool.call`, §7 raw.otel_span)
+# Design   : docs/spikes/ai-effectiveness-observability.md §4.4a (what Copilot
+#            emits), §11.1 (storage pipeline), §11.3 (never store content)
+#
+# Distribution required: opentelemetry-collector-contrib (the googlecloudpubsub
+# exporter, the transform/filter processors and the redaction processor are all
+# contrib components; they are NOT in the core distribution).
+#
+# NO project id, endpoint, topic path or credential is literal in this file.
+# Everything is `${env:...}` and is bound at deploy time by deploy/deploy.sh.
+# =============================================================================
+
+extensions:
+  health_check:
+    endpoint: 0.0.0.0:13133
+
+  # The collector is public-facing (laptops export to it over the internet or the
+  # VPN), so the OTLP receivers require a bearer token. Copilot sends it via the
+  # managed exporter headers described in copilot-otel-setup.md.
+  bearertokenauth/otlp:
+    scheme: Bearer
+    token: ${env:AIEP_OTLP_TOKEN}
+
+  # On-disk sending queue backing the exporter's `sending_queue.storage`.
+  file_storage/otlp_queue:
+    directory: ${env:AIEP_OTEL_QUEUE_DIR}
+    timeout: 10s
+    compaction:
+      on_start: true
+      directory: ${env:AIEP_OTEL_QUEUE_DIR}
+      max_transaction_size: 65536
+
+receivers:
+  otlp:
+    protocols:
+      grpc:
+        endpoint: 0.0.0.0:4317
+        auth:
+          authenticator: bearertokenauth/otlp
+        max_recv_msg_size_mib: 8
+      http:
+        # otlp-http is the Copilot exporter default (see copilot-otel-setup.md).
+        endpoint: 0.0.0.0:4318
+        auth:
+          authenticator: bearertokenauth/otlp
+        max_request_body_size: 8388608
+
+processors:
+  # ---------------------------------------------------------------------------
+  # 1. memory_limiter MUST be the first processor in every pipeline. It sheds
+  #    load before the collector OOMs, which keeps the ingest path "fail open"
+  #    (CONTRACT.md §1.2) rather than crash-looping under a burst.
+  # ---------------------------------------------------------------------------
+  memory_limiter:
+    check_interval: 1s
+    limit_percentage: 75
+    spike_limit_percentage: 20
+
+  # ---------------------------------------------------------------------------
+  # 2. DEFENCE IN DEPTH — drop every content-bearing attribute.
+  #
+  #    Copilot's `captureContent` defaults to OFF and this project's recorded
+  #    decision is that it stays off, enforced by enterprise-managed settings
+  #    (design §4.4a, §11.3). This processor exists so that if someone flips it
+  #    on anyway — locally, on an unmanaged machine, or in a future client
+  #    version with a different default — prompt text, responses and tool
+  #    arguments are destroyed at the collector and never reach BigQuery.
+  #
+  #    Two independent mechanisms, deliberately overlapping:
+  #      a) explicit `delete_key` for every attribute Copilot is documented to
+  #         populate under captureContent;
+  #      b) a pattern sweep that deletes ANY attribute whose key looks like
+  #         content, so a newly introduced attribute name is dropped by default.
+  # ---------------------------------------------------------------------------
+  transform/drop_content:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        statements:
+          # (a) named content attributes — GenAI semconv + Copilot specifics
+          - delete_key(attributes, "gen_ai.prompt")
+          - delete_key(attributes, "gen_ai.completion")
+          - delete_key(attributes, "gen_ai.input.messages")
+          - delete_key(attributes, "gen_ai.output.messages")
+          - delete_key(attributes, "gen_ai.system_instructions")
+          - delete_key(attributes, "gen_ai.tool.call.arguments")
+          - delete_key(attributes, "gen_ai.tool.call.result")
+          - delete_key(attributes, "gen_ai.tool.description")
+          - delete_key(attributes, "gen_ai.request.instructions")
+          - delete_key(attributes, "gen_ai.response.text")
+          - delete_key(attributes, "code.stacktrace")
+          - delete_key(attributes, "exception.message")
+          - delete_key(attributes, "exception.stacktrace")
+          - delete_key(attributes, "url.full")
+          - delete_key(attributes, "user.email")
+          - delete_key(attributes, "enduser.id")
+
+          # (a2) Copilot-specific content attributes OBSERVED on the wire
+          #      2026-08-19. Not covered by the GenAI semconv names above.
+          - delete_key(attributes, "copilot_chat.user_request")
+          - delete_key(attributes, "copilot_chat.request.options")
+          - delete_key(attributes, "copilot_chat.request.shape")
+
+          # (b) pattern sweep — mirrors CONTRACT.md §3 "forbidden attribute
+          #     names" so the OTel path and the JSON path enforce one list.
+          #
+          #     ⚠ ANCHORED to a whole dot-segment, exactly as CONTRACT.md §3
+          #     requires for the JSON path. An unanchored substring sweep is a
+          #     real bug, not a theoretical one: the previous version contained
+          #     "response" and therefore silently deleted gen_ai.response.model,
+          #     gen_ai.response.id and gen_ai.response.finish_reasons. Losing
+          #     response.model is severe — dim_model_pricing joins on it, so
+          #     every run would price to NULL and DQ-6 would fire forever.
+          #     Verified against real Copilot spans on 2026-08-19.
+          #
+          #     "response" is deliberately NOT in this list. Content-bearing
+          #     response attributes (gen_ai.response.text) still match on their
+          #     final segment "text", and the allow-list in step 3 is the real
+          #     guarantee — this sweep is defence in depth.
+          - delete_matching_keys(attributes,
+              "(?i)(^|\\.)(prompt|prompts|completion|completions|content|message|messages|body|text|code|diff|stack_?trace|stacktrace|error_message|password|secret|api[_-]?key|token_value|credential|email|arguments|result|instructions|system_instructions)$")
+
+          # (c) value-level sweep for a key-shaped-innocent attribute that
+          #     happens to carry a pasted private key.
+          - replace_all_patterns(attributes, "value", ".*BEGIN[ A-Z]*PRIVATE KEY.*", "[REDACTED]")
+
+      # Span events carry free text (session start, tool calls, user feedback).
+      # Nothing downstream consumes them and they are the most likely place for
+      # content to hide, so every span-event attribute is deleted.
+      - context: spanevent
+        statements:
+          - delete_matching_keys(attributes, ".*")
+
+  # ---------------------------------------------------------------------------
+  # 3. Second, independent redaction pass. The redaction processor is a
+  #    key ALLOW-LIST, not a deny-list (CONTRACT.md §11.3 requires allow-list
+  #    semantics): only the attributes named here survive on a span. Anything
+  #    Copilot adds in a future release is dropped until it is added here on
+  #    purpose.
+  # ---------------------------------------------------------------------------
+  redaction/allowlist:
+    allow_all_keys: false
+    allowed_keys:
+      # --- GenAI semantic conventions Copilot actually emits (design §4.4a) ---
+      - gen_ai.operation.name          # invoke_agent | chat | execute_tool | embeddings
+      - gen_ai.agent.name
+      - gen_ai.conversation.id         # ⭐ the bridge to run.bound (CONTRACT §3 #2)
+      - gen_ai.request.model
+      - gen_ai.response.model
+      - gen_ai.response.finish_reasons
+      - gen_ai.provider.name
+      - gen_ai.system
+      - gen_ai.tool.name
+      - gen_ai.tool.type
+      - gen_ai.usage.input_tokens
+      - gen_ai.usage.output_tokens
+      - gen_ai.usage.cached_input_tokens        # canonical name we normalise TO
+      # Spellings OBSERVED ON THE WIRE from Copilot Chat (VS Code, 2026-08-19).
+      # These are the ones that actually arrive — the two "alternate spellings"
+      # previously listed here were guesses and never appear. Dropping cache_read
+      # is not cosmetic: in a measured session it was 20588 of 20751 input tokens
+      # (99%), so losing it overstates cost by ~50x on cache-heavy runs.
+      - gen_ai.usage.cache_read.input_tokens
+      - gen_ai.usage.cache_creation.input_tokens
+      - gen_ai.usage.reasoning_tokens           # canonical name we normalise TO
+      - gen_ai.usage.reasoning.output_tokens    # OBSERVED spelling
+      - gen_ai.response.id
+      - gen_ai.response.time_to_first_chunk     # model latency signal
+      - gen_ai.request.stream
+      - gen_ai.usage.total_tokens             # SYNTHESISED below — never sent by Copilot
+      - gen_ai.request.max_tokens
+      - gen_ai.request.temperature
+      - gen_ai.request.top_p
+      # --- non-content correlation / dimension attributes -------------------
+      - server.address
+      - error.type
+      - rpc.grpc.status_code
+      - http.response.status_code
+      - session.id
+      - aiep.run_id                    # injected by emit.py where available
+      - aiep.trace_id
+      - aiep.workflow_id
+    blocked_values:
+      # Last-resort value screening. Same patterns as
+      # skills/dev-quality-gates/SKILL.md and collector/main.py SECRET_PATTERNS.
+      - "AKIA[0-9A-Z]{16}"
+      - "ATATT[A-Za-z0-9_\\-=]{16,}"
+      - "gh[pousr]_[A-Za-z0-9]{16,}"
+      - "(?i)-{0,5}BEGIN[ A-Z0-9]*PRIVATE KEY"
+      - "(?i)api[_-]?key\\s*[=:]\\s*\\S{8,}"
+      - "(?i)password\\s*[=:]\\s*\\S{4,}"
+    summary: debug            # counts of redacted keys only, never the values
+
+  # ---------------------------------------------------------------------------
+  # 4. TOTAL TOKENS.
+  #    Copilot does NOT emit gen_ai.usage.total_tokens (design §4.4a, explicitly
+  #    verified). Every downstream cost query would otherwise read NULL and
+  #    CONTRACT.md §4 forbids substituting 0. So total is SYNTHESISED here as
+  #    input + output.
+  #
+  #    Deliberate accounting decisions, so the number is reproducible:
+  #      * cached input tokens are ALREADY counted inside input_tokens by the
+  #        GenAI convention, so they are NOT added again;
+  #      * reasoning tokens are billed as output and are already inside
+  #        output_tokens, so they are NOT added again;
+  #      * missing components default to 0 ONLY for the total; the individual
+  #        attributes stay absent so DQ can tell "zero" from "not reported";
+  #      * `aiep.total_tokens_basis` records that this was computed, not
+  #        measured, so raw.otel_span never lies about provenance.
+  # ---------------------------------------------------------------------------
+  transform/total_tokens:
+    error_mode: ignore
+    trace_statements:
+      - context: span
+        conditions:
+          - attributes["gen_ai.usage.input_tokens"] != nil or attributes["gen_ai.usage.output_tokens"] != nil
+        statements:
+          - set(attributes["gen_ai.usage.total_tokens"],
+                Int(attributes["gen_ai.usage.input_tokens"]) + Int(attributes["gen_ai.usage.output_tokens"]))
+            where attributes["gen_ai.usage.input_tokens"] != nil
+              and attributes["gen_ai.usage.output_tokens"] != nil
+          - set(attributes["gen_ai.usage.total_tokens"], Int(attributes["gen_ai.usage.input_tokens"]))
+            where attributes["gen_ai.usage.input_tokens"] != nil
+              and attributes["gen_ai.usage.output_tokens"] == nil
+          - set(attributes["gen_ai.usage.total_tokens"], Int(attributes["gen_ai.usage.output_tokens"]))
+            where attributes["gen_ai.usage.input_tokens"] == nil
+              and attributes["gen_ai.usage.output_tokens"] != nil
+          - set(attributes["aiep.total_tokens_basis"], "computed_input_plus_output")
+
+          # Normalise the two observed spellings of the cached / reasoning
+          # counters onto the CONTRACT.md §3 #5 attribute names.
+          # Observed on the wire 2026-08-19: Copilot emits cache_read /
+          # cache_creation / reasoning.output_tokens. Normalise onto the canonical
+          # CONTRACT §3 names. cache_read is the one that matters for cost —
+          # it is the portion of input billed at the cached rate.
+          - set(attributes["gen_ai.usage.cached_input_tokens"], attributes["gen_ai.usage.cache_read.input_tokens"])
+            where attributes["gen_ai.usage.cached_input_tokens"] == nil
+              and attributes["gen_ai.usage.cache_read.input_tokens"] != nil
+          - set(attributes["gen_ai.usage.reasoning_tokens"], attributes["gen_ai.usage.reasoning.output_tokens"])
+            where attributes["gen_ai.usage.reasoning_tokens"] == nil
+              and attributes["gen_ai.usage.reasoning.output_tokens"] != nil
+          - delete_key(attributes, "gen_ai.usage.cache_read.input_tokens")
+          - delete_key(attributes, "gen_ai.usage.reasoning.output_tokens")
+
+  # ---------------------------------------------------------------------------
+  # 5. Keep only the GenAI spans. Copilot's host process also emits generic
+  #    HTTP/extension-activation spans that carry no metric value and would
+  #    inflate raw.otel_span (and its cost) for nothing.
+  # ---------------------------------------------------------------------------
+  filter/gen_ai_only:
+    error_mode: ignore
+    traces:
+      span:
+        - 'attributes["gen_ai.operation.name"] == nil and attributes["gen_ai.conversation.id"] == nil'
+
+  # ---------------------------------------------------------------------------
+  # 6. Environment / ownership stamping. Bounded values only (CONTRACT.md §1.5,
+  #    DQ-15): these become BigQuery clustering columns.
+  # ---------------------------------------------------------------------------
+  resource/stamp:
+    attributes:
+      - key: aiep.collector_env
+        value: ${env:AIEP_ENVIRONMENT}
+        action: upsert
+      - key: aiep.schema_version
+        value: "1.0.0"
+        action: upsert
+      - key: aiep.capture_content_policy
+        value: "disabled_by_org_policy"
+        action: upsert
+      # Host name and user name are identity-bearing and high cardinality.
+      - key: host.name
+        action: delete
+      - key: process.owner
+        action: delete
+      - key: process.command_line
+        action: delete
+
+  # ---------------------------------------------------------------------------
+  # 7. Batching. Last processor before the exporter, always.
+  # ---------------------------------------------------------------------------
+  batch:
+    send_batch_size: 512
+    send_batch_max_size: 1024
+    timeout: 5s
+
+exporters:
+  # ---------------------------------------------------------------------------
+  # PRIMARY SINK -> BigQuery `raw.otel_span`.
+  #
+  # There is no stable first-party OTLP->BigQuery span exporter, so the path to
+  # raw.otel_span is the same one design §11.1 already uses for ai_run_event:
+  #
+  #     collector --> Pub/Sub topic ${AIEP_OTEL_TOPIC}
+  #               --> BigQuery subscription (write-mode, table ${...}.raw.otel_span)
+  #
+  # The BigQuery subscription is created by deploy/deploy.sh, not here; a
+  # subscription with `use_table_schema=true` lands each OTLP-JSON span as one
+  # row. raw.otel_span is partitioned on DATE(start_time) and clustered on
+  # conversation_id per CONTRACT.md §7.
+  # ---------------------------------------------------------------------------
+  googlecloudpubsub/raw_otel_span:
+    project: ${env:PROJECT_ID}
+    topic: projects/${env:PROJECT_ID}/topics/${env:AIEP_OTEL_TOPIC}
+    encoding: otlp_json
+    compression: gzip
+    watermark:
+      behavior: current
+    # RETRY + on-disk queue. A VPN drop or a Pub/Sub blip must not lose spans;
+    # design §6.5 makes offline tolerance non-negotiable.
+    retry_on_failure:
+      enabled: true
+      initial_interval: 5s
+      max_interval: 60s
+      max_elapsed_time: 600s
+    sending_queue:
+      enabled: true
+      num_consumers: 4
+      queue_size: 5000
+      storage: file_storage/otlp_queue
+    timeout: 30s
+
+  # Local spill for a total outage of the primary sink — mirrors the collector's
+  # NDJSON fallback in main.py. Drained by the runbook, never by hand-editing.
+  file/spill:
+    path: ${env:AIEP_OTEL_SPILL_PATH}
+    rotation:
+      max_megabytes: 128
+      max_backups: 8
+    format: json
+
+  # Enabled only when LOG_LEVEL=debug during the verification procedure in
+  # copilot-otel-setup.md. `basic` prints counts, never attribute values.
+  debug:
+    verbosity: basic
+    sampling_initial: 5
+    sampling_thereafter: 500
+
+service:
+  extensions: [health_check, bearertokenauth/otlp, file_storage/otlp_queue]
+  telemetry:
+    logs:
+      level: ${env:LOG_LEVEL}
+    metrics:
+      level: normal
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors:
+        - memory_limiter        # must be first
+        - transform/drop_content
+        - redaction/allowlist
+        - transform/total_tokens
+        - filter/gen_ai_only
+        - resource/stamp
+        - batch                 # must be last
+      exporters: [googlecloudpubsub/raw_otel_span, file/spill]
+
+    # Copilot also exports operation-duration / token-usage / tool-call metrics.
+    # They pass through the identical content-stripping chain — a metric label is
+    # just as capable of carrying a prompt fragment as a span attribute is.
+    metrics:
+      receivers: [otlp]
+      processors:
+        - memory_limiter
+        - transform/drop_content
+        - redaction/allowlist
+        - resource/stamp
+        - batch
+      exporters: [googlecloudpubsub/raw_otel_span]

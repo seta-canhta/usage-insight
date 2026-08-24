@@ -1,0 +1,33 @@
+# Credentials. Never.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated reports carry live Atlassian account ids, issue keys, branch names
+# and named individuals. Generated on demand; must never enter git history --
+# report/ holds the code that produces them, which is the part worth reviewing.
+# Everything under reports/ is ignored except the README explaining the layout.
+/reports/*
+!/reports/README.md
+/out/
+*.xlsx
+*.ndjson
+
+# Daily-report source files: personal data, arrive from outside the repo.
+/inbox/
+
+# Poller watermarks -- machine state, not source.
+/state/
+
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.DS_Store
+.pytest_cache/
+
+# npx client build artefacts
+node_modules/
+cli/dist/
