@@ -30,6 +30,13 @@ RUN python -m pip install --no-cache-dir -r /app/server/requirements.txt
 COPY server/proxy.py server/store.py /app/server/
 COPY cli/identity.py /app/cli/identity.py
 
+# The watchdog, which runs from this same image with a different entrypoint
+# (see server/compose.yaml). It belongs here because it is the piece that
+# notices the endpoint has stopped receiving -- deployed separately, it is the
+# piece most likely to be the one nobody deployed.
+COPY importers/watch.py importers/pull.py /app/importers/
+COPY pollers/common.py /app/pollers/common.py
+
 RUN groupadd --system --gid 10001 insight \
  && useradd --system --uid 10001 --gid insight --no-create-home insight \
  && mkdir -p /var/lib/insight \

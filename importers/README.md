@@ -63,12 +63,19 @@ what makes the collection consensual. A voluntary record, never an audit trail.
 ## `pull.py` — fetching a week
 
 ```bash
-export INSIGHT_ENDPOINT=https://aeris-insight.seta-international.com
+# The read routes are not public. Tunnel to them; see server/README.md.
+ssh -N -L 8479:<endpoint>:8479 <host> &
+export INSIGHT_ENDPOINT=http://127.0.0.1:8479
 export INSIGHT_ADMIN_TOKEN=...
 
 python3 pull.py --week 2026-W34 --inbox inbox/ --roster roster.txt
 python3 bundle.py --inbox inbox/ --out events.ndjson --state state/bundles.json
 ```
+
+`https://aeris-insight.seta-international.com` is where laptops *upload*. Listing
+and fetching expose every engineer at once, so those routes are restricted by
+source address and reached over SSH — the admin token is defence in depth, not
+the only thing in the way.
 
 It stops at `inbox/` on purpose. `bundle.py` already parses, checksums,
 re-checks the allow-list and dedupes, and a bundle that arrived over HTTP has
@@ -87,12 +94,17 @@ per line. Emails stay on this side: nothing written into `inbox/` carries one.
 ## `watch.py` — noticing silence
 
 ```bash
-python3 watch.py --roster roster.txt          # once a day, from cron
+python3 watch.py --roster roster.txt          # hourly, next to the endpoint
 python3 watch.py --roster roster.txt --dry-run
 ```
 
 Posts to ntfy.sh when someone stops reporting. Configured entirely in `.env`;
 see `.env.example` and `docs/TRANSPORT.md`.
+
+In the deployed system this runs beside the endpoint rather than here —
+`server/compose.yaml` runs it from the endpoint's own image, so it reaches the
+read routes over a private network and needs no tunnel. Running it by hand is
+for checking what it would say.
 
 The unit is a **working day**, not an hour. `insight auto` uploads nothing in an
 hour where nothing changed, so hourly misses are not signal — but an idle day

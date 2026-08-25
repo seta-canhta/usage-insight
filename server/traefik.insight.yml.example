@@ -1,0 +1,64 @@
+# Traefik v3 dynamic config for the collection endpoint.
+#
+# The alternative to server/nginx.conf.example, for a host where something else
+# already owns 443. Copy into the Traefik file provider's watch directory and
+# it is picked up without a restart:
+#
+#   cp server/traefik.insight.yml.example <traefik-dynamic-dir>/insight.yml
+#
+# It splits the same way the nginx config does, and for the same reason: the
+# upload route is the only one the internet may reach. The read routes list
+# every engineer at once and are reached from the office network or over an SSH
+# tunnel -- see server/README.md.
+
+http:
+  middlewares:
+    # 1 MiB, the cap cli/ship.py and server/proxy.py both enforce. Rejecting an
+    # oversized body one hop earlier means the process never buffers it.
+    insight-cap:
+      buffering:
+        maxRequestBodyBytes: 1048576
+        memRequestBodyBytes: 1048576
+
+    # The read routes, restricted by source address. Behind Cloudflare every
+    # public request arrives from a Cloudflare address, so this admits the
+    # office LAN, container networks, and loopback -- which is what an
+    # `ssh -L` tunnel to the host looks like -- and nothing from the internet.
+    # Traefik matches on the connecting address, not X-Forwarded-For, so a
+    # header cannot forge its way past this.
+    insight-lan-only:
+      ipAllowList:
+        sourceRange:
+          - "127.0.0.1/32"
+          - "10.0.0.0/8"
+          - "172.16.0.0/12"
+          - "192.168.0.0/16"
+
+  routers:
+    # Uploads, and the health check. Public. Higher priority than the read
+    # router below, which would otherwise swallow these paths.
+    insight-upload:
+      rule: "Host(`aeris-insight.seta-international.com`) && (Path(`/v1/bundle`) || Path(`/healthz`))"
+      entryPoints: [websecure]
+      service: insight
+      middlewares: [insight-cap]
+      priority: 300
+      tls: {}
+
+    # Everything else on this hostname: the read routes, and 404s for paths the
+    # endpoint does not serve. Not reachable from the internet.
+    insight-read:
+      rule: "Host(`aeris-insight.seta-international.com`)"
+      entryPoints: [websecure]
+      service: insight
+      middlewares: [insight-lan-only]
+      priority: 250
+      tls: {}
+
+  services:
+    insight:
+      loadBalancer:
+        servers:
+          # The container name on the shared Docker network. The endpoint
+          # publishes no host port: Traefik is the only thing that can reach it.
+          - url: "http://insight-proxy:8479"

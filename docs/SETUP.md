@@ -168,6 +168,18 @@ nothing happened in it, which is why those dates are worth typing.
 `purge` is a local command. A bundle you already uploaded is already uploaded —
 ask whoever runs the pipeline if you need one removed.
 
+### If an upload fails
+
+`ship` says which of these it was, and none of them lose the bundle — it stays
+in `~/.seta-insight/.reports/` and the next run sends it.
+
+| what it says | what it means |
+|---|---|
+| *not on the whitelist* (`401`) | your line has not reached the server yet, or you rotated and the old secret has expired. `./insight whoami` prints it again |
+| *did not reach the endpoint* | something in front of the server — a CDN or proxy — refused the request. Nothing on your machine needs changing; tell whoever runs the pipeline |
+| *a certificate this machine cannot verify* | your Python has no CA certificates. On a python.org install for macOS, run `/Applications/Python 3.x/Install Certificates.command` |
+| *unreachable after 3 attempts* | the network, or the server is down. It will go with the next hourly run |
+
 ## What this is not
 
 These figures describe how a way of working is going — whether AI-assisted work

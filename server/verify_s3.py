@@ -181,6 +181,11 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--store", default=os.environ.get("INSIGHT_STORE"),
                         help="s3://bucket (default: $INSIGHT_STORE)")
     parser.add_argument("--json", action="store_true", help="machine-readable")
+    parser.add_argument("--strict", action="store_true",
+                        help="treat the advisory checks as failures. What is "
+                             "advisory on a laptop -- a human credential that "
+                             "can delete -- is a defect on the host that serves "
+                             "the endpoint, so the deploy runbook uses this")
     args = parser.parse_args(argv)
 
     if not args.store:
@@ -196,12 +201,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     if checks and checks[-1].ok:
         checks += check_least_privilege(store, bucket)
 
-    failed = [c for c in checks if not c.ok and not c.advisory]
-    warned = [c for c in checks if not c.ok and c.advisory]
+    broken = [c for c in checks if not c.ok]
+    failed = broken if args.strict else [c for c in broken if not c.advisory]
+    warned = [] if args.strict else [c for c in broken if c.advisory]
 
     if args.json:
         print(json.dumps({
-            "store": args.store, "bucket": bucket,
+            "store": args.store, "bucket": bucket, "strict": args.strict,
             "checks": [{"name": c.name, "ok": c.ok, "advisory": c.advisory,
                         "detail": c.detail} for c in checks],
             "passed": not failed,
@@ -212,8 +218,9 @@ def main(argv: Optional[List[str]] = None) -> int:
             print(check.line())
         print()
         if failed:
-            print("{} check(s) failed. Do not point the endpoint at this bucket "
-                  "yet.".format(len(failed)))
+            print("{} check(s) failed{}. Do not point the endpoint at this "
+                  "bucket yet.".format(
+                      len(failed), " (--strict)" if args.strict else ""))
         elif warned:
             print("Usable. {} advisory note(s) above -- neither blocks the "
                   "endpoint.".format(len(warned)))

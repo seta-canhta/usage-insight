@@ -153,12 +153,20 @@ X-Insight-Schema: 1.0.0
 X-Insight-Format: seta-insight-bundle/1
 X-Insight-Digest: sha256=1f3a...  ← of the ENTIRE body, all lines
 X-Insight-Client: insight-ship/1
+User-Agent: seta-insight/1 (+usage-insight)
 Authorization: Bearer <the engineer's secret>
 
 {"_manifest":{...}}
 {"event_id":"evt_...",...}
 ...
 ```
+
+`User-Agent` is not decoration. urllib's default is `Python-urllib/3.x`, and
+Cloudflare's browser integrity check answers that with `403 error code: 1010`
+*before* the request reaches any origin — so no header, credential or retry of
+ours can recover from it, and the failure looks exactly like the endpoint
+refusing the engineer. Anything that names the client gets through. See
+*Anything in front of the endpoint*, below.
 
 `X-Insight-Digest` is transport integrity — the whole file, manifest line
 included. It is **not** the manifest's own `sha256`, which covers only the event
@@ -396,7 +404,15 @@ S3, and well inside a single-`PUT` object.
 honours `IfNoneMatch: "*"`, so the `409`-on-duplicate this document promises is
 enforced by the storage layer rather than by code that can rot. Two clients
 shipped, a resend was refused, and `pull.py` fetched both back through
-`bundle.py` with nothing rejected. See `server/README.md`.
+`bundle.py` with nothing rejected.
+
+**Deployed 2026-08-25.** The endpoint runs behind the reverse proxy that already
+owned 443 on the office box, and the whole chain — `scan` → `pack` → `ship` →
+`pull` → `bundle` — was run through it at the real hostname. `INSIGHT_STORE` is
+a directory rather than the bucket for now; nothing downstream can tell, because
+`pull.py` reads through the endpoint and never from S3. See `server/README.md`
+for what is still outstanding: a Cloudflare record, and a service credential
+that cannot delete.
 
 **Retention is an S3 lifecycle rule**, server-side, and the client is never
 given `DeleteObject`. `insight purge` stays what it always was: a *local*
@@ -511,6 +527,43 @@ describes.
 
 That is what "one port" buys: **443 public, 22 for the person who runs the
 pipeline, and nothing else.**
+
+On a host where something else already owns 443, the same split is a pair of
+routers on the existing reverse proxy rather than a second server block —
+`server/traefik.insight.yml.example` is the Traefik form, with an `ipAllowList`
+on the read router in place of the loopback bind. The rule is the same: uploads
+and `/healthz` public, everything else reachable only from the office network or
+an SSH tunnel.
+
+### Anything in front of the endpoint
+
+The moment a CDN or WAF sits between the laptops and the proxy, some `4xx`
+responses stop coming from the endpoint at all — and they mean the opposite of
+what they say. Two that were hit turning this on:
+
+* **`403 error code: 1010`** from Cloudflare, for every upload. Its browser
+  integrity check refuses `Python-urllib/*` zone-wide, before any origin fetch.
+  Read as an endpoint response, that is "your address was removed from the
+  whitelist" — a message that sends someone to edit a file that was never wrong.
+  The client now sends its own `User-Agent`, which the check accepts.
+* **`502`**, for everything, when the hostname's DNS record points somewhere
+  that is not the origin. Nothing on the origin can fix that, and the origin's
+  access log is empty, which is the useful clue.
+
+So the client tells the two apart by *who answered*: the endpoint replies in
+JSON with an `error` key, and a CDN replies with its own page. A `4xx` without
+that key is reported as "did not reach the endpoint", is not retried with a
+second credential, and does not blame the whitelist.
+
+### One more thing that is not the network
+
+`ship` uploads over HTTPS with `urllib`, and a stock python.org build on macOS
+has an **empty** trust store until somebody runs `Install Certificates.command`
+— which nobody does. Every upload then fails with `unable to get local issuer
+certificate`, on a machine where `curl` to the same URL works, because `curl`
+reads the system bundle. `ship` now falls back to that same bundle, and never
+falls back to not verifying: an unverified upload of a sealed bundle is worse
+than a failed one, because it looks like it worked.
 
 ### Turning it on
 

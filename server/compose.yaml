@@ -1,0 +1,136 @@
+# =============================================================================
+# The collection endpoint, as a container.
+#
+#   cd usage-insight/server && docker compose up -d --build
+#
+# For a host where something else already owns 443 and root is not casually
+# available -- which is most hosts that already do something. The alternative,
+# systemd plus nginx, is server/insight-proxy.service and
+# server/nginx.conf.example; use that on a machine dedicated to this.
+#
+# **No published ports.** The endpoint is reachable only from the Docker network
+# it shares with whatever terminates TLS. Nothing on the host's LAN can reach
+# it, which is the same guarantee `INSIGHT_HOST=127.0.0.1` gives the systemd
+# deployment. Inside the container it does bind 0.0.0.0 -- it has to, or the
+# reverse proxy in the next container could not reach it -- and says so in its
+# startup log. That warning is about a host bind; here there is no host bind.
+#
+# Configuration lives in ./etc, mounted read-only:
+#   etc/allowed.env    one `./insight whoami` line per engineer (fingerprints)
+#   etc/admin.token    the admin token, guarding the read routes
+#
+# Both are files rather than environment variables on purpose: `docker inspect`
+# prints the environment to anyone who can reach the Docker daemon, and on a
+# shared host that is a wider audience than root.
+# =============================================================================
+
+services:
+  insight-proxy:
+    build:
+      # Defaults suit running this from server/ in a checkout. A deployment
+      # that keeps its configuration outside the source tree -- so a redeploy
+      # cannot overwrite it -- sets these in an .env file and runs compose with
+      # --project-directory; see server/README.md.
+      context: "${INSIGHT_SRC:-..}"
+      dockerfile: server/Dockerfile
+    image: aeris-insight-proxy:latest
+    container_name: insight-proxy
+    restart: unless-stopped
+
+    environment:
+      # s3://aeris-insight in production. file:// keeps working with no AWS
+      # credential at all, and the report pipeline cannot tell the difference:
+      # importers/pull.py reads through this endpoint, never from the bucket.
+      INSIGHT_STORE: "${INSIGHT_STORE:-file:///var/lib/insight}"
+      INSIGHT_ALLOWED_FILE: /etc/insight/allowed.env
+      INSIGHT_ADMIN_TOKEN_FILE: /etc/insight/admin.token
+      INSIGHT_HOST: "0.0.0.0"          # container-internal; see the note above
+      INSIGHT_PORT: "8479"
+      AWS_REGION: "${AWS_REGION:-ap-southeast-1}"
+      LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+    volumes:
+      - "${INSIGHT_CONF:-./etc}:/etc/insight:ro"
+      - "${INSIGHT_DATA:-./data}:/var/lib/insight"   # only the file:// store
+
+    # It reads a whitelist and writes bundles. It needs nothing else.
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
+
+    networks: [edge]
+
+  # ── the watchdog ─────────────────────────────────────────────────────────
+  # Automating the upload removed the thing that used to make a gap visible: a
+  # weekly email that did not arrive. This is what speaks instead. Same image,
+  # different entrypoint; it reaches the endpoint over the Docker network, so
+  # the read routes it uses stay off the internet.
+  insight-watch:
+    image: aeris-insight-proxy:latest
+    container_name: insight-watch
+    restart: unless-stopped
+    depends_on: [insight-proxy]
+
+    environment:
+      # Working hours, miss threshold and the ntfy topic. Defaults are in
+      # importers/watch.py and documented in .env.example.
+      INSIGHT_TZ_OFFSET: "${INSIGHT_TZ_OFFSET:-+07:00}"
+      INSIGHT_WORK_START: "${INSIGHT_WORK_START:-09:00}"
+      INSIGHT_WORK_END: "${INSIGHT_WORK_END:-19:00}"
+      INSIGHT_WORK_DAYS: "${INSIGHT_WORK_DAYS:-0,1,2,3,4}"
+      INSIGHT_MISS_THRESHOLD: "${INSIGHT_MISS_THRESHOLD:-3}"
+      INSIGHT_NTFY_URL: "${INSIGHT_NTFY_URL:-https://ntfy.sh/seta-insight}"
+      INSIGHT_NTFY_TOKEN: "${INSIGHT_NTFY_TOKEN:-}"
+      # How often to look. Hourly is frequent enough for a rule measured in
+      # working days, and rare enough that the log stays readable.
+      INSIGHT_WATCH_INTERVAL: "${INSIGHT_WATCH_INTERVAL:-3600}"
+
+    volumes:
+      - "${INSIGHT_CONF:-./etc}:/etc/insight:ro"
+      - "${INSIGHT_STATE:-./state}:/var/lib/insight-watch"
+
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      # A loop rather than cron: one process, one log, and nothing to install
+      # on the host. `|| true` because a watchdog that dies of a transient
+      # network error is a watchdog that was not watching.
+      - |
+        while true; do
+          python3 /app/importers/watch.py             --roster /etc/insight/roster.txt             --endpoint http://insight-proxy:8479             --token "$$(cat /etc/insight/admin.token)"             --state /var/lib/insight-watch/state.json || true
+          sleep "$${INSIGHT_WATCH_INTERVAL:-3600}"
+        done
+
+    # The image's health check asks the endpoint's own port whether it is up.
+    # In this container nothing listens there, so it would report unhealthy
+    # forever -- an alarm that is always on, which is the same as no alarm.
+    # The watchdog's liveness is visible in its log, once an hour.
+    healthcheck:
+      disable: true
+
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m
+    cap_drop: [ALL]
+    security_opt:
+      - no-new-privileges:true
+
+    logging:
+      driver: json-file
+      options: {max-size: "10m", max-file: "5"}
+
+    networks: [edge]
+
+
+networks:
+  edge:
+    # The network the TLS terminator is already on. Declared external so this
+    # project never creates or removes it -- it belongs to that deployment.
+    external: true
+    name: "${INSIGHT_EDGE_NETWORK:?set INSIGHT_EDGE_NETWORK to the reverse proxy's docker network}"

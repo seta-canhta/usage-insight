@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 import shutil
+import ssl
 import sys
 import tempfile
 import unittest
@@ -220,6 +221,122 @@ class RotationFallbackTests(unittest.TestCase):
                                  previous_token="old", post=post)
         self.assertIn("rotated", str(caught.exception))
         self.assertEqual(len(post.calls), 2)
+
+
+class InFrontOfTheEndpointTests(unittest.TestCase):
+    """A refusal from the CDN must not be read as a refusal from the endpoint.
+
+    Found in deployment: Cloudflare answered a valid upload with `error code:
+    1010` and this reported that the engineer's address had been removed from
+    the whitelist -- sending someone to edit a file that was never wrong.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="insight-front-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "b.ndjson")
+        write_bundle(self.path)
+
+    def test_a_403_from_a_cdn_does_not_blame_the_whitelist(self):
+        post = Recorder((403, {"body": "error code: 1010"}))
+        with self.assertRaises(ship_mod.ShipError) as caught:
+            ship_mod.ship_bundle(self.path, "https://x.test", token="t", post=post)
+        message = str(caught.exception)
+        self.assertIn("did not reach the endpoint", message)
+        self.assertNotIn("whitelist", message)
+        self.assertIn("1010", message)
+
+    def test_a_403_from_a_cdn_is_not_retried_with_the_previous_secret(self):
+        # No credential of any kind would get past it, and trying a second one
+        # is how a blocked client turns into a blocked client that looks like
+        # credential stuffing.
+        post = Recorder((403, {"body": "error code: 1010"}))
+        with self.assertRaises(ship_mod.ShipError):
+            ship_mod.ship_bundle(self.path, "https://x.test", token="new",
+                                 previous_token="old", post=post)
+        self.assertEqual(len(post.calls), 1)
+
+    def test_a_401_from_a_cdn_does_not_look_like_a_rotation(self):
+        post = Recorder((401, {"body": "<html>Access denied</html>"}))
+        with self.assertRaises(ship_mod.ShipError) as caught:
+            ship_mod.ship_bundle(self.path, "https://x.test", token="new",
+                                 previous_token="old", post=post)
+        self.assertIn("in front of it", str(caught.exception))
+        self.assertEqual(len(post.calls), 1)
+
+    def test_the_endpoints_own_refusals_are_unaffected(self):
+        post = Recorder((403, {"error": "not on the whitelist"}))
+        with self.assertRaises(ship_mod.ShipError) as caught:
+            ship_mod.ship_bundle(self.path, "https://x.test", token="t", post=post)
+        self.assertIn("whitelist", str(caught.exception))
+
+
+class UserAgentTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="insight-ua-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.path = os.path.join(self.tmp, "b.ndjson")
+        write_bundle(self.path)
+
+    def test_the_client_names_itself(self):
+        # urllib's default is `Python-urllib/3.x`, which Cloudflare's browser
+        # integrity check answers with 403 (`error code: 1010`) before the
+        # request reaches the endpoint. Nothing downstream can recover from
+        # that, so the header is part of the contract, not decoration.
+        post = Recorder((201, {"key": "k"}))
+        ship_mod.ship_bundle(self.path, "https://x.test", token="t", post=post)
+        agent = post.calls[0]["headers"]["User-Agent"]
+        self.assertTrue(agent)
+        self.assertNotIn("Python-urllib", agent)
+
+
+class TrustStoreTests(unittest.TestCase):
+    """HTTPS has to work on a stock Mac.
+
+    A python.org build ships with an empty trust store until somebody runs
+    `Install Certificates.command`, which nobody does -- so every upload fails
+    with "unable to get local issuer certificate" on a machine where `curl` to
+    the same URL works.
+    """
+
+    def test_the_context_has_certificates_to_verify_against(self):
+        self.assertTrue(ship_mod._ssl_context().get_ca_certs())
+
+    def test_verification_is_never_switched_off(self):
+        # The tempting fix. An unverified upload of a sealed bundle is worse
+        # than a failed one, because it looks like it worked.
+        context = ship_mod._ssl_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_an_empty_default_store_falls_back_to_the_system_bundle(self):
+        self.addCleanup(setattr, ssl, "create_default_context",
+                        ssl.create_default_context)
+        ssl.create_default_context = lambda *a, **k: ssl.SSLContext(
+            ssl.PROTOCOL_TLS_CLIENT)          # loads nothing
+        context = ship_mod._ssl_context()
+        self.assertTrue(context.get_ca_certs(),
+                        "no CA bundle found on this machine to fall back to")
+
+    def test_a_certificate_failure_is_not_retried(self):
+        # It will not verify on the third attempt either, and the retries only
+        # delay the message that says what to do about it.
+        attempts = []
+
+        def post(url, body, headers, timeout):
+            attempts.append(url)
+            raise urllib.error.URLError(
+                ssl.SSLCertVerificationError("unable to get local issuer certificate"))
+
+        tmp = tempfile.mkdtemp(prefix="insight-cert-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "b.ndjson")
+        write_bundle(path)
+        with self.assertRaises(ship_mod.ShipError) as caught:
+            ship_mod.ship_bundle(path, "https://x.test", token="t", post=post)
+        self.assertEqual(len(attempts), 1)
+        self.assertIn("Install Certificates", str(caught.exception))
+        self.assertIn("Nothing was uploaded", str(caught.exception))
 
 
 class ReceiptTests(unittest.TestCase):

@@ -86,11 +86,22 @@ def parse_whitelist(raw: str) -> Dict[str, List[str]]:
     A second fingerprint is a rotation in progress. Both are accepted at once so
     a rotation never needs the engineer and the ``.env`` to change in the same
     minute, which is the coordination that makes people avoid rotating at all.
+
+    A ``#`` comment runs to the end of its line. That has to be handled per
+    line, before the lines are flattened: this reads a file that an operator
+    edits by hand, and a comment naturally contains a comma -- "one line per
+    engineer, as `whoami` prints it". Splitting on commas first turns the tail
+    of that sentence into an entry, and the endpoint refuses to start over a
+    remark.
     """
+    entries: List[str] = []
+    for line in (raw or "").splitlines():
+        entries.extend(line.split("#", 1)[0].split(","))
+
     allowed: Dict[str, List[str]] = {}
-    for entry in (raw or "").replace("\n", ",").split(","):
+    for entry in entries:
         entry = entry.strip()
-        if not entry or entry.startswith("#"):
+        if not entry:
             continue
         parts = [p.strip() for p in entry.split(":") if p.strip()]
         if len(parts) < 2:

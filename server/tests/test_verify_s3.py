@@ -117,6 +117,35 @@ class ExitCodeTests(unittest.TestCase):
         code = verify_s3.main(["--store", os.path.join(self.tmp, "ok"), "--json"])
         self.assertEqual(code, 0)
 
+    def test_an_advisory_alone_still_exits_zero(self):
+        # A human running this from a laptop is told about the delete grant and
+        # is not stopped by it -- their credential is expected to be broad.
+        self.addCleanup(setattr, verify_s3, "check_least_privilege",
+                        verify_s3.check_least_privilege)
+        verify_s3.check_least_privilege = lambda store, bucket: [
+            verify_s3.Check("the role CAN delete", "", ok=False, advisory=True)]
+        code = verify_s3.main(["--store", os.path.join(self.tmp, "advisory"),
+                               "--json"])
+        self.assertEqual(code, 0)
+
+    def test_strict_turns_an_advisory_into_a_failure(self):
+        # The same finding on the host that serves the endpoint is a defect:
+        # that credential is the service's, and the service never deletes. The
+        # deploy runbook runs with --strict so the difference is enforced rather
+        # than remembered.
+        self.addCleanup(setattr, verify_s3, "check_least_privilege",
+                        verify_s3.check_least_privilege)
+        verify_s3.check_least_privilege = lambda store, bucket: [
+            verify_s3.Check("the role CAN delete", "", ok=False, advisory=True)]
+        code = verify_s3.main(["--store", os.path.join(self.tmp, "strict"),
+                               "--json", "--strict"])
+        self.assertEqual(code, 1)
+
+    def test_strict_does_not_invent_failures(self):
+        code = verify_s3.main(["--store", os.path.join(self.tmp, "clean"),
+                               "--json", "--strict"])
+        self.assertEqual(code, 0)
+
     def test_no_store_is_an_error_naming_the_bucket(self):
         with self.assertRaises(SystemExit) as caught:
             verify_s3.main(["--json"])

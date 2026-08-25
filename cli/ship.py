@@ -29,6 +29,14 @@ from typing import Any, Dict, List, Optional, Tuple
 
 CLIENT_VERSION = "insight-ship/1"
 
+#: Sent as ``User-Agent``. Not cosmetic: urllib's default is
+#: ``Python-urllib/3.x``, and Cloudflare's browser integrity check answers that
+#: with ``403 error code: 1010`` -- before the request reaches the endpoint, so
+#: no credential or header of ours can help. Found the first time a bundle was
+#: shipped at the real hostname. Naming the client is also what makes an upload
+#: identifiable in an access log.
+USER_AGENT = "seta-insight/1 (+usage-insight)"
+
 #: Bundles are KBs to a couple of MB (``docs/TRANSPORT.md``, *Sizing*). A file
 #: an order of magnitude past that is a bug or a mistake, and the useful place
 #: to find that out is here -- before spending an engineer's upstream on it --
@@ -116,10 +124,60 @@ def digest_of(path: str) -> Tuple[bytes, str]:
 # the wire
 # --------------------------------------------------------------------------
 
+#: Where to look for a CA bundle when Python's own trust store is empty, in the
+#: order they are tried. The first is macOS's system bundle -- the same one
+#: `curl` uses, which is why `curl` works on a machine where this does not.
+_CA_BUNDLES = (
+    "/etc/ssl/cert.pem",                        # macOS, FreeBSD
+    "/etc/ssl/certs/ca-certificates.crt",       # Debian, Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",         # Fedora, RHEL
+)
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """A context that can actually verify the endpoint's certificate.
+
+    A stock python.org build on macOS ships with an *empty* trust store until
+    somebody runs ``Install Certificates.command``, which nobody does. Every
+    HTTPS upload then fails with ``unable to get local issuer certificate`` --
+    on a machine where ``curl`` to the same URL works, because ``curl`` reads
+    the system bundle. This is not a rare corner: it is the default state of a
+    fresh Mac, and it would have made `ship` look broken for most of the team.
+
+    So: the normal context first, and only if it loaded nothing, the bundle the
+    operating system already ships -- the same one `curl` reads. Verification is
+    never turned off: an unverified upload of a sealed bundle is worse than a
+    failed one, because it looks like it worked.
+    """
+    context = ssl.create_default_context()
+    if context.get_ca_certs():
+        return context
+
+    for candidate in _CA_BUNDLES:
+        if not os.path.exists(candidate):
+            continue
+        try:
+            context.load_verify_locations(cafile=candidate)
+        except (OSError, ssl.SSLError):
+            continue
+        if context.get_ca_certs():
+            return context
+
+    return context          # still empty: let it fail, and explain why
+
+
+def _is_certificate_error(exc: BaseException) -> bool:
+    """``urlopen`` wraps the SSL error in a ``URLError``; unwrap one level."""
+    for candidate in (exc, getattr(exc, "reason", None)):
+        if isinstance(candidate, ssl.SSLCertVerificationError):
+            return True
+    return False
+
+
 def _post(url: str, body: bytes, headers: Dict[str, str],
           timeout: int) -> Tuple[int, Dict[str, Any]]:
     request = urllib.request.Request(url, data=body, headers=headers, method="PUT")
-    context = ssl.create_default_context()
+    context = _ssl_context()
     try:
         with urllib.request.urlopen(request, timeout=timeout, context=context) as response:
             payload = response.read().decode("utf-8", "replace")
@@ -175,6 +233,7 @@ def ship_bundle(path: str, endpoint: str, token: Optional[str] = None,
         "X-Insight-Format": str(manifest.get("format") or ""),
         "X-Insight-Digest": "sha256=" + digest,
         "X-Insight-Client": CLIENT_VERSION,
+        "User-Agent": USER_AGENT,
     }
     url = endpoint.rstrip("/") + "/v1/bundle"
 
@@ -209,6 +268,17 @@ def _attempt(url, body, headers, timeout, retries, post, manifest, window,
         try:
             status, payload = post(url, body, headers, timeout)
         except (urllib.error.URLError, OSError) as exc:
+            if _is_certificate_error(exc):
+                # Permanent, like a 403: the certificate will not verify on the
+                # next attempt either, and three tries only delay the message
+                # that says what to do.
+                raise ShipError(
+                    "{} presented a certificate this machine cannot verify -- "
+                    "{}. Python's trust store is empty, which is the default "
+                    "on a python.org install for macOS: run "
+                    "\"/Applications/Python 3.x/Install Certificates.command\" "
+                    "or point SSL_CERT_FILE at a CA bundle. Nothing was "
+                    "uploaded.".format(url, exc))
             last = "{}: {}".format(type(exc).__name__, exc)
             if attempt == retries:
                 raise ShipError("{} unreachable after {} attempts -- {}".format(
@@ -234,9 +304,27 @@ def _attempt(url, body, headers, timeout, retries, post, manifest, window,
             }
 
         detail = payload.get("error") or payload.get("body") or ""
+
+        # Who actually answered? The endpoint replies in JSON with an "error"
+        # key; a CDN or WAF in front of it replies with its own page. Told
+        # apart because they mean opposite things: a 403 from the endpoint is
+        # "you are not on the whitelist", and a 403 from Cloudflare is "the
+        # bundle never reached the endpoint" -- and reading the second as the
+        # first sends someone to edit a whitelist that was never wrong.
+        # Found in deployment: Cloudflare answered `error code: 1010` to a
+        # perfectly valid upload, and this said the address had been removed.
+        answered_by_endpoint = "error" in payload
+
         # 401 is "I do not know this secret", so another one is worth trying.
         # 403 is "I know you and you may not upload" -- a second secret for the
         # same person cannot change that, and trying one looks like stuffing.
+        if not answered_by_endpoint and 400 <= status < 500:
+            raise ShipError(
+                "{} did not reach the endpoint: HTTP {} came from something in "
+                "front of it -- a CDN, WAF or reverse proxy{}. The bundle is "
+                "untouched and nothing on this machine needs changing; the "
+                "endpoint's own refusals arrive as JSON.".format(
+                    url, status, " -- " + detail if detail else ""))
         if status == 401:
             raise _Unauthorised()
         if status == 403:

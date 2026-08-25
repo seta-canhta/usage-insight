@@ -284,6 +284,61 @@ class ReadRouteTests(ProxyTestCase):
         self.assertTrue(self.json_of(raw)["ok"])
 
 
+class AdminTokenSourceTests(unittest.TestCase):
+    """Where the admin token is read from.
+
+    A file is offered because of how this is deployed. In a container the
+    environment is readable by anyone who can reach the Docker daemon --
+    `docker inspect` prints it -- which on a shared host is a wider audience
+    than root.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="insight-token-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def write(self, text):
+        path = os.path.join(self.tmp, "token")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_a_file_holds_the_token(self):
+        path = self.write("s3cret-token\n")
+        self.assertEqual(proxy_mod.load_admin_token(None, path), "s3cret-token")
+
+    def test_a_trailing_newline_is_not_part_of_the_token(self):
+        # `echo token > file` is how this file gets written by hand, and a
+        # token that silently includes \n never matches the header.
+        path = self.write("s3cret-token\n")
+        self.assertNotIn("\n", proxy_mod.load_admin_token(None, path))
+
+    def test_the_file_wins_over_the_environment(self):
+        # Both set means the deploy moved to a file and left the old variable
+        # behind. The file is the one that was edited on purpose.
+        path = self.write("from-file")
+        self.assertEqual(proxy_mod.load_admin_token("from-env", path), "from-file")
+
+    def test_the_environment_still_works_on_its_own(self):
+        self.assertEqual(proxy_mod.load_admin_token("from-env", None), "from-env")
+
+    def test_an_empty_file_refuses_to_start(self):
+        # Not "no admin token, so no read routes" -- a truncated file must not
+        # quietly become an open door or a silent one.
+        with self.assertRaises(SystemExit):
+            proxy_mod.load_admin_token(None, self.write("   \n"))
+
+    def test_a_missing_file_names_the_path(self):
+        missing = os.path.join(self.tmp, "not-there")
+        with self.assertRaises(SystemExit) as caught:
+            proxy_mod.load_admin_token(None, missing)
+        self.assertIn(missing, str(caught.exception))
+
+    def test_nothing_at_all_refuses_to_start(self):
+        with self.assertRaises(SystemExit):
+            proxy_mod.load_admin_token(None, None)
+
+
 class TraversalTests(ProxyTestCase):
     def test_a_key_cannot_escape_the_store(self):
         status, _ = self.get("/v1/bundle/../../../../etc/passwd")

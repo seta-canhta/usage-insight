@@ -75,6 +75,36 @@ class WhitelistTests(unittest.TestCase):
             "# team\n,canh@seta-international.vn:aaa,\n")
         self.assertEqual(parsed, {"canh@seta-international.vn": ["aaa"]})
 
+    def test_a_comment_may_contain_a_comma(self):
+        # Found by deploying: the header line of a hand-edited allowed.env read
+        # "# One line per engineer, exactly what `./insight whoami` prints."
+        # Flattening newlines to commas first made "exactly what ..." an entry,
+        # and the endpoint refused to start over a remark.
+        parsed = identity.parse_whitelist(
+            "# One line per engineer, exactly what `whoami` prints.\n"
+            "canh@seta-international.vn:aaa\n")
+        self.assertEqual(parsed, {"canh@seta-international.vn": ["aaa"]})
+
+    def test_a_comment_after_an_entry_is_not_part_of_it(self):
+        parsed = identity.parse_whitelist(
+            "canh@seta-international.vn:aaa   # left the team 2026-09-01?\n")
+        self.assertEqual(parsed, {"canh@seta-international.vn": ["aaa"]})
+
+    def test_a_comment_does_not_swallow_the_next_line(self):
+        parsed = identity.parse_whitelist(
+            "# a note\ncanh@seta-international.vn:aaa\n"
+            "# another, with a comma\nminh@seta-international.vn:bbb\n")
+        self.assertEqual(sorted(parsed), ["canh@seta-international.vn",
+                                          "minh@seta-international.vn"])
+
+    def test_the_environment_variable_form_is_unaffected(self):
+        # INSIGHT_ALLOWED is one line of comma-separated entries and has no
+        # comments; per-line comment stripping must not change it.
+        parsed = identity.parse_whitelist(
+            "canh@seta-international.vn:aaa,minh@seta-international.vn:bbb")
+        self.assertEqual(sorted(parsed), ["canh@seta-international.vn",
+                                          "minh@seta-international.vn"])
+
     def test_rejects_an_entry_with_no_fingerprint(self):
         with self.assertRaises(identity.IdentityError):
             identity.parse_whitelist("canh@seta-international.vn")

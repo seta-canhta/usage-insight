@@ -159,6 +159,18 @@ cả khi tuần đó không có gì.
 `purge` chỉ xoá trên máy bạn. Bundle đã upload thì đã upload rồi — cần xoá thì
 hỏi người vận hành pipeline.
 
+### Nếu upload thất bại
+
+`ship` sẽ nói rõ là trường hợp nào, và không trường hợp nào làm mất bundle —
+nó vẫn nằm trong `~/.seta-insight/.reports/` và lần chạy sau sẽ gửi lại.
+
+| thông báo | nghĩa là gì |
+|---|---|
+| *not on the whitelist* (`401`) | dòng của bạn chưa tới server, hoặc bạn vừa đổi khoá và khoá cũ đã hết hiệu lực. Chạy `./insight whoami` để in lại |
+| *did not reach the endpoint* | một thứ đứng trước server — CDN hoặc proxy — đã chặn request. Máy bạn không cần sửa gì; báo cho người vận hành pipeline |
+| *a certificate this machine cannot verify* | Python trên máy bạn không có chứng chỉ CA. Với bản cài từ python.org trên macOS, chạy `/Applications/Python 3.x/Install Certificates.command` |
+| *unreachable after 3 attempts* | mạng, hoặc server đang tắt. Lần chạy theo giờ kế tiếp sẽ gửi lại |
+
 ## Đây không phải cái gì
 
 Các con số này mô tả **một cách làm việc đang diễn ra thế nào** — việc có AI hỗ

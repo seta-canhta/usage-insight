@@ -153,6 +153,32 @@ def _bearer(headers: Dict[str, str]) -> str:
     return value.strip()
 
 
+def load_admin_token(raw: Optional[str], path: Optional[str]) -> str:
+    """``INSIGHT_ADMIN_TOKEN``, or a file holding it.
+
+    The file exists because of how this is actually deployed. In a container the
+    environment is readable by anyone who can talk to the Docker daemon --
+    ``docker inspect`` prints it -- and on a shared host that is a wider audience
+    than root. A mounted, root-owned file is not visible that way, and it is the
+    same shape as ``INSIGHT_ALLOWED_FILE`` next to it.
+
+    Required either way. The read routes expose every engineer at once.
+    """
+    token = (raw or "").strip()
+    if path:
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                token = handle.read().strip()
+        except OSError as exc:
+            raise SystemExit("cannot read INSIGHT_ADMIN_TOKEN_FILE {}: {}".format(
+                path, exc))
+    if not token:
+        raise SystemExit(
+            "INSIGHT_ADMIN_TOKEN is required -- the read routes expose every "
+            "engineer at once and are never left open")
+    return token
+
+
 def load_allowed(raw: Optional[str], path: Optional[str]) -> Dict[str, List[str]]:
     """``INSIGHT_ALLOWED`` from the environment, or a file holding the same.
 
@@ -425,6 +451,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                         default=int(os.environ.get("INSIGHT_PORT", "8479")))
     parser.add_argument("--allowed-file", default=os.environ.get("INSIGHT_ALLOWED_FILE"),
                         help="file of email:fingerprint lines")
+    parser.add_argument("--admin-token-file",
+                        default=os.environ.get("INSIGHT_ADMIN_TOKEN_FILE"),
+                        help="file holding the admin token, instead of putting "
+                             "it in the environment where `docker inspect` "
+                             "shows it")
     args = parser.parse_args(argv)
 
     logging.basicConfig(
@@ -433,11 +464,8 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     if not args.store:
         raise SystemExit("no --store -- pass s3://aeris-insight or file:///path")
-    admin_token = os.environ.get("INSIGHT_ADMIN_TOKEN", "")
-    if not admin_token:
-        raise SystemExit(
-            "INSIGHT_ADMIN_TOKEN is required -- the read routes expose every "
-            "engineer at once and are never left open")
+    admin_token = load_admin_token(os.environ.get("INSIGHT_ADMIN_TOKEN"),
+                                   args.admin_token_file)
 
     allowed = load_allowed(os.environ.get("INSIGHT_ALLOWED"), args.allowed_file)
     try:
