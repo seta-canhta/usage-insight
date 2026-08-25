@@ -91,7 +91,28 @@ hợp đó thì báo lại, đừng ép.
 
 ---
 
-## Thứ Sáu hàng tuần — khoảng một phút
+## Nó tự chạy, mỗi giờ
+
+`setup` đã hẹn lịch sẵn. Mỗi giờ máy bạn đọc dữ liệu, đóng gói sự kiện trong
+ngày, và **chỉ upload nếu có thay đổi** — giờ nào không có gì thì không gửi gì.
+
+| | |
+|---|---|
+| `./insight schedule --status` | đang bật không, chạy lần cuối lúc nào |
+| `./insight schedule --off` | tắt; quay lại tự chạy lệnh bằng tay |
+| `~/.seta-insight/auto.log` | mỗi lần chạy một dòng, kể cả lỗi |
+
+Không chạy bằng quyền root, không cài gì ngoài thư mục home của bạn.
+
+Mọi bundle đã gửi vẫn nằm trong `~/.seta-insight/.reports/` để bạn mở ra đọc lại
+bất cứ lúc nào, và `purge` vẫn xoá sạch mọi thứ trên máy bạn.
+
+---
+
+## Nếu bạn muốn tự chạy bằng tay
+
+`./insight setup --no-schedule` để tắt lịch tự động. Khi đó, thứ Sáu hàng tuần —
+khoảng một phút
 
 ```bash
 cd ~/usage-insight

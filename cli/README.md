@@ -114,3 +114,29 @@ rotation that happens once.
 The email is transport identity. `CONTRACT.md §1.1` forbids raw addresses in
 collected data and nothing here writes one into a bundle; it exists so a missing
 week can be chased by name instead of by machine id.
+
+## Hourly, by default
+
+`setup` installs a launchd agent (macOS) or systemd user timer (Linux) that runs
+`insight auto` once an hour. `schedule --off` removes it; `--no-schedule` at
+setup never installs it.
+
+`auto` is the same work the manual commands do, with the properties an
+unattended job needs. Each is tested, because every one of these failures is
+invisible for weeks:
+
+- **Dedupes on the events, not the file.** The manifest carries `packed_at`, so
+  the file changes every hour even when nothing happened. Keying on it would
+  upload 24 near-identical bundles a day.
+- **A quiet day still uploads once.** An empty bundle with a declared window is
+  a measured zero; a day with no bundle is missing data. Collapsing the two is
+  the failure `ARCHITECTURE.md` cares about most.
+- **A failing step does not stop the others.** Copilot not being installed is
+  not a reason to skip uploading buffered agent events.
+- **A failed upload keeps its bundle** for the next run.
+- **A stale lock is broken after six hours**, so one crash does not stop
+  collection permanently and silently.
+- **An uninitialised machine exits quietly** — the scheduler outlives
+  `purge --all`.
+- **Old buffer days are pruned only once a bundle covering them was uploaded.**
+  Pruning on age alone turns a fixable outage into permanent data loss.

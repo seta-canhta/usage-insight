@@ -222,6 +222,11 @@ def _attempt(url, body, headers, timeout, retries, post, manifest, window,
                 "already_stored": status == 409,
                 "key": payload.get("key"),
                 "sha256": payload.get("sha256") or digest,
+                # The manifest's own checksum, over the events only. Unlike the
+                # transport digest it does not move when nothing but `packed_at`
+                # changed, which is what lets an hourly run tell a genuinely
+                # quiet hour from the same events packed again.
+                "content_sha256": manifest.get("sha256"),
                 "bytes": payload.get("bytes") or len(body),
                 "machine_id": manifest.get("machine_id"),
                 "window": window,

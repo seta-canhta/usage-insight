@@ -21,6 +21,8 @@ to resolve on someone else's machine.
     ./insight pack      seal a bundle to hand over
     ./insight ship      send a sealed bundle to the collection endpoint
     ./insight whoami    the whitelist line to send to the server admin
+    ./insight schedule  collect hourly instead of remembering to
+    ./insight auto      one unattended run, for the scheduler
     ./insight rotate-token  mint a new upload secret
     ./insight status    what is buffered, what was packed
     ./insight purge     delete everything collected
@@ -35,14 +37,17 @@ where a content leak would come from.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import hashlib
+import io
 import json
 import os
 import re
 import subprocess
 import sys
+import time
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -112,6 +117,23 @@ and you can read any bundle first. `purge` deletes everything held here; a
 bundle you have already sent is already sent, and removing that is a request to
 whoever runs the pipeline."""
 
+#: The honest version of the above once collection is scheduled. Setup turns
+#: hourly upload on by default, so the consent text has to lead with that --
+#: describing a manual handover to someone whose machine will upload on its own
+#: is not a consent record, it is a wrong one.
+TRANSPORT_HOURLY = """**This machine will upload on its own, every hour.** A sealed bundle of the
+day's events goes to:
+
+  {endpoint}
+
+Bundles are kept in {home} so you can read anything that was sent, `status`
+lists every upload, and nothing is uploaded in an hour where nothing changed.
+
+You are not locked in: `insight schedule --off` stops the hourly run and
+returns this to upload-only-when-you-say-so, and `purge` deletes everything
+held here. A bundle already sent is already sent -- removing that is a request
+to whoever runs the pipeline."""
+
 
 # --------------------------------------------------------------------------
 # config
@@ -167,8 +189,12 @@ def cmd_init(args: argparse.Namespace) -> int:
             email = identity.normalise_email(email)
         except identity.IdentityError as exc:
             raise SystemExit(str(exc))
-    transport = (TRANSPORT_ENDPOINT.format(home=HOME, endpoint=endpoint)
-                 if endpoint else TRANSPORT_MANUAL.format(home=HOME))
+    if endpoint and getattr(args, "hourly", False):
+        transport = TRANSPORT_HOURLY.format(home=HOME, endpoint=endpoint)
+    elif endpoint:
+        transport = TRANSPORT_ENDPOINT.format(home=HOME, endpoint=endpoint)
+    else:
+        transport = TRANSPORT_MANUAL.format(home=HOME)
     print(CONSENT_TEXT.format(home=HOME, transport=transport))
     if not args.yes:
         answer = input("Collect telemetry from this machine? [y/N] ").strip().lower()
@@ -409,7 +435,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
             cmd_init(argparse.Namespace(yes=args.yes, force=False,
                                         endpoint=args.endpoint,
                                         no_endpoint=args.no_endpoint,
-                                        email=args.email))
+                                        email=args.email,
+                                        hourly=not args.no_schedule))
         steps.append({"step": "consent", "ok": True,
                       "detail": "recorded" if load_config() else "declined"})
 
@@ -441,6 +468,25 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 steps.append({"step": "identity", "ok": True,
                               "detail": config["email"]})
 
+        # Hourly by default. An engineer who has to remember a weekly command
+        # is an engineer whose quiet weeks are indistinguishable from their
+        # busy ones, and `pull` cannot tell those apart from the outside.
+        # `--no-schedule` opts out; `schedule --off` reverses it later.
+        if not args.no_schedule and config is not None:
+            import schedule as schedule_mod
+            try:
+                detail = schedule_mod.install(
+                    os.path.join(_ROOT, "insight"), LOG_PATH)
+                steps.append({"step": "schedule", "ok": True,
+                              "detail": "hourly via {}".format(detail["kind"])})
+            except schedule_mod.ScheduleError as exc:
+                # Not fatal. Everything still works by hand, and saying so
+                # beats a setup that reports success and quietly never runs.
+                steps.append({"step": "schedule", "ok": False,
+                              "detail": "{} -- collection still works with "
+                                        "`./insight pack && ./insight ship`"
+                                        .format(exc)})
+
         for repo in args.repo or []:
             try:
                 cmd_install_hook(argparse.Namespace(repo=repo, force=args.force))
@@ -462,8 +508,13 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("Restart VS Code (quit fully, not Reload Window) so the settings "
               "take effect.")
         final = load_config() or {}
-        tail = " && ./insight ship" if final.get("endpoint") else ""
-        print("Then: ./insight otel && ./insight collect && ./insight pack" + tail)
+        if not args.no_schedule and any(
+                s["step"] == "schedule" and s["ok"] for s in steps):
+            print("Collection runs hourly from now on. Nothing else to remember.")
+            print("`./insight schedule --status` shows the last run, `--off` stops it.")
+        else:
+            tail = " && ./insight ship" if final.get("endpoint") else ""
+            print("Then: ./insight otel && ./insight collect && ./insight pack" + tail)
         if final.get("endpoint_token"):
             print()
             print_whitelist_line(final)
@@ -880,6 +931,16 @@ def cmd_pack(args: argparse.Namespace) -> int:
     os.makedirs(REPORTS_DIR, exist_ok=True)
     name = "{}-{}.ndjson".format(config["machine_id"][:8], now().replace(":", "").replace("-", ""))
     path = os.path.join(REPORTS_DIR, name)
+    # The stamp has second resolution, so two packs in the same second collide.
+    # Rare by hand and routine once a scheduler is driving this -- and the
+    # failure is silent: the second bundle overwrites the first, which may not
+    # have been uploaded yet.
+    if os.path.exists(path):
+        stem = name[:-len(".ndjson")]
+        serial = 2
+        while os.path.exists(path):
+            path = os.path.join(REPORTS_DIR, "{}-{}.ndjson".format(stem, serial))
+            serial += 1
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(json.dumps({"_manifest": manifest}, sort_keys=True) + "\n")
         handle.write(body)
@@ -978,6 +1039,251 @@ def cmd_ship(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# auto -- the unattended hourly run
+# --------------------------------------------------------------------------
+
+LOCK_PATH = os.path.join(HOME, "auto.lock")
+LOG_PATH = os.path.join(HOME, "auto.log")
+
+#: Buffer partitions older than this are removed once a bundle covering them
+#: has been uploaded. An hourly job runs forever; without this the buffer on an
+#: engineer's laptop grows for as long as they work here.
+KEEP_DAYS = 30
+
+
+def _log(record: Dict[str, Any]) -> None:
+    record["at"] = now()
+    try:
+        os.makedirs(HOME, exist_ok=True)
+        with open(LOG_PATH, "a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record, sort_keys=True) + "\n")
+    except OSError:
+        pass  # a full disk must not turn a collection run into a crash loop
+
+
+def _quietly(step: str, fn, args: argparse.Namespace) -> Tuple[Optional[str], str]:
+    """Run one step. Returns ``(error or None, whatever it printed)``.
+
+    Unattended, so a step that fails must not stop the ones after it: Copilot
+    not having written a span file is not a reason to skip uploading the agent
+    events that are already buffered. Every failure is logged; none is fatal.
+
+    The captured output is how ``auto`` learns which bundle ``pack`` wrote.
+    Guessing it from the directory instead would mean guessing wrong exactly
+    when two bundles share a timestamp.
+    """
+    buffer = io.StringIO()
+    try:
+        with contextlib.redirect_stdout(buffer):
+            fn(args)
+    except SystemExit as exc:
+        return "{}: {}".format(step, exc), buffer.getvalue()
+    except Exception as exc:  # noqa: BLE001 -- an hourly job may not crash
+        return "{}: {}: {}".format(step, type(exc).__name__, exc), buffer.getvalue()
+    return None, buffer.getvalue()
+
+
+def _prune_buffer(receipts: Dict[str, Any]) -> List[str]:
+    """Drop old partitions, but only ones already covered by an upload.
+
+    Pruning on age alone would delete a week that never left the machine
+    because shipping had been broken the whole time -- silently turning a fixable
+    outage into permanent data loss.
+    """
+    covered = set()
+    for receipt in receipts.values():
+        if not isinstance(receipt, dict):
+            continue
+        window = str(receipt.get("window") or "")
+        if "/" in window:
+            start, end = window.split("/", 1)
+            covered.add((start[:10], end[:10]))
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(days=KEEP_DAYS)).strftime("%Y-%m-%d")
+    dropped = []
+    for day in buffer_days():
+        if day >= cutoff:
+            continue
+        if not any(start <= day <= end for start, end in covered):
+            continue
+        path = buffer_path(day)
+        if os.path.exists(path):
+            os.remove(path)
+            dropped.append(day)
+    return dropped
+
+
+def cmd_auto(args: argparse.Namespace) -> int:
+    """One collection run, for a scheduler rather than a person.
+
+    Reads the local sources, packs the current day, and uploads it only if the
+    result differs from what has already gone. A quiet hour therefore costs
+    nothing: no object, no request, no line in the report suggesting activity
+    that did not happen.
+    """
+    import ship as ship_mod
+
+    config = load_config()
+    if config is None:
+        _log({"event": "skipped", "reason": "not initialised"})
+        return 0
+
+    # A slow scan on a big repository can outlast the hour. Overlapping runs
+    # would pack the same events twice and race on the buffer.
+    os.makedirs(HOME, exist_ok=True)
+    try:
+        lock = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+    except FileExistsError:
+        age = time.time() - os.path.getmtime(LOCK_PATH)
+        if age < 6 * 3600:
+            _log({"event": "skipped", "reason": "another run holds the lock",
+                  "lock_age_s": int(age)})
+            return 0
+        # Older than any real run: the previous process died without cleaning up.
+        os.remove(LOCK_PATH)
+        lock = os.open(LOCK_PATH, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+
+    problems: List[str] = []
+    try:
+        os.write(lock, str(os.getpid()).encode())
+        os.close(lock)
+
+        for step, fn, ns in (
+            ("otel", cmd_otel, argparse.Namespace(source=None, keep_raw=False)),
+            ("collect", cmd_collect, argparse.Namespace(source=None)),
+            ("scan", cmd_scan, argparse.Namespace(repo=None, since_days=7)),
+        ):
+            problem, _ = _quietly(step, fn, ns)
+            if problem:
+                problems.append(problem)
+
+        # The current day, declared. Re-packing it as the day fills is what
+        # makes an hourly run idempotent: identical content hashes identically,
+        # and the proxy already refuses a digest it holds.
+        today = now()[:10]
+        pack_problem, packed = _quietly("pack", cmd_pack, argparse.Namespace(
+            window_start=None, window_end=None,
+            since=today, until=today, clear=False))
+        if pack_problem:
+            problems.append(pack_problem)
+            _log({"event": "failed", "problems": problems})
+            return 0
+        try:
+            newest = json.loads(packed)["bundle"]
+        except (json.JSONDecodeError, KeyError, TypeError) as exc:
+            problems.append("pack: unreadable result: {}".format(exc))
+            _log({"event": "failed", "problems": problems})
+            return 0
+
+        # Deduped on the events, never on the file name and never on the whole
+        # file. The name has second resolution, so two packs in one second
+        # collide; the file carries `packed_at`, so it differs on every run even
+        # when nothing happened. The manifest's own checksum covers the events
+        # alone and is the only one of the three that stays still when the hour
+        # was genuinely quiet.
+        receipts = ship_mod.load_receipts(RECEIPTS_PATH)
+        content = ship_mod.read_manifest(newest).get("sha256")
+        already = any(isinstance(r, dict) and r.get("content_sha256") == content
+                      for r in receipts.values())
+        if already:
+            # Nothing new since the last upload. Drop the duplicate rather than
+            # leaving 24 identical bundles a day in .reports/.
+            os.remove(newest)
+            _log({"event": "no_change", "problems": problems})
+            return 0
+
+        if not config.get("endpoint") or not config.get("endpoint_token"):
+            _log({"event": "packed_not_sent", "bundle": os.path.basename(newest),
+                  "reason": "no endpoint or no upload secret", "problems": problems})
+            return 0
+
+        try:
+            receipt = ship_mod.ship_bundle(
+                newest, config["endpoint"],
+                token=config.get("endpoint_token"),
+                previous_token=config.get("endpoint_token_previous"))
+        except ship_mod.ShipError as exc:
+            # Kept on disk. The next run retries it, and a week of failed
+            # uploads still ends with every bundle recoverable by hand.
+            _log({"event": "ship_failed", "bundle": os.path.basename(newest),
+                  "error": str(exc), "problems": problems})
+            return 0
+
+        receipts[os.path.basename(newest)] = receipt
+        ship_mod.save_receipts(RECEIPTS_PATH, receipts)
+        dropped = _prune_buffer(receipts)
+        _log({"event": "shipped", "bundle": os.path.basename(newest),
+              "status": receipt["status"], "key": receipt.get("key"),
+              "pruned_days": dropped, "problems": problems})
+        return 0
+    finally:
+        if os.path.exists(LOCK_PATH):
+            os.remove(LOCK_PATH)
+
+
+def cmd_schedule(args: argparse.Namespace) -> int:
+    import schedule as schedule_mod
+
+    if args.status or not (args.hourly or args.off):
+        state = {
+            "installed": schedule_mod.installed(),
+            "platform": schedule_mod.system(),
+            "interval_seconds": schedule_mod.INTERVAL_SECONDS,
+            "log": LOG_PATH if os.path.exists(LOG_PATH) else None,
+        }
+        if os.path.exists(LOG_PATH):
+            with open(LOG_PATH, "r", encoding="utf-8") as handle:
+                lines = handle.readlines()[-1:]
+            if lines:
+                try:
+                    state["last_run"] = json.loads(lines[0])
+                except json.JSONDecodeError:
+                    pass
+        print(json.dumps(state, indent=2, sort_keys=True))
+        return 0
+
+    if args.off:
+        result = schedule_mod.remove()
+        print(json.dumps({"scheduled": False, **result}, sort_keys=True))
+        return 0
+
+    config = require_config()
+    insight = os.path.join(_ROOT, "insight")
+
+    if not args.yes:
+        # Said before it is switched on, not in a file someone may never open.
+        print()
+        print("Every hour, this machine will:")
+        print("  - read Copilot's span file, the agent buffer, and git history")
+        print("  - pack today's events into a bundle")
+        print("  - upload it to {}".format(config.get("endpoint") or "(no endpoint set)"))
+        print()
+        print("It uploads nothing when nothing has changed, and it never")
+        print("collects prompts, replies, code or diffs -- the same limits as")
+        print("the manual commands.")
+        print()
+        print("What you give up by turning this on: today you read a bundle")
+        print("before sending it. After this, it goes on its own. Everything")
+        print("sent stays readable in {} and `purge` still works.".format(REPORTS_DIR))
+        print()
+        print("`./insight schedule --off` reverses this at any time.")
+        print()
+        answer = input("Collect and upload hourly from this machine? [y/N] ").strip().lower()
+        if answer not in ("y", "yes"):
+            print("nothing was scheduled")
+            return 1
+
+    try:
+        result = schedule_mod.install(insight, LOG_PATH)
+    except schedule_mod.ScheduleError as exc:
+        raise SystemExit(str(exc))
+    print(json.dumps({"scheduled": True, **result}, sort_keys=True))
+    print("Runs hourly. `./insight schedule --status` shows the last run, "
+          "`--off` stops it.")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # identity
 # --------------------------------------------------------------------------
 
@@ -1070,6 +1376,7 @@ def cmd_status(args: argparse.Namespace) -> int:
         f for f in os.listdir(REPORTS_DIR) if f.endswith(".ndjson")
     ) if os.path.isdir(REPORTS_DIR) else []
     import identity
+    import schedule as schedule_mod
     import ship as ship_mod
     receipts = ship_mod.load_receipts(RECEIPTS_PATH)
     print(json.dumps({
@@ -1091,6 +1398,7 @@ def cmd_status(args: argparse.Namespace) -> int:
             identity.fingerprint(config["endpoint_token"])
             if config.get("endpoint_token") else None),
         "rotation_in_flight": bool(config.get("endpoint_token_previous")),
+        "hourly": schedule_mod.installed(),
         "shipped": len(receipts),
         # Named, not counted. "3 bundles waiting" is a number to ignore; the
         # file names are what someone acts on.
@@ -1123,6 +1431,15 @@ def cmd_purge(args: argparse.Namespace) -> int:
     if os.path.exists(RECEIPTS_PATH):
         os.remove(RECEIPTS_PATH)
         removed += 1
+    for path in (LOCK_PATH, LOG_PATH):
+        if os.path.exists(path):
+            os.remove(path)
+            removed += 1
+    if args.all:
+        # Someone purging everything expects the collection to stop, not to
+        # keep running hourly against a config they just deleted.
+        import schedule as schedule_mod
+        schedule_mod.remove()
     if os.path.exists(CONFIG_PATH) and args.all:
         os.remove(CONFIG_PATH)
     print(json.dumps({"files_removed": removed, "config_removed": bool(args.all)}))
@@ -1170,6 +1487,8 @@ def build_parser() -> argparse.ArgumentParser:
                                    "server whitelist, never stored in a bundle")
     p.add_argument("--no-endpoint", action="store_true",
                    help="do not upload; bundles are handed over by hand")
+    p.add_argument("--no-schedule", action="store_true",
+                   help="do not collect hourly; run the commands by hand")
     p.add_argument("--yes", action="store_true", help="skip the consent prompt")
     p.add_argument("--force", action="store_true",
                    help="replace an existing prepare-commit-msg hook")
@@ -1235,6 +1554,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--finish", action="store_true",
                    help="discard the previous secret once the new line is live")
     p.set_defaults(func=cmd_rotate_token)
+
+    p = sub.add_parser(
+        "auto", help="one unattended collection run (what the scheduler calls)")
+    p.set_defaults(func=cmd_auto)
+
+    p = sub.add_parser(
+        "schedule", help="collect hourly instead of remembering to")
+    p.add_argument("--hourly", action="store_true", help="turn it on")
+    p.add_argument("--off", action="store_true", help="turn it off")
+    p.add_argument("--status", action="store_true",
+                   help="is it on, and when did it last run")
+    p.add_argument("--yes", action="store_true", help="skip the prompt")
+    p.set_defaults(func=cmd_schedule)
 
     p = sub.add_parser("status", help="what is buffered and what was packed")
     p.set_defaults(func=cmd_status)

@@ -1,0 +1,216 @@
+#!/usr/bin/env python3
+"""Run the collection hourly instead of remembering to.
+
+    ./insight schedule --hourly     turn it on
+    ./insight schedule --off        turn it off
+    ./insight schedule --status     is it on, when did it last run
+
+macOS gets a launchd agent, Linux a systemd user timer, and a machine with
+neither is told to add a cron line rather than left thinking it worked.
+
+**This is opt-in and it says so.** Weekly handover made the consent concrete --
+an engineer packed a file, read it if they wanted, and sent it. An hourly job
+removes the moment where that reading happened, so the trade is made explicitly:
+`schedule --hourly` prints what it will do and asks, `--off` reverses it, and
+neither is the default. What survives is that everything is still readable
+afterwards, `status` shows every upload, and `purge` still works.
+
+Nothing here runs as root, installs a system service, or writes outside the
+user's own home. A tool that measures people should be one they can switch off
+without asking anyone.
+"""
+
+from __future__ import annotations
+
+import os
+import platform
+import subprocess
+from typing import Dict, List, Optional, Tuple
+
+LABEL = "vn.seta.insight"
+
+#: Hourly. Not configurable yet, because every value below an hour is someone
+#: mistaking this for a live dashboard, and the pipeline is weekly.
+INTERVAL_SECONDS = 3600
+
+
+class ScheduleError(Exception):
+    """The schedule was not changed. Never reported as installed when it is not."""
+
+
+def system() -> str:
+    return platform.system()
+
+
+# --------------------------------------------------------------------------
+# macOS -- launchd
+# --------------------------------------------------------------------------
+
+def launchd_path(home: Optional[str] = None) -> str:
+    return os.path.join(home or os.path.expanduser("~"),
+                        "Library", "LaunchAgents", LABEL + ".plist")
+
+
+def launchd_plist(insight: str, log: str) -> str:
+    """``RunAtLoad`` is false on purpose.
+
+    True would fire a collection the instant the agent is installed, which is
+    the same second the engineer is reading what it will do. Waiting for the
+    first interval costs an hour and means nothing is ever uploaded inside the
+    conversation where consent was given.
+    """
+    return """<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>{label}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>{insight}</string>
+    <string>auto</string>
+  </array>
+  <key>StartInterval</key><integer>{interval}</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>{log}</string>
+  <key>StandardErrorPath</key><string>{log}</string>
+  <key>ProcessType</key><string>Background</string>
+</dict>
+</plist>
+""".format(label=LABEL, insight=insight, interval=INTERVAL_SECONDS, log=log)
+
+
+# --------------------------------------------------------------------------
+# Linux -- systemd user timer
+# --------------------------------------------------------------------------
+
+def systemd_dir(home: Optional[str] = None) -> str:
+    return os.path.join(home or os.path.expanduser("~"),
+                        ".config", "systemd", "user")
+
+
+def systemd_units(insight: str) -> Dict[str, str]:
+    """``Persistent=true`` so a laptop that was asleep catches up once.
+
+    Once, not once per missed hour: the collection is idempotent but a machine
+    back from a week's leave should not wake to 168 queued runs.
+    """
+    service = """[Unit]
+Description=Collect and upload AI effectiveness telemetry
+
+[Service]
+Type=oneshot
+ExecStart={insight} auto
+""".format(insight=insight)
+
+    timer = """[Unit]
+Description=Hourly AI effectiveness collection
+
+[Timer]
+OnBootSec=15min
+OnUnitActiveSec={interval}s
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+""".format(interval=INTERVAL_SECONDS)
+    return {"insight-collect.service": service, "insight-collect.timer": timer}
+
+
+# --------------------------------------------------------------------------
+# install / remove
+# --------------------------------------------------------------------------
+
+def _run(argv: List[str]) -> Tuple[int, str]:
+    try:
+        done = subprocess.run(argv, capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return 1, str(exc)
+    return done.returncode, (done.stdout + done.stderr).strip()
+
+
+def install(insight: str, log: str, home: Optional[str] = None,
+            run=_run) -> Dict[str, object]:
+    kind = system()
+    if kind == "Darwin":
+        path = launchd_path(home)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(launchd_plist(insight, log))
+        # bootout first so re-running `schedule --hourly` after an upgrade
+        # replaces the agent rather than failing on an already-loaded label.
+        run(["launchctl", "bootout", "gui/{}/{}".format(os.getuid(), LABEL)])
+        code, detail = run(["launchctl", "bootstrap",
+                            "gui/{}".format(os.getuid()), path])
+        if code != 0:
+            code, detail = run(["launchctl", "load", "-w", path])
+        if code != 0:
+            raise ScheduleError(
+                "wrote {} but launchctl refused it: {}".format(path, detail))
+        return {"kind": "launchd", "path": path, "interval": INTERVAL_SECONDS}
+
+    if kind == "Linux":
+        directory = systemd_dir(home)
+        os.makedirs(directory, exist_ok=True)
+        for name, body in systemd_units(insight).items():
+            with open(os.path.join(directory, name), "w", encoding="utf-8") as handle:
+                handle.write(body)
+        code, detail = run(["systemctl", "--user", "daemon-reload"])
+        if code == 0:
+            code, detail = run(["systemctl", "--user", "enable", "--now",
+                                "insight-collect.timer"])
+        if code != 0:
+            raise ScheduleError(
+                "wrote units to {} but systemd refused them: {}\n"
+                "On a machine without a user systemd, add this to `crontab -e` "
+                "instead:\n    {}".format(directory, detail, cron_line(insight)))
+        return {"kind": "systemd", "path": directory, "interval": INTERVAL_SECONDS}
+
+    raise ScheduleError(
+        "no scheduler is wired up for {}. Add this to `crontab -e`:\n    {}"
+        .format(kind, cron_line(insight)))
+
+
+def remove(home: Optional[str] = None, run=_run) -> Dict[str, object]:
+    """Turn it off. Missing is success, not an error.
+
+    Someone switching this off wants it off, and a non-zero exit because it was
+    already off reads as a failure to switch it off.
+    """
+    kind = system()
+    removed: List[str] = []
+
+    if kind == "Darwin":
+        path = launchd_path(home)
+        run(["launchctl", "bootout", "gui/{}/{}".format(os.getuid(), LABEL)])
+        run(["launchctl", "unload", path])
+        if os.path.exists(path):
+            os.remove(path)
+            removed.append(path)
+        return {"kind": "launchd", "removed": removed}
+
+    if kind == "Linux":
+        run(["systemctl", "--user", "disable", "--now", "insight-collect.timer"])
+        directory = systemd_dir(home)
+        for name in systemd_units("x"):
+            path = os.path.join(directory, name)
+            if os.path.exists(path):
+                os.remove(path)
+                removed.append(path)
+        run(["systemctl", "--user", "daemon-reload"])
+        return {"kind": "systemd", "removed": removed}
+
+    return {"kind": kind.lower(), "removed": removed}
+
+
+def installed(home: Optional[str] = None) -> bool:
+    if system() == "Darwin":
+        return os.path.exists(launchd_path(home))
+    if system() == "Linux":
+        return os.path.exists(
+            os.path.join(systemd_dir(home), "insight-collect.timer"))
+    return False
+
+
+def cron_line(insight: str) -> str:
+    return "0 * * * * {} auto >/dev/null 2>&1".format(insight)

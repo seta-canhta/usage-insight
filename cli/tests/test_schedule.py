@@ -1,0 +1,157 @@
+"""Tests for hourly collection.
+
+    python3 -m pytest cli/tests/test_schedule.py -q
+"""
+
+import json
+import os
+import shutil
+import sys
+import tempfile
+import unittest
+
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+import schedule as schedule_mod  # noqa: E402
+
+
+class Runner:
+    """Stands in for launchctl/systemctl."""
+
+    def __init__(self, *codes):
+        self.codes = list(codes)
+        self.calls = []
+
+    def __call__(self, argv):
+        self.calls.append(argv)
+        code = self.codes[min(len(self.calls) - 1, len(self.codes) - 1)] \
+            if self.codes else 0
+        return code, "" if code == 0 else "refused"
+
+
+class UnitContentTests(unittest.TestCase):
+    def test_launchd_runs_auto_hourly(self):
+        plist = schedule_mod.launchd_plist("/opt/usage-insight/insight", "/tmp/x.log")
+        self.assertIn("<string>auto</string>", plist)
+        self.assertIn("<integer>3600</integer>", plist)
+        self.assertIn("/opt/usage-insight/insight", plist)
+
+    def test_launchd_does_not_fire_the_moment_it_is_installed(self):
+        # RunAtLoad true would collect and upload in the same second the
+        # engineer is still reading what it is about to do.
+        self.assertIn("<key>RunAtLoad</key><false/>",
+                      schedule_mod.launchd_plist("/x/insight", "/tmp/x.log"))
+
+    def test_systemd_timer_catches_up_once_not_once_per_missed_hour(self):
+        units = schedule_mod.systemd_units("/x/insight")
+        timer = units["insight-collect.timer"]
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("OnUnitActiveSec=3600s", timer)
+        self.assertIn("ExecStart=/x/insight auto",
+                      units["insight-collect.service"])
+
+    def test_the_cron_fallback_is_a_line_someone_can_paste(self):
+        line = schedule_mod.cron_line("/x/insight")
+        self.assertTrue(line.startswith("0 * * * * /x/insight auto"))
+
+
+class InstallTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.real_system = schedule_mod.system
+
+    def tearDown(self):
+        schedule_mod.system = self.real_system
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_darwin_writes_a_plist_and_loads_it(self):
+        schedule_mod.system = lambda: "Darwin"
+        run = Runner()
+        result = schedule_mod.install("/x/insight", "/tmp/x.log",
+                                      home=self.tmp, run=run)
+        self.assertEqual(result["kind"], "launchd")
+        self.assertTrue(os.path.exists(schedule_mod.launchd_path(self.tmp)))
+        self.assertTrue(any("bootstrap" in " ".join(c) for c in run.calls))
+
+    def test_reinstalling_replaces_rather_than_failing_on_a_loaded_label(self):
+        schedule_mod.system = lambda: "Darwin"
+        run = Runner()
+        schedule_mod.install("/x/insight", "/tmp/x.log", home=self.tmp, run=run)
+        self.assertIn("bootout", " ".join(run.calls[0]))
+
+    def test_darwin_falls_back_to_load_when_bootstrap_is_unavailable(self):
+        schedule_mod.system = lambda: "Darwin"
+        run = Runner(0, 1, 0)          # bootout ok, bootstrap fails, load ok
+        result = schedule_mod.install("/x/insight", "/tmp/x.log",
+                                      home=self.tmp, run=run)
+        self.assertEqual(result["kind"], "launchd")
+        self.assertTrue(any("load" in c for call in run.calls for c in call))
+
+    def test_a_refused_agent_raises_rather_than_reporting_success(self):
+        # Reporting a schedule that is not running is the one failure that
+        # produces a month of silence nobody investigates.
+        schedule_mod.system = lambda: "Darwin"
+        with self.assertRaises(schedule_mod.ScheduleError):
+            schedule_mod.install("/x/insight", "/tmp/x.log", home=self.tmp,
+                                 run=Runner(0, 1, 1))
+
+    def test_linux_writes_both_units_and_enables_the_timer(self):
+        schedule_mod.system = lambda: "Linux"
+        run = Runner()
+        result = schedule_mod.install("/x/insight", "/tmp/x.log",
+                                      home=self.tmp, run=run)
+        self.assertEqual(result["kind"], "systemd")
+        directory = schedule_mod.systemd_dir(self.tmp)
+        self.assertTrue(os.path.exists(
+            os.path.join(directory, "insight-collect.timer")))
+        self.assertTrue(any("enable" in " ".join(c) for c in run.calls))
+
+    def test_a_machine_without_user_systemd_is_given_the_cron_line(self):
+        schedule_mod.system = lambda: "Linux"
+        with self.assertRaises(schedule_mod.ScheduleError) as caught:
+            schedule_mod.install("/x/insight", "/tmp/x.log", home=self.tmp,
+                                 run=Runner(1))
+        self.assertIn("crontab -e", str(caught.exception))
+
+    def test_an_unknown_platform_says_so_instead_of_pretending(self):
+        schedule_mod.system = lambda: "Windows"
+        with self.assertRaises(schedule_mod.ScheduleError) as caught:
+            schedule_mod.install("/x/insight", "/tmp/x.log", home=self.tmp,
+                                 run=Runner())
+        self.assertIn("crontab", str(caught.exception))
+
+
+class RemoveTests(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.real_system = schedule_mod.system
+
+    def tearDown(self):
+        schedule_mod.system = self.real_system
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def test_removing_deletes_the_agent(self):
+        schedule_mod.system = lambda: "Darwin"
+        schedule_mod.install("/x/insight", "/tmp/x.log", home=self.tmp,
+                             run=Runner())
+        self.assertTrue(schedule_mod.installed(self.tmp))
+        schedule_mod.remove(home=self.tmp, run=Runner())
+        self.assertFalse(schedule_mod.installed(self.tmp))
+
+    def test_removing_something_already_off_is_success(self):
+        # Someone switching this off wants it off. A non-zero exit because it
+        # was already off reads as a failure to switch it off.
+        schedule_mod.system = lambda: "Darwin"
+        result = schedule_mod.remove(home=self.tmp, run=Runner(1, 1))
+        self.assertEqual(result["removed"], [])
+
+    def test_linux_removal_takes_both_units(self):
+        schedule_mod.system = lambda: "Linux"
+        schedule_mod.install("/x/insight", "/tmp/x.log", home=self.tmp,
+                             run=Runner())
+        result = schedule_mod.remove(home=self.tmp, run=Runner())
+        self.assertEqual(len(result["removed"]), 2)
+
+
+if __name__ == "__main__":
+    unittest.main()

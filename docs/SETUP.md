@@ -98,7 +98,27 @@ stops with that message, tell us rather than forcing it.
 
 ---
 
-## Every Friday — about a minute
+## It runs by itself, hourly
+
+`setup` schedules the collection. Once an hour your machine reads the local
+sources, packs the day's events, and uploads them **only if something changed** —
+a quiet hour sends nothing at all.
+
+| | |
+|---|---|
+| `./insight schedule --status` | is it on, and when did it last run |
+| `./insight schedule --off` | stop it; go back to running the commands yourself |
+| `~/.seta-insight/auto.log` | one line per run, including anything that failed |
+
+Nothing runs as root and nothing is installed outside your home directory.
+
+Everything that was ever uploaded stays readable in
+`~/.seta-insight/.reports/`, so you can still open any bundle after the fact.
+`purge` still deletes everything held on your machine.
+
+---
+
+## If you would rather do it by hand
 
 ```bash
 cd ~/usage-insight
@@ -108,6 +128,9 @@ cd ~/usage-insight
 ./insight pack --since 2026-08-17 --until 2026-08-23
 ./insight ship      # upload it
 ```
+
+`./insight setup --no-schedule` opts out of the hourly run, and then it is
+yours to remember:
 
 `otel` empties Copilot's span file after reading it — it grows without limit
 otherwise, and it is the file that may hold your prompts.

@@ -83,3 +83,22 @@ Only a roster knows who was expected.
 
 The roster is the same people as the server's `INSIGHT_ALLOWED`, one work email
 per line. Emails stay on this side: nothing written into `inbox/` carries one.
+
+## `watch.py` — noticing silence
+
+```bash
+python3 watch.py --roster roster.txt          # once a day, from cron
+python3 watch.py --roster roster.txt --dry-run
+```
+
+Posts to ntfy.sh when someone stops reporting. Configured entirely in `.env`;
+see `.env.example` and `docs/TRANSPORT.md`.
+
+The unit is a **working day**, not an hour. `insight auto` uploads nothing in an
+hour where nothing changed, so hourly misses are not signal — but an idle day
+still uploads one empty bundle, so a working day with nothing at all means the
+collection is broken rather than that the person was quiet.
+
+It stays silent about nights, weekends, an outage it has already reported, and
+anyone new to the roster who has not had time to set up yet. Each of those is a
+reason someone would mute the channel, and a muted channel is worse than none.

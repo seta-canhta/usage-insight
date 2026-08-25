@@ -66,6 +66,11 @@ Then restart VS Code. Once a week:
 ./insight ship      # upload it
 ```
 
+Or not, because `setup` schedules all of that hourly by default -- a launchd
+agent on macOS, a systemd user timer on Linux, `./insight schedule --off` to
+stop. A quiet hour uploads nothing; a quiet day still uploads one empty bundle,
+because a measured zero and missing data must never look the same.
+
 `scan` with no `--repo` covers all of them, and keeps going if one clone has
 since been deleted.
 
@@ -82,8 +87,16 @@ python3 importers/pull.py --week 2026-W34 --inbox inbox/ --roster roster.txt
 python3 importers/bundle.py --inbox inbox/ --out events.ndjson
 ```
 
-`pull` names who did not report. Read that line before the numbers —
-[`docs/TRANSPORT.md`](docs/TRANSPORT.md).
+`pull` names who did not report. Read that line before the numbers.
+
+And once a day, so nobody has to remember to look:
+
+```bash
+python3 importers/watch.py --roster roster.txt   # → ntfy.sh when a machine goes quiet
+```
+
+[`docs/TRANSPORT.md`](docs/TRANSPORT.md) is the wire contract, the hourly
+collection, and the watchdog.
 
 Engineer-facing guide: [`docs/SETUP.md`](docs/SETUP.md) ·
 [tiếng Việt](docs/SETUP.vi.md)
@@ -137,4 +150,4 @@ that works.
 | `schema/` | `CONTRACT.md` — the single source of truth |
 | `docs/` | [what we measure](docs/WHAT-WE-MEASURE.md), findings, architecture |
 
-429 tests: `for s in pollers report collector cli importers; do python3 -m unittest discover -s $s/tests; done`
+492 tests: `for s in pollers report collector cli importers; do python3 -m unittest discover -s $s/tests; done`

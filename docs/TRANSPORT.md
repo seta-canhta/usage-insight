@@ -272,6 +272,94 @@ path was already built for.
 
 ---
 
+## Collection runs hourly
+
+`insight setup` installs a scheduler by default -- a launchd agent on macOS, a
+systemd user timer on Linux -- that runs `insight auto` once an hour. Nothing
+runs as root, nothing is installed outside the user's home, and
+`insight schedule --off` reverses it.
+
+`auto` reads the local sources, packs **today's** window, and uploads only if
+the events differ from what has already gone:
+
+```
+otel → collect → scan → pack --since today --until today → ship (if changed)
+```
+
+Three things make that safe to run 24 times a day:
+
+**Dedupe is on the events, not the file.** The manifest carries `packed_at`, so
+the file differs on every run even when nothing happened; the manifest's own
+`sha256` covers the events alone and stays still. Keying on the file would
+upload 24 near-identical bundles a day and show a team 24x busier than it is.
+
+**A quiet day still uploads once.** An empty bundle with a declared window is a
+*measured* zero -- the machine was on and did no AI work. A day with no bundle at
+all is missing data. Those must not look the same, which is the whole reason
+`pack` declares a window even when it found nothing.
+
+**Failures are survivable.** A step that fails is logged and the rest continue;
+a failed upload leaves the bundle on disk for the next run; a crashed run's lock
+is broken after six hours; and a run on an uninitialised machine exits quietly,
+because the scheduler can outlive a `purge --all`.
+
+Everything lands in `~/.seta-insight/auto.log`, one JSON line per run, and
+`insight schedule --status` prints the last one.
+
+The consent text changes with it. A machine that uploads on its own is told so
+before it is set up -- describing a manual handover to someone whose laptop will
+upload hourly is not a weaker consent record, it is a false one.
+
+---
+
+## Noticing when a machine goes quiet
+
+```bash
+python3 importers/watch.py --roster roster.txt
+```
+
+Run it once a day from cron. It lists recent weeks, works out who has not
+reported, and posts to **ntfy.sh** when someone crosses the threshold.
+
+**A miss is a working day, not an hour.** `auto` uploads nothing in an hour
+where nothing changed, so three silent hours is what a normal afternoon of
+non-AI work looks like -- alerting on it would train everyone to mute the
+channel. A working day with no bundle at all is different: even an idle day
+uploads one empty bundle, so silence for a whole day means the collection is
+broken on that machine.
+
+Nights and weekends are not misses, which is what the working hours are for. A
+laptop shut at 19:00 on Friday is not a fault.
+
+| `.env` | default | |
+|---|---|---|
+| `INSIGHT_WORK_START` | `09:00` | |
+| `INSIGHT_WORK_END` | `19:00` | |
+| `INSIGHT_WORK_DAYS` | `0,1,2,3,4` | Monday = 0 |
+| `INSIGHT_TZ_OFFSET` | `+07:00` | fixed offset; Vietnam has no DST, so no tz database is needed |
+| `INSIGHT_MISS_THRESHOLD` | `3` | consecutive working days |
+| `INSIGHT_NTFY_URL` | `https://ntfy.sh/seta-insight` | |
+| `INSIGHT_NTFY_TOKEN` | *(empty)* | only for an access-protected topic |
+
+Two rules keep the channel worth listening to:
+
+**One outage is one message.** The alert fires when the threshold is crossed and
+again only if the streak grows. A fortnight-long outage is one problem, not ten
+notifications, and a channel that repeats is a channel that gets muted -- which
+is worse than having none, because everyone believes it is still watching.
+
+**A new joiner is never the first thing it pages about.** Someone added to the
+roster today has no uploads for the three working days before they existed here,
+which looks exactly like a broken machine. First sighting is recorded, and the
+clock starts then.
+
+⚠️ **A public ntfy.sh topic is readable by anyone who guesses the name**, and
+these messages carry work email addresses. Either use an access-protected topic
+with `INSIGHT_NTFY_TOKEN`, or accept that the topic name is the only thing
+keeping a list of your engineers private. `ntfy.sh/seta-insight` is guessable.
+
+---
+
 ## The thing automation makes worse
 
 With manual handover, a missing week is visible: no email arrived. Automate it
