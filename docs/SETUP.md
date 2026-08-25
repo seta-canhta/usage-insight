@@ -15,6 +15,31 @@ command.
 
 ---
 
+## 0 · Already collecting? Two commands
+
+If this machine has been running `insight` for a while and you have just been
+added to the server's whitelist, you do not start over — nothing already
+collected is disturbed, and the machine keeps its identity and its salt.
+
+```bash
+git pull
+./insight setup --email <you>@aeris.net --token <the secret you were sent>
+./insight ship --all        # send everything collected so far
+```
+
+Then, once that upload has worked:
+
+```bash
+./insight rotate-token      # and send the printed line back
+```
+
+That last step matters. A secret you were *sent* has travelled over some
+channel; one minted here never does. Rotating leaves this machine holding a
+secret nobody else has seen, and the old one keeps uploading until the server
+catches up, so there is nothing to coordinate.
+
+---
+
 ## 1 · One command
 
 ```bash

@@ -11,6 +11,31 @@ Bạn đọc được mọi file trước khi gửi, và xoá sạch bằng mộ
 
 ---
 
+## 0 · Máy đã thu thập sẵn? Hai lệnh
+
+Nếu máy này đã chạy `insight` một thời gian và anh/chị vừa được thêm vào
+whitelist của server thì không phải làm lại từ đầu — dữ liệu đã thu thập giữ
+nguyên, máy giữ nguyên định danh và salt.
+
+```bash
+git pull
+./insight setup --email <ban>@aeris.net --token <secret được gửi>
+./insight ship --all        # gửi hết những gì đã thu thập
+```
+
+Sau khi upload thành công lần đầu:
+
+```bash
+./insight rotate-token      # rồi gửi lại dòng nó in ra
+```
+
+Bước cuối quan trọng. Secret được *gửi* tới thì đã đi qua một kênh nào đó; secret
+tự tạo trên máy thì không. Sau khi rotate, máy này giữ một secret chưa ai từng
+thấy, và secret cũ vẫn upload được cho tới khi server cập nhật — không cần canh
+đúng thời điểm.
+
+---
+
 ## 1 · Một lệnh duy nhất
 
 ```bash

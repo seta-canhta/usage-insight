@@ -249,7 +249,7 @@ def cmd_init(args: argparse.Namespace) -> int:
     print("initialised. machine id {}".format(config["machine_id"][:8]))
     if config.get("endpoint_token"):
         print()
-        print_whitelist_line(config)
+        print_whitelist_line(config, adopted=bool(issued))
     elif endpoint:
         # Warned, not refused. Collecting without being able to upload is still
         # a useful state -- the bundles are on disk and can be handed over by
@@ -261,16 +261,32 @@ def cmd_init(args: argparse.Namespace) -> int:
     return 0
 
 
-def print_whitelist_line(config: Dict[str, Any]) -> None:
+def print_whitelist_line(config: Dict[str, Any], adopted: bool = False) -> None:
     """The one thing setup cannot do for the engineer, said plainly.
 
     Uploading fails until someone adds this line to the server, and the failure
     is a 401 that looks like a bug rather than a missing step. Printing it here,
     in full, is what keeps that from becoming a support conversation.
+
+    ``adopted`` is the opposite situation: the secret came *from* the server, so
+    the line is already there. Telling someone to send a line that is already in
+    place trains them to ignore this paragraph, and the thing they actually have
+    to do -- rotate, so the machine holds a secret that never travelled -- gets
+    lost underneath it.
     """
     import identity
 
     line = identity.whitelist_line(config["email"], config["endpoint_token"])
+    if adopted:
+        print("You are already on the server whitelist as:")
+        print()
+        print("    " + line)
+        print()
+        print("That secret was issued to you, so it has travelled over some")
+        print("channel to get here. Once an upload has worked, run")
+        print("`./insight rotate-token` and send the new line back -- uploads")
+        print("keep working on this one until the server catches up.")
+        return
     print("Send this line to whoever maintains the collection server, so they")
     print("can add you to INSIGHT_ALLOWED in its .env:")
     print()
@@ -414,6 +430,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
     import vscode_setup
 
     steps: List[Dict[str, Any]] = []
+    #: An upload secret issued by the server admin, rather than minted here.
+    issued = (getattr(args, "token", None) or "").strip() or None
 
     aiep = args.aiep or os.path.join(_ROOT, "..", "ai-engineering-platform")
     aiep = os.path.abspath(aiep) if os.path.isdir(
@@ -449,6 +467,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
                                         endpoint=args.endpoint,
                                         no_endpoint=args.no_endpoint,
                                         email=args.email,
+                                        token=getattr(args, "token", None),
                                         hourly=not args.no_schedule))
         steps.append({"step": "consent", "ok": True,
                       "detail": "recorded" if load_config() else "declined"})
@@ -456,7 +475,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # Also settable on a machine set up before there was an endpoint, so
         # turning transport on later is one command rather than a re-init.
         config = load_config()
-        if config is not None and (args.endpoint or args.email
+        if config is not None and (args.endpoint or args.email or issued
                                    or args.no_endpoint
                                    or not config.get("endpoint")):
             import identity
@@ -469,7 +488,18 @@ def cmd_setup(args: argparse.Namespace) -> int:
                     config["email"] = identity.normalise_email(args.email)
                 except identity.IdentityError as exc:
                     raise SystemExit(str(exc))
-            if config.get("email") and not config.get("endpoint_token"):
+            if issued and config.get("endpoint_token") != issued:
+                # An address was added to the server whitelist before this
+                # machine was configured, which is what onboarding several
+                # people at once looks like. Without this, `setup` would mint
+                # a secret whose fingerprint is on nobody's list and the first
+                # upload would 401 for a reason nothing on this machine shows.
+                # The old one is kept valid, so a machine that was already
+                # uploading does not stop while the server catches up.
+                if config.get("endpoint_token"):
+                    config["endpoint_token_previous"] = config["endpoint_token"]
+                config["endpoint_token"] = issued
+            elif config.get("email") and not config.get("endpoint_token"):
                 config["endpoint_token"] = identity.mint_secret()
             write_json(CONFIG_PATH, config)
             os.chmod(CONFIG_PATH, 0o600)
@@ -530,7 +560,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
             print("Then: ./insight otel && ./insight collect && ./insight pack" + tail)
         if final.get("endpoint_token"):
             print()
-            print_whitelist_line(final)
+            print_whitelist_line(
+                final, adopted=final.get("endpoint_token") == issued)
     return 0 if all(s.get("ok") for s in steps) else 1
 
 
@@ -1501,6 +1532,9 @@ def build_parser() -> argparse.ArgumentParser:
                        DEFAULT_ENDPOINT))
     p.add_argument("--email", help="your work email -- identifies you to the "
                                    "server whitelist, never stored in a bundle")
+    p.add_argument("--token", help="adopt an upload secret issued by whoever "
+                                   "runs the server, instead of minting one "
+                                   "here. Rotate it once you are uploading")
     p.add_argument("--no-endpoint", action="store_true",
                    help="do not upload; bundles are handed over by hand")
     p.add_argument("--no-schedule", action="store_true",

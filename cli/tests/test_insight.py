@@ -94,6 +94,12 @@ class TestAdoptedToken(ClientTestCase):
                               "--token", "issued-by-the-admin")
         self.assertIn(identity.fingerprint("issued-by-the-admin"), out)
 
+    def test_init_with_an_issued_secret_says_so(self):
+        _, out = self.run_cli("init", "--yes", "--email", "ngoc@aeris.net",
+                              "--token", "issued")
+        self.assertIn("already on the server whitelist", out)
+        self.assertNotIn("Send this line", out)
+
     def test_without_it_a_secret_is_minted_locally(self):
         self.run_cli("init", "--yes", "--email", "ngoc@aeris.net")
         token = self.insight.load_config()["endpoint_token"]
@@ -117,6 +123,84 @@ class TestAdoptedToken(ClientTestCase):
         config = self.insight.load_config()
         self.assertNotEqual(config["endpoint_token"], "issued-by-the-admin")
         self.assertEqual(config["endpoint_token_previous"], "issued-by-the-admin")
+
+
+class TestSetupAdoptsAnIssuedToken(ClientTestCase):
+    """The case this was written for: a machine that has been collecting for
+    weeks, and an address that was added to the server whitelist yesterday."""
+
+    def setUp(self):
+        super().setUp()
+        import vscode_setup
+        # Do not touch the real editor settings from a test.
+        self.addCleanup(setattr, vscode_setup, "settings_path",
+                        vscode_setup.settings_path)
+        vscode_setup.settings_path = lambda: None
+
+    def setup_cli(self, *extra):
+        return self.run_cli("setup", "--yes", "--no-schedule", *extra)
+
+    def test_an_existing_machine_adopts_the_issued_secret(self):
+        self.init()                                  # collecting, no address yet
+        before = self.insight.load_config()
+        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        config = self.insight.load_config()
+        self.assertEqual(config["endpoint_token"], "issued")
+        self.assertEqual(config["email"], "ngoc@aeris.net")
+        # and nothing already collected is disturbed
+        self.assertEqual(config["salt"], before["salt"])
+        self.assertEqual(config["machine_id"], before["machine_id"])
+
+    def test_without_a_token_setup_mints_one_as_before(self):
+        self.init()
+        self.setup_cli("--email", "ngoc@aeris.net")
+        token = self.insight.load_config()["endpoint_token"]
+        self.assertTrue(token)
+        self.assertNotEqual(token, "issued")
+
+    def test_a_machine_that_was_already_uploading_keeps_working(self):
+        # Replacing the secret outright would break every upload between now
+        # and the server being told. The old one stays valid, which is exactly
+        # what `rotate-token` does.
+        self.init()
+        self.setup_cli("--email", "ngoc@aeris.net")
+        original = self.insight.load_config()["endpoint_token"]
+        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        config = self.insight.load_config()
+        self.assertEqual(config["endpoint_token"], "issued")
+        self.assertEqual(config["endpoint_token_previous"], original)
+
+    def test_running_it_twice_does_not_shuffle_the_secrets(self):
+        # Idempotence matters here: `setup` is the command people re-run when
+        # they are not sure it worked, and a second run must not push the
+        # issued secret into `previous` and leave nothing valid.
+        self.init()
+        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        config = self.insight.load_config()
+        self.assertEqual(config["endpoint_token"], "issued")
+        self.assertIsNone(config.get("endpoint_token_previous"))
+
+    def test_it_does_not_ask_for_a_line_the_server_already_has(self):
+        # Telling somebody to send a line that is already in place trains them
+        # to skip this paragraph -- and the thing they do have to do, rotate,
+        # is in the same paragraph.
+        self.init()
+        _, out = self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        self.assertIn("already on the server whitelist", out)
+        self.assertIn("rotate-token", out)
+        self.assertNotIn("Send this line", out)
+
+    def test_a_minted_secret_still_asks_for_the_line(self):
+        self.init()
+        _, out = self.setup_cli("--email", "ngoc@aeris.net")
+        self.assertIn("Send this line", out)
+
+    def test_the_endpoint_defaults_to_the_real_one(self):
+        self.init()
+        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        self.assertEqual(self.insight.load_config()["endpoint"],
+                         self.insight.SETA_ENDPOINT)
 
 
 class TestAllowList(ClientTestCase):
