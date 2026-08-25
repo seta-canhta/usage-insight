@@ -190,10 +190,6 @@ def cmd_init(args: argparse.Namespace) -> int:
         except identity.IdentityError as exc:
             raise SystemExit(str(exc))
     issued = (getattr(args, "token", None) or "").strip() or None
-    if issued and not email:
-        raise SystemExit(
-            "--token needs --email: the whitelist is keyed by address, and a "
-            "secret with nobody attached to it can never be matched")
 
     if endpoint and getattr(args, "hourly", False):
         transport = TRANSPORT_HOURLY.format(home=HOME, endpoint=endpoint)
@@ -240,6 +236,10 @@ def cmd_init(args: argparse.Namespace) -> int:
         # does. It travelled over some channel to get here, which the minted
         # one never does -- so `rotate-token` afterwards is the point at which
         # this machine holds a secret nobody else has ever seen.
+        # An issued secret needs no address alongside it. The server resolves
+        # the fingerprint to a person itself -- that is the whole mechanism --
+        # and `ship` has never sent an email address in any header. Asking for
+        # one here would be asking twice for the same fact.
         "endpoint_token": issued or (existing or {}).get("endpoint_token") or (
             identity.mint_secret() if email else None),
         "endpoint_token_previous": (existing or {}).get("endpoint_token_previous"),
@@ -248,8 +248,12 @@ def cmd_init(args: argparse.Namespace) -> int:
     os.chmod(CONFIG_PATH, 0o600)
     print("initialised. machine id {}".format(config["machine_id"][:8]))
     if config.get("endpoint_token"):
-        print()
-        print_whitelist_line(config, adopted=bool(issued))
+        # `setup` prints this itself, at the end, after the step table. Printing
+        # it here too puts the same paragraph on screen twice, and a paragraph
+        # somebody has already scrolled past is one they stop reading.
+        if not getattr(args, "quiet_whitelist", False):
+            print()
+            print_whitelist_line(config, adopted=bool(issued))
     elif endpoint:
         # Warned, not refused. Collecting without being able to upload is still
         # a useful state -- the bundles are on disk and can be handed over by
@@ -276,16 +280,18 @@ def print_whitelist_line(config: Dict[str, Any], adopted: bool = False) -> None:
     """
     import identity
 
-    line = identity.whitelist_line(config["email"], config["endpoint_token"])
+    email = config.get("email")
+    line = (identity.whitelist_line(email, config["endpoint_token"]) if email
+            else identity.fingerprint(config["endpoint_token"]))
     if adopted:
-        print("You are already on the server whitelist as:")
+        print("You are already on the server whitelist. Your fingerprint:")
         print()
         print("    " + line)
         print()
         print("That secret was issued to you, so it has travelled over some")
         print("channel to get here. Once an upload has worked, run")
-        print("`./insight rotate-token` and send the new line back -- uploads")
-        print("keep working on this one until the server catches up.")
+        print("`./insight rotate-token` and send the new fingerprint back --")
+        print("uploads keep working on this one until the server catches up.")
         return
     print("Send this line to whoever maintains the collection server, so they")
     print("can add you to INSIGHT_ALLOWED in its .env:")
@@ -468,6 +474,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
                                         no_endpoint=args.no_endpoint,
                                         email=args.email,
                                         token=getattr(args, "token", None),
+                                        quiet_whitelist=True,
                                         hourly=not args.no_schedule))
         steps.append({"step": "consent", "ok": True,
                       "detail": "recorded" if load_config() else "declined"})
@@ -1338,10 +1345,6 @@ def cmd_whoami(args: argparse.Namespace) -> int:
     prevents -- a 401 an engineer cannot diagnose -- costs more than the command.
     """
     config = require_config()
-    if not config.get("email"):
-        raise SystemExit(
-            "no work email recorded -- run `insight setup --email "
-            "you@seta-international.vn`")
     if not config.get("endpoint_token"):
         raise SystemExit("no upload secret on this machine -- run "
                          "`insight rotate-token` to mint one")
@@ -1352,8 +1355,10 @@ def cmd_whoami(args: argparse.Namespace) -> int:
         print("A rotation is still in flight. The previous line stays valid "
               "until it is removed:")
         print()
-        print("    " + identity.whitelist_line(
-            config["email"], config["endpoint_token_previous"]))
+        print("    " + (identity.whitelist_line(
+            config["email"], config["endpoint_token_previous"])
+            if config.get("email")
+            else identity.fingerprint(config["endpoint_token_previous"])))
     return 0
 
 
@@ -1368,10 +1373,11 @@ def cmd_rotate_token(args: argparse.Namespace) -> int:
     import identity
 
     config = require_config()
-    if not config.get("email"):
+    if not (config.get("email") or config.get("endpoint_token")):
         raise SystemExit(
-            "no work email recorded -- run `insight setup --email "
-            "you@seta-international.vn`")
+            "nothing to rotate -- this machine has no upload secret. Run "
+            "`insight setup --token <the secret you were sent>`, or "
+            "`insight setup --email you@example.com` to mint one here")
 
     if args.finish:
         if not config.get("endpoint_token_previous"):
@@ -1396,7 +1402,7 @@ def cmd_rotate_token(args: argparse.Namespace) -> int:
         print("Add it ALONGSIDE the existing one rather than replacing it -- "
               "INSIGHT_ALLOWED takes")
         print("both as `{}:<new>:<old>`. Uploads keep working throughout."
-              .format(config["email"]))
+              .format(config.get("email") or "<your address>"))
         print("Once it is in place, `insight rotate-token --finish` drops the "
               "old secret here.")
     return 0

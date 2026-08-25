@@ -19,9 +19,12 @@ nguyên, máy giữ nguyên định danh và salt.
 
 ```bash
 git pull
-./insight setup --email <ban>@aeris.net --token <secret được gửi>
+./insight setup --token <secret được gửi>
 ./insight ship --all        # gửi hết những gì đã thu thập
 ```
+
+Không cần kèm email: server tự tra secret ra người — đó chính là ý nghĩa của
+whitelist — và `ship` chưa bao giờ gửi địa chỉ email trong bất kỳ header nào.
 
 Sau khi upload thành công lần đầu:
 

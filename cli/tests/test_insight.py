@@ -106,12 +106,28 @@ class TestAdoptedToken(ClientTestCase):
         self.assertTrue(token)
         self.assertNotEqual(token, "issued-by-the-admin")
 
-    def test_a_token_with_no_address_is_refused(self):
-        # The whitelist is keyed by address. A secret with nobody attached to
-        # it can never be matched, and would fail at the first upload instead
-        # of here.
-        with self.assertRaises(SystemExit):
-            self.run_cli("init", "--yes", "--token", "issued-by-the-admin")
+    def test_a_token_on_its_own_is_enough(self):
+        # No --email alongside it. The server resolves the fingerprint to a
+        # person itself -- that is the whole mechanism -- and `ship` has never
+        # sent an address in any header, so asking for one here would be
+        # asking twice for the same fact.
+        self.run_cli("init", "--yes", "--token", "issued-by-the-admin")
+        config = self.insight.load_config()
+        self.assertEqual(config["endpoint_token"], "issued-by-the-admin")
+        self.assertTrue(config["endpoint"])
+
+    def test_whoami_works_without_a_local_address(self):
+        import identity
+        self.run_cli("init", "--yes", "--token", "issued-by-the-admin")
+        _, out = self.run_cli("whoami")
+        self.assertIn(identity.fingerprint("issued-by-the-admin"), out)
+
+    def test_rotating_works_without_a_local_address(self):
+        self.run_cli("init", "--yes", "--token", "issued-by-the-admin")
+        self.run_cli("rotate-token")
+        config = self.insight.load_config()
+        self.assertNotEqual(config["endpoint_token"], "issued-by-the-admin")
+        self.assertEqual(config["endpoint_token_previous"], "issued-by-the-admin")
 
     def test_rotating_afterwards_replaces_it_with_a_local_one(self):
         # The whole point of adopting one: it travelled over some channel to
@@ -190,6 +206,12 @@ class TestSetupAdoptsAnIssuedToken(ClientTestCase):
         self.assertIn("already on the server whitelist", out)
         self.assertIn("rotate-token", out)
         self.assertNotIn("Send this line", out)
+
+    def test_the_paragraph_is_printed_once(self):
+        # `setup` runs `init`, and both used to print it. A paragraph somebody
+        # has already scrolled past is one they stop reading.
+        _, out = self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        self.assertEqual(out.count("already on the server whitelist"), 1)
 
     def test_a_minted_secret_still_asks_for_the_line(self):
         self.init()

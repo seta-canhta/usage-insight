@@ -23,9 +23,13 @@ collected is disturbed, and the machine keeps its identity and its salt.
 
 ```bash
 git pull
-./insight setup --email <you>@aeris.net --token <the secret you were sent>
+./insight setup --token <the secret you were sent>
 ./insight ship --all        # send everything collected so far
 ```
+
+No address needed alongside it: the server resolves the secret to a person
+itself — that is what the whitelist *is* — and `ship` has never sent an email
+address in any header.
 
 Then, once that upload has worked:
 

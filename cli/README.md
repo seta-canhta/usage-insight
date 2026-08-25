@@ -108,9 +108,14 @@ Onboarding sometimes runs the other way: somebody is added to the server's
 whitelist before their laptop has been touched, so the secret exists first.
 
 ```bash
-./insight init --email ngoc@aeris.net --token <issued by the admin>
+./insight init --token <issued by the admin>
 ./insight rotate-token          # once an upload has worked
 ```
+
+The secret arrives on its own. An address is not asked for alongside it,
+because the server already holds the pairing — resolving a fingerprint to a
+person is the whole of what the whitelist does, and `ship` sends no address in
+any header. Asking here would be asking twice for the same fact.
 
 The rotation is the point, not an afterthought. An issued secret travelled over
 some channel to get here — chat, email, a screen — and a minted one never does.
