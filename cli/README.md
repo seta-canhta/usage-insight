@@ -101,6 +101,23 @@ Re-running it is safe: the proxy keys objects by content digest and writes with
 *already handed over*. Someone unsure whether last week went through will run it
 again, and it has to be safe when they do.
 
+## Onboarding somebody already on the whitelist
+
+Normally the secret is minted here and only its `sha256` is ever sent anywhere.
+Onboarding sometimes runs the other way: somebody is added to the server's
+whitelist before their laptop has been touched, so the secret exists first.
+
+```bash
+./insight init --email ngoc@aeris.net --token <issued by the admin>
+./insight rotate-token          # once an upload has worked
+```
+
+The rotation is the point, not an afterthought. An issued secret travelled over
+some channel to get here — chat, email, a screen — and a minted one never does.
+Rotating leaves this machine holding a secret nobody else has seen, and the old
+one keeps working until the server's line catches up, so nothing has to be
+coordinated in the same minute.
+
 ## Identity, and what it is not
 
 `setup --email` mints a secret that stays on the machine, and prints

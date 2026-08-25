@@ -189,6 +189,12 @@ def cmd_init(args: argparse.Namespace) -> int:
             email = identity.normalise_email(email)
         except identity.IdentityError as exc:
             raise SystemExit(str(exc))
+    issued = (getattr(args, "token", None) or "").strip() or None
+    if issued and not email:
+        raise SystemExit(
+            "--token needs --email: the whitelist is keyed by address, and a "
+            "secret with nobody attached to it can never be matched")
+
     if endpoint and getattr(args, "hourly", False):
         transport = TRANSPORT_HOURLY.format(home=HOME, endpoint=endpoint)
     elif endpoint:
@@ -227,7 +233,14 @@ def cmd_init(args: argparse.Namespace) -> int:
         "email": email,
         # Minted here, kept here. The server is given sha256 of it and never
         # the value, so its whitelist is not a credential store.
-        "endpoint_token": (existing or {}).get("endpoint_token") or (
+        #
+        # ``--token`` adopts one issued by the server admin instead. That is
+        # the onboarding case: somebody is added to the whitelist before their
+        # laptop has been touched, so the secret has to exist before this file
+        # does. It travelled over some channel to get here, which the minted
+        # one never does -- so `rotate-token` afterwards is the point at which
+        # this machine holds a secret nobody else has ever seen.
+        "endpoint_token": issued or (existing or {}).get("endpoint_token") or (
             identity.mint_secret() if email else None),
         "endpoint_token_previous": (existing or {}).get("endpoint_token_previous"),
     }
@@ -1472,6 +1485,9 @@ def build_parser() -> argparse.ArgumentParser:
                                    "server whitelist, never stored in a bundle")
     p.add_argument("--no-endpoint", action="store_true",
                    help="do not upload; bundles are handed over by hand")
+    p.add_argument("--token", help="adopt an upload secret issued by whoever "
+                                   "runs the server, instead of minting one "
+                                   "here. Rotate it once you are uploading")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser(

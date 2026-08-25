@@ -72,6 +72,53 @@ class TestConsent(ClientTestCase):
             self.insight.load_config()["machine_id"], first["machine_id"])
 
 
+class TestAdoptedToken(ClientTestCase):
+    """`init --token` — a secret issued by whoever runs the server.
+
+    The onboarding case: somebody is added to the whitelist before their laptop
+    has been touched, so the secret has to exist before the config file does.
+    """
+
+    def test_the_issued_secret_is_the_one_used(self):
+        self.run_cli("init", "--yes", "--email", "ngoc@aeris.net",
+                     "--token", "issued-by-the-admin")
+        self.assertEqual(self.insight.load_config()["endpoint_token"],
+                         "issued-by-the-admin")
+
+    def test_the_printed_line_matches_the_issued_secret(self):
+        # The admin already put a fingerprint in the whitelist. If `whoami`
+        # printed a different one, the two would disagree and every upload
+        # would 401 with nothing to point at.
+        import identity
+        _, out = self.run_cli("init", "--yes", "--email", "ngoc@aeris.net",
+                              "--token", "issued-by-the-admin")
+        self.assertIn(identity.fingerprint("issued-by-the-admin"), out)
+
+    def test_without_it_a_secret_is_minted_locally(self):
+        self.run_cli("init", "--yes", "--email", "ngoc@aeris.net")
+        token = self.insight.load_config()["endpoint_token"]
+        self.assertTrue(token)
+        self.assertNotEqual(token, "issued-by-the-admin")
+
+    def test_a_token_with_no_address_is_refused(self):
+        # The whitelist is keyed by address. A secret with nobody attached to
+        # it can never be matched, and would fail at the first upload instead
+        # of here.
+        with self.assertRaises(SystemExit):
+            self.run_cli("init", "--yes", "--token", "issued-by-the-admin")
+
+    def test_rotating_afterwards_replaces_it_with_a_local_one(self):
+        # The whole point of adopting one: it travelled over some channel to
+        # get here. Rotation is where this machine starts holding a secret
+        # nobody else has seen, and the old one stays valid meanwhile.
+        self.run_cli("init", "--yes", "--email", "ngoc@aeris.net",
+                     "--token", "issued-by-the-admin")
+        self.run_cli("rotate-token")
+        config = self.insight.load_config()
+        self.assertNotEqual(config["endpoint_token"], "issued-by-the-admin")
+        self.assertEqual(config["endpoint_token_previous"], "issued-by-the-admin")
+
+
 class TestAllowList(ClientTestCase):
 
     def test_an_attribute_outside_the_allow_list_is_reported(self):
