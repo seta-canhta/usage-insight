@@ -31,3 +31,8 @@ venv/
 # npx client build artefacts
 node_modules/
 cli/dist/
+
+# Server operational state: the whitelist is fingerprints, not secrets, but it
+# is still the list of everyone being measured and it belongs in /etc on the box.
+/server/allowed.env
+allowed.env

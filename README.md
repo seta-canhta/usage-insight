@@ -146,8 +146,9 @@ that works.
 | `importers/` | weekly bundles, daily spreadsheet reconciliation |
 | `report/` | weekly Markdown, per-person workbooks |
 | `collector/` | the attribute allow-list, enforced |
+| `server/` | the collection endpoint — S3 behind one `PUT` |
 | `docs/TRANSPORT.md` | the upload contract — implement the proxy against this |
 | `schema/` | `CONTRACT.md` — the single source of truth |
 | `docs/` | [what we measure](docs/WHAT-WE-MEASURE.md), findings, architecture |
 
-492 tests: `for s in pollers report collector cli importers; do python3 -m unittest discover -s $s/tests; done`
+524 tests: `for s in pollers report collector cli importers server; do python3 -m unittest discover -s $s/tests; done`

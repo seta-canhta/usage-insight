@@ -1,0 +1,51 @@
+# usage-insight collection endpoint — the only thing facing the internet.
+#
+# One public route. Uploading has to be reachable from every laptop; reading
+# exposes the whole team at once and is done from one machine by one person who
+# already has SSH, so the read routes are not published here at all. See
+# docs/TRANSPORT.md, "Ports: one public, one on loopback".
+
+server {
+    listen 443 ssl http2;
+    server_name aeris-insight.seta-international.com;
+
+    ssl_certificate     /etc/letsencrypt/live/aeris-insight.seta-international.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/aeris-insight.seta-international.com/privkey.pem;
+
+    # An upload is a few KB. This matches cli/ship.py's own cap, so a 413 means
+    # the same thing on both sides instead of one hop silently disagreeing.
+    client_max_body_size 1m;
+
+    access_log /var/log/nginx/insight.access.log;
+
+    # A laptop uploads once an hour. Anything faster is a loop, not a person.
+    limit_req_zone $binary_remote_addr zone=insight_upload:10m rate=30r/m;
+
+    location = /v1/bundle {
+        limit_req zone=insight_upload burst=10 nodelay;
+        proxy_pass http://127.0.0.1:8479;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+        # A bundle is small; buffering it costs nothing and keeps a slow
+        # uploader from occupying a worker thread on the Python side.
+        proxy_request_buffering on;
+        proxy_read_timeout 60s;
+    }
+
+    location = /healthz {
+        proxy_pass http://127.0.0.1:8479;
+        access_log off;
+    }
+
+    # Reading is not a public route. Reach it with:
+    #   ssh -N -L 8479:127.0.0.1:8479 aeris-insight.seta-international.com
+    location /v1/ { return 404; }
+
+    location / { return 404; }
+}
+
+server {
+    listen 80;
+    server_name aeris-insight.seta-international.com;
+    return 301 https://$host$request_uri;
+}

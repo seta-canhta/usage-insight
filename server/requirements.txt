@@ -1,0 +1,11 @@
+# usage-insight collection endpoint — runtime dependencies.
+#
+# The service is stdlib-only apart from this. boto3 is what turns `--store
+# s3://...` into a real bucket write; without it the proxy still starts, still
+# authenticates, still validates, and still stores — against `--store file://`,
+# which is how the whole test suite runs and how the endpoint can be exercised
+# before any AWS credential exists.
+#
+# Pin the major/minor and let patch float, so a CVE fix does not need a code
+# change but a breaking release cannot arrive unannounced.
+boto3~=1.35

@@ -402,8 +402,18 @@ not a limitation of it.
 
 ## Deploying the proxy
 
-Roughly eighty lines wherever you like — Lambda + Function URL, a container,
-Express behind nginx. The shape:
+**It is built: [`server/`](../server/README.md).** Stdlib plus boto3, importing
+`cli/identity.py` rather than reimplementing the whitelist, with a `file://`
+backend so the whole thing runs before an AWS account exists:
+
+```bash
+INSIGHT_ADMIN_TOKEN=$(python3 -c "import secrets;print(secrets.token_urlsafe(32))") \
+python3 server/proxy.py --store file:///tmp/insight --allowed-file allowed.env
+```
+
+`server/README.md` has the systemd unit, the nginx config, the bucket and IAM
+setup, and the one-line-per-engineer whitelist. What follows is the shape it
+implements, kept here because the contract outlives the implementation:
 
 ```python
 ALLOWED = parse_whitelist(env["INSIGHT_ALLOWED"])   # {email: [fp, fp_prev]}
@@ -432,11 +442,11 @@ on GET /v1/bundles, GET /v1/bundle/*:
     # listing can name people; the bucket itself never holds one.
 ```
 
-`cli/identity.py` already implements `parse_whitelist`, `fingerprint`,
-`identify` and `person_key`, with tests. If the proxy is Python, import it
-rather than reimplementing — the whole argument in *Where validation lives*
-applies here too, and a whitelist parser that disagrees with the client about
-what `email:fp:fp` means fails in the least debuggable way available.
+`server/proxy.py` imports `parse_whitelist`, `fingerprint`, `identify` and
+`person_key` from `cli/identity.py` rather than reimplementing them — the whole
+argument in *Where validation lives* applies here too, and a whitelist parser
+that disagrees with the client about what `email:fp:fp` means fails in the least
+debuggable way available.
 
 The IAM role wants `s3:PutObject` for the write path and `s3:GetObject` +
 `s3:ListBucket` for the read path. Nothing wants `s3:DeleteObject` — retention

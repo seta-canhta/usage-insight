@@ -1,0 +1,50 @@
+# systemd unit for the collection endpoint.
+#   sudo cp server/insight-proxy.service /etc/systemd/system/
+#   sudo systemctl enable --now insight-proxy
+#
+# Reads its configuration from /etc/insight/proxy.env, which holds the admin
+# token and is the one file on this machine that must not be world-readable.
+
+[Unit]
+Description=usage-insight collection endpoint
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=insight
+Group=insight
+WorkingDirectory=/opt/usage-insight
+
+# INSIGHT_STORE, INSIGHT_ADMIN_TOKEN, INSIGHT_ALLOWED_FILE, AWS_REGION.
+# chmod 600, owned by root. Never in git.
+EnvironmentFile=/etc/insight/proxy.env
+
+ExecStart=/usr/bin/python3 /opt/usage-insight/server/proxy.py
+
+Restart=always
+RestartSec=5s
+
+# Loopback only. nginx is what faces the internet; this process has no TLS and
+# no rate limiting of its own, and binding it publicly would skip both.
+Environment=INSIGHT_HOST=127.0.0.1
+Environment=INSIGHT_PORT=8479
+Environment=PYTHONUNBUFFERED=1
+
+# It reads a whitelist and writes to S3. It needs nothing else.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+# Only needed for --store file://; harmless with s3://.
+ReadWritePaths=/var/lib/insight
+
+[Install]
+WantedBy=multi-user.target

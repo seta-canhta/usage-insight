@@ -310,16 +310,39 @@ class NewJoinerTests(unittest.TestCase):
                                  config(), TUE, state=state)
         self.assertEqual(len(report["to_alert"]), 1)
 
-    def test_anyone_who_has_ever_uploaded_skips_the_grace_period(self):
-        # They are demonstrably set up, so silence now is a real outage.
-        objects = [upload("lan@seta-international.vn", "2026-08-19T10:00:00+07:00")]
+    def test_an_upload_old_enough_to_judge_skips_the_grace_period(self):
+        # Seen well before the window, silent since: a real outage.
+        objects = [upload("lan@seta-international.vn", "2026-08-13T10:00:00+07:00")]
         report = watch_mod.check(objects, ["lan@seta-international.vn"],
                                  config(), TUE, state={})
         self.assertFalse(report["people"][0]["new_to_the_roster"])
         self.assertEqual(len(report["to_alert"]), 1)
 
-    def test_an_unreadable_first_sighting_does_not_silence_an_outage(self):
+    def test_someone_whose_only_upload_is_today_is_not_alerted(self):
+        # The one that pages the whole team on day one. Today is excluded from
+        # the window on purpose, so their streak counts back across days that
+        # predate the system -- while an upload an hour ago is the strongest
+        # possible evidence that nothing is broken.
+        objects = [upload("lan@seta-international.vn", "2026-08-25T10:00:00+07:00")]
+        report = watch_mod.check(objects, ["lan@seta-international.vn"],
+                                 config(), TUE, state={})
+        self.assertEqual(report["to_alert"], [])
+
+    def test_a_whole_team_that_just_started_is_not_paged_about(self):
+        roster = ["canh@seta-international.vn", "minh@seta-international.vn"]
+        objects = [upload(p, "2026-08-25T09:00:00+07:00") for p in roster]
+        report = watch_mod.check(objects, roster, config(), TUE, state={})
+        self.assertEqual(report["to_alert"], [])
+
+    def test_an_unreadable_first_sighting_is_rewritten_rather_than_kept(self):
+        # A stamp that never parses is a person who is never judged. It must
+        # heal on the next run, not silence them for as long as the file lives.
+        self.assertFalse(watch_mod._is_date("not a date"))
+        self.assertFalse(watch_mod._is_date(None))
+        self.assertTrue(watch_mod._is_date("2026-08-18"))
+
+    def test_an_unreadable_stamp_is_ignored_when_judging(self):
         state = {"lan@seta-international.vn": {"roster_since": "not a date"}}
         report = watch_mod.check([], ["lan@seta-international.vn"],
                                  config(), TUE, state=state)
-        self.assertEqual(len(report["to_alert"]), 1)
+        self.assertTrue(report["people"][0]["new_to_the_roster"])

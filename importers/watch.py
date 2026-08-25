@@ -270,20 +270,45 @@ def should_alert(person: str, streak: int, threshold: int,
     return streak > already
 
 
-def is_settled(person: str, state: Dict[str, Any], today: date,
-               work_days: Set[int], threshold: int) -> bool:
-    """Has this person been on the roster long enough to be judged?
-
-    First sighting is recorded rather than assumed, so the clock starts when
-    someone is added to the roster instead of when they were hired.
-    """
-    since = (state.get(person) or {}).get("roster_since")
-    if not since:
-        return False
+def _is_date(value: Any) -> bool:
     try:
-        start = date.fromisoformat(since)
+        date.fromisoformat(value)
+        return True
     except (TypeError, ValueError):
-        return True     # an unreadable stamp must not silence a real outage
+        return False
+
+
+def first_evidence(person: str, seen: Set[date],
+                   state: Dict[str, Any]) -> Optional[date]:
+    """The earliest day this person is known to have existed here.
+
+    Their first upload, or the day they were added to the roster, whichever is
+    older. Anything before that is not silence -- it is a period they were not
+    being measured in.
+    """
+    candidates = set(seen)
+    since = (state.get(person) or {}).get("roster_since")
+    if since:
+        try:
+            candidates.add(date.fromisoformat(since))
+        except (TypeError, ValueError):
+            pass        # an unreadable stamp must not silence a real outage
+    return min(candidates) if candidates else None
+
+
+def is_settled(person: str, seen: Set[date], state: Dict[str, Any],
+               today: date, work_days: Set[int], threshold: int) -> bool:
+    """Has this person existed here long enough to be judged silent?
+
+    The subtle case, and the one that pages the whole team on day one: someone
+    whose only upload is *today*. Today is excluded from the window on purpose,
+    so their streak counts back across working days that predate the system --
+    and an upload an hour ago is the strongest possible evidence that nothing is
+    broken. The clock starts at first evidence, not at the start of the window.
+    """
+    start = first_evidence(person, seen, state)
+    if start is None:
+        return False
     elapsed = sum(1 for day in working_days_before(today, work_days, 400)
                   if day >= start)
     return elapsed >= threshold
@@ -304,10 +329,8 @@ def check(objects: Sequence[Dict[str, Any]], roster: Sequence[str],
     for person in sorted({str(p).strip().lower() for p in roster if str(p).strip()}):
         seen = reported.get(person, set())
         streak = missed_streak(seen, expected)
-        # Anyone who has ever uploaded is judged from that upload; only someone
-        # never seen at all needs the grace period.
-        settled = bool(seen) or is_settled(
-            person, state, today, config["work_days"], config["threshold"])
+        settled = is_settled(person, seen, state, today,
+                             config["work_days"], config["threshold"])
         people.append({
             "person": person,
             "missed_working_days": streak,
@@ -402,8 +425,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     # Record first sighting before anything else, so the grace period starts
     # from the day someone joined the roster rather than the day they broke.
     for entry in report["people"]:
-        state.setdefault(entry["person"], {}).setdefault(
-            "roster_since", today.isoformat())
+        record = state.setdefault(entry["person"], {})
+        if not _is_date(record.get("roster_since")):
+            # Rewritten rather than kept. `setdefault` would leave a corrupt
+            # stamp in place, and a stamp that never parses is a person who is
+            # never judged -- silence that lasts as long as the file does.
+            record["roster_since"] = today.isoformat()
 
     sent = 0
     for entry in report["to_alert"]:
