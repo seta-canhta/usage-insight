@@ -3,7 +3,7 @@
 Dành cho engineer tham gia pilot đo hiệu quả AI. macOS và Ubuntu.
 
 **Nó ghi lại gì:** agent nào của platform đã chạy, trên ticket nào, tốn bao nhiêu token
-Copilot. Tất cả nằm trên máy bạn cho tới khi chính bạn gửi file đi.
+Copilot. Tất cả nằm trên máy bạn cho tới khi chính bạn chạy một lệnh để gửi đi.
 
 **Nó không bao giờ ghi:** prompt của bạn, câu trả lời của Copilot, code, diff,
 nội dung file, hay bất cứ thứ gì bạn gõ. Chỉ có số đếm, hash và các nhãn cố định.
@@ -16,13 +16,35 @@ Bạn đọc được mọi file trước khi gửi, và xoá sạch bằng mộ
 ```bash
 git clone git@github.com:seta-canhta/usage-insight.git
 cd usage-insight
-./insight setup --repo ~/work/repo-one --repo ~/work/repo-two
+./insight setup --repo ~/work/repo-one --repo ~/work/repo-two \
+    --email ban@seta-international.vn
 ```
 
 Lặp `--repo` cho từng repo bạn làm việc. Mỗi cái được ghi nhớ, nên `scan` về sau không cần tham số — và repo bạn quên chính là repo sẽ âm thầm không báo gì.
 
-Lệnh này cấu hình VS Code, ghi nhận sự đồng ý của bạn, và cài commit hook.
-Thêm `--dry-run` nếu muốn xem trước nó sẽ đổi gì.
+Lệnh này cấu hình VS Code, ghi nhận sự đồng ý của bạn, cài commit hook, và tạo
+một khoá bí mật để upload. Thêm `--dry-run` nếu muốn xem trước nó sẽ đổi gì.
+
+### Một dòng cần gửi đi
+
+Kết thúc `setup`, nó in ra một dòng như thế này:
+
+```
+    ban@seta-international.vn:9f2ac41e8b...c3d1
+```
+
+**Gửi dòng đó cho người vận hành pipeline.** Nó được thêm vào danh sách cho phép
+trên server, và `./insight ship` sẽ từ chối upload cho tới khi dòng đó có mặt.
+
+Dòng đó là *hash*, không phải mật khẩu — dán vào chat cũng an toàn. Khoá bí mật
+thật được tạo ngay trên máy bạn, nằm trong `~/.seta-insight/config.json`, và
+không bao giờ được gửi cho ai, kể cả người quản lý danh sách cho phép.
+
+Mất rồi? `./insight whoami` in lại.
+
+Email của bạn chỉ dùng cho một việc: cho server biết ai đang upload, để tuần nào
+thiếu dữ liệu thì hỏi đúng người. **Nó không bao giờ được ghi vào bundle** — dữ
+liệu thu thập không chứa địa chỉ email nào cả.
 
 Nó backup `settings.json`, **giữ nguyên mọi setting bạn đang có**, và **khôi
 phục backup nếu kết quả không parse được** — nên file của bạn hoặc đúng, hoặc
@@ -77,19 +99,27 @@ cd ~/usage-insight
 ./insight collect                                # agent nào, ticket nào
 ./insight scan      # mọi repo đã đăng ký
 ./insight pack --since 2026-08-17 --until 2026-08-23
+./insight ship      # upload lên
 ```
 
 `otel` xoá rỗng file span của Copilot sau khi đọc — không thì nó phình vô hạn,
 và đó chính là file có thể chứa prompt của bạn.
 
-`pack` in ra đường dẫn một file trong `~/.seta-insight/.reports/`. Gửi file đó.
+`pack` ghi một file trong `~/.seta-insight/.reports/`, còn `ship` upload nó lên.
+Cố ý tách làm hai lệnh: **không gì rời khỏi máy bạn cho tới khi bạn gõ lệnh thứ
+hai.**
 
 **Cứ mở ra xem trước nếu muốn.** Nó là text thuần: một dòng tóm tắt, rồi mỗi
-dòng một sự kiện. Không nén, không giấu gì.
+dòng một sự kiện. Không nén, không giấu gì. `./insight ship --dry-run` cho xem
+sẽ gửi gì mà không gửi thật.
 
-**Tuần không làm gì vẫn phải gửi file.** Tuần không có sự kiện là số 0 thật; tuần
-không có file là *thiếu dữ liệu*. Báo cáo phải phân biệt được hai thứ đó — nên
-gửi một bundle rỗng cũng là một câu trả lời có ích.
+Chạy `ship` hai lần cũng không sao — server nhận ra bundle nó đã có và báo lại.
+Không chắc tuần trước đã gửi được chưa thì cứ chạy lại.
+
+**Tuần không làm gì vẫn phải gửi bundle.** Tuần không có sự kiện là số 0 thật;
+tuần không có bundle là *thiếu dữ liệu*. Báo cáo phải phân biệt được hai thứ đó
+— vì vậy `pack --since ... --until ...` ghi lại đúng tuần bạn muốn nói tới, kể
+cả khi tuần đó không có gì.
 
 ---
 
@@ -97,10 +127,16 @@ gửi một bundle rỗng cũng là một câu trả lời có ích.
 
 | | |
 |---|---|
-| `./insight status` | đang có gì trong bộ đệm |
-| `./insight purge --yes` | xoá sạch mọi sự kiện và bundle |
+| `./insight status` | đang có gì trong bộ đệm, và đã upload những gì |
+| `./insight ship --dry-run` | sẽ gửi gì, mà không gửi thật |
+| `./insight whoami` | in lại dòng cho danh sách cho phép |
+| `./insight rotate-token` | đổi khoá upload (upload vẫn chạy bình thường) |
+| `./insight purge --yes` | xoá sạch mọi sự kiện và bundle trên máy này |
 | `./insight purge --yes --all` | xoá luôn, và quên hẳn máy này |
 | Tắt hoàn toàn | đặt `otel.enabled` về `false` và ngừng chạy `pack` |
+
+`purge` chỉ xoá trên máy bạn. Bundle đã upload thì đã upload rồi — cần xoá thì
+hỏi người vận hành pipeline.
 
 ## Đây không phải cái gì
 

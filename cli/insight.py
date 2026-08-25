@@ -19,6 +19,9 @@ to resolve on someone else's machine.
     ./insight scan         read git history in a repository
     ./insight collect   read the emit.py buffer
     ./insight pack      seal a bundle to hand over
+    ./insight ship      send a sealed bundle to the collection endpoint
+    ./insight whoami    the whitelist line to send to the server admin
+    ./insight rotate-token  mint a new upload secret
     ./insight status    what is buffered, what was packed
     ./insight purge     delete everything collected
 
@@ -57,11 +60,23 @@ HOME = os.environ.get("SETA_INSIGHT_HOME") or os.path.join(
 CONFIG_PATH = os.path.join(HOME, "config.json")
 BUFFER_DIR = os.path.join(HOME, "buffer")
 REPORTS_DIR = os.path.join(HOME, ".reports")
+#: Which bundles have already gone, so `ship` does not resend megabytes and
+#: `status` can answer "did last week get through?" without a network call.
+RECEIPTS_PATH = os.path.join(HOME, "shipped.json")
 
 #: Where ``emit.py`` writes, per ai-engineering-platform.
 EMIT_BUFFER = os.path.join(os.path.expanduser("~"), ".aiep", "telemetry")
 
 BUNDLE_FORMAT = "seta-insight-bundle/1"
+
+#: Where `ship` uploads unless told otherwise. Defaulted rather than asked for,
+#: because an engineer who is never told about `--endpoint` collects diligently
+#: for a month and then finds out nothing ever arrived. `--endpoint` overrides
+#: it and `--no-endpoint` opts out into handing bundles over by hand.
+#: SETA_INSIGHT_ENDPOINT exists so tests and a staging proxy do not have to
+#: patch the module.
+SETA_ENDPOINT = "https://aeris-insight.seta-international.com"
+DEFAULT_ENDPOINT = os.environ.get("SETA_INSIGHT_ENDPOINT") or SETA_ENDPOINT
 
 CONSENT_TEXT = """
 This collects, from this machine:
@@ -73,13 +88,29 @@ This collects, from this machine:
 It never collects prompts, responses, source code, diffs, file contents, or
 secrets. Counts, hashes and fixed categories only.
 
-Nothing is sent anywhere. Everything stays in {home} until you run `pack`
-and hand the bundle over yourself. You can read any bundle before you send it,
-and `purge` deletes everything at any time.
+{transport}
 
 These figures describe how a way of working is going. They are not a
 performance record and do not support individual assessment.
 """
+
+#: Said differently depending on whether an endpoint is configured, because the
+#: promise is different. "Nothing is sent anywhere" is true of a machine with no
+#: endpoint and false of one with `ship` wired up, and a consent text that is
+#: false in the second case is worse than no consent text at all.
+TRANSPORT_MANUAL = """Nothing is sent anywhere. Everything stays in {home} until you run `pack`
+and hand the bundle over yourself. You can read any bundle before you send it,
+and `purge` deletes everything at any time."""
+
+TRANSPORT_ENDPOINT = """Everything stays in {home} until you run `ship`, which uploads a sealed
+bundle to:
+
+  {endpoint}
+
+`ship` never runs on its own -- nothing leaves this machine until you type it,
+and you can read any bundle first. `purge` deletes everything held here; a
+bundle you have already sent is already sent, and removing that is a request to
+whoever runs the pipeline."""
 
 
 # --------------------------------------------------------------------------
@@ -124,7 +155,21 @@ def cmd_init(args: argparse.Namespace) -> int:
         print("consent recorded {}".format(existing.get("consent_at")))
         return 0
 
-    print(CONSENT_TEXT.format(home=HOME))
+    import identity
+
+    endpoint = (None if getattr(args, "no_endpoint", False) else
+                (getattr(args, "endpoint", None)
+                 or (existing or {}).get("endpoint")
+                 or DEFAULT_ENDPOINT))
+    email = getattr(args, "email", None) or (existing or {}).get("email")
+    if email:
+        try:
+            email = identity.normalise_email(email)
+        except identity.IdentityError as exc:
+            raise SystemExit(str(exc))
+    transport = (TRANSPORT_ENDPOINT.format(home=HOME, endpoint=endpoint)
+                 if endpoint else TRANSPORT_MANUAL.format(home=HOME))
+    print(CONSENT_TEXT.format(home=HOME, transport=transport))
     if not args.yes:
         answer = input("Collect telemetry from this machine? [y/N] ").strip().lower()
         if answer not in ("y", "yes"):
@@ -147,10 +192,60 @@ def cmd_init(args: argparse.Namespace) -> int:
         # have to remember four commands, because the one they forget is the
         # one that silently reports nothing.
         "repos": (existing or {}).get("repos") or [],
+        # Where `ship` sends. Absent means bundles are handed over by hand,
+        # which stays a supported way to run this rather than a broken one.
+        "endpoint": endpoint,
+        # Transport identity. CONTRACT.md 1.1 forbids raw email addresses in
+        # collected data, and nothing writes this into a bundle -- it travels
+        # in the Authorization header and nowhere else.
+        "email": email,
+        # Minted here, kept here. The server is given sha256 of it and never
+        # the value, so its whitelist is not a credential store.
+        "endpoint_token": (existing or {}).get("endpoint_token") or (
+            identity.mint_secret() if email else None),
+        "endpoint_token_previous": (existing or {}).get("endpoint_token_previous"),
     }
     write_json(CONFIG_PATH, config)
+    os.chmod(CONFIG_PATH, 0o600)
     print("initialised. machine id {}".format(config["machine_id"][:8]))
+    if config.get("endpoint_token"):
+        print()
+        print_whitelist_line(config)
+    elif endpoint:
+        # Warned, not refused. Collecting without being able to upload is still
+        # a useful state -- the bundles are on disk and can be handed over by
+        # hand -- and refusing here would block anyone not yet enrolled.
+        print()
+        print("No work email recorded, so `ship` has nothing to upload under.")
+        print("Run `./insight setup --email you@seta-international.vn` when you "
+              "have one.")
     return 0
+
+
+def print_whitelist_line(config: Dict[str, Any]) -> None:
+    """The one thing setup cannot do for the engineer, said plainly.
+
+    Uploading fails until someone adds this line to the server, and the failure
+    is a 401 that looks like a bug rather than a missing step. Printing it here,
+    in full, is what keeps that from becoming a support conversation.
+    """
+    import identity
+
+    line = identity.whitelist_line(config["email"], config["endpoint_token"])
+    print("Send this line to whoever maintains the collection server, so they")
+    print("can add you to INSIGHT_ALLOWED in its .env:")
+    print()
+    print("    " + line)
+    print()
+    print("It is a hash, not a secret -- the secret stays in {}.".format(
+        CONFIG_PATH))
+    # Only true before there is a working secret. During a rotation the old one
+    # still uploads, and saying otherwise would send someone chasing an outage
+    # that is not happening.
+    if config.get("endpoint_token_previous"):
+        print("Uploads keep working on the previous secret until it is.")
+    else:
+        print("Uploading with `ship` will fail until that line is in place.")
 
 
 # --------------------------------------------------------------------------
@@ -311,9 +406,40 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     if not args.dry_run:
         if load_config() is None:
-            cmd_init(argparse.Namespace(yes=args.yes, force=False))
+            cmd_init(argparse.Namespace(yes=args.yes, force=False,
+                                        endpoint=args.endpoint,
+                                        no_endpoint=args.no_endpoint,
+                                        email=args.email))
         steps.append({"step": "consent", "ok": True,
                       "detail": "recorded" if load_config() else "declined"})
+
+        # Also settable on a machine set up before there was an endpoint, so
+        # turning transport on later is one command rather than a re-init.
+        config = load_config()
+        if config is not None and (args.endpoint or args.email
+                                   or args.no_endpoint
+                                   or not config.get("endpoint")):
+            import identity
+            if args.no_endpoint:
+                config["endpoint"] = None
+            elif args.endpoint or not config.get("endpoint"):
+                config["endpoint"] = args.endpoint or DEFAULT_ENDPOINT
+            if args.email:
+                try:
+                    config["email"] = identity.normalise_email(args.email)
+                except identity.IdentityError as exc:
+                    raise SystemExit(str(exc))
+            if config.get("email") and not config.get("endpoint_token"):
+                config["endpoint_token"] = identity.mint_secret()
+            write_json(CONFIG_PATH, config)
+            os.chmod(CONFIG_PATH, 0o600)
+        if config is not None:
+            steps.append({"step": "endpoint", "ok": True,
+                          "detail": config.get("endpoint")
+                          or "not set -- bundles are handed over by hand"})
+            if config.get("email"):
+                steps.append({"step": "identity", "ok": True,
+                              "detail": config["email"]})
 
         for repo in args.repo or []:
             try:
@@ -335,7 +461,12 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # The one thing this cannot do for them, said once and plainly.
         print("Restart VS Code (quit fully, not Reload Window) so the settings "
               "take effect.")
-        print("Then: ./insight otel && ./insight collect && ./insight pack")
+        final = load_config() or {}
+        tail = " && ./insight ship" if final.get("endpoint") else ""
+        print("Then: ./insight otel && ./insight collect && ./insight pack" + tail)
+        if final.get("endpoint_token"):
+            print()
+            print_whitelist_line(final)
     return 0 if all(s.get("ok") for s in steps) else 1
 
 
@@ -766,6 +897,162 @@ def cmd_pack(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# ship
+# --------------------------------------------------------------------------
+
+def cmd_ship(args: argparse.Namespace) -> int:
+    """Send sealed bundles to the collection endpoint.
+
+    Separate from ``pack`` on purpose. The consent model rests on an engineer
+    being able to read their bundle before deciding to hand it over, and folding
+    the upload into ``pack`` would remove that without saying so.
+    """
+    import ship as ship_mod
+
+    config = require_config()
+    endpoint = args.endpoint or config.get("endpoint")
+    if not endpoint:
+        raise SystemExit(
+            "no collection endpoint configured -- run `insight setup "
+            "--endpoint https://...` or pass --endpoint. See docs/TRANSPORT.md")
+
+    if not (args.token or config.get("endpoint_token")):
+        raise SystemExit(
+            "no upload secret on this machine -- run `insight setup --email "
+            "you@seta-international.vn`, then send the line it prints to "
+            "whoever maintains the server whitelist")
+
+    receipts = ship_mod.load_receipts(RECEIPTS_PATH)
+    if args.bundle:
+        pending = [os.path.abspath(os.path.expanduser(args.bundle))]
+    else:
+        pending = ship_mod.unshipped(REPORTS_DIR, receipts)
+        # Newest only unless asked otherwise: the weekly ritual sends this
+        # week. Someone catching up after leave asks for --all and means it.
+        if pending and not args.all:
+            pending = pending[-1:]
+
+    if not pending:
+        print(json.dumps({"shipped": 0, "detail": "nothing to ship",
+                          "endpoint": endpoint}, sort_keys=True))
+        return 0
+
+    if args.dry_run:
+        for path in pending:
+            manifest = ship_mod.read_manifest(path)
+            body, digest = ship_mod.digest_of(path)
+            print(json.dumps({
+                "would_ship": os.path.basename(path),
+                "endpoint": endpoint.rstrip("/") + "/v1/bundle",
+                "window": manifest.get("window_start"),
+                "events": manifest.get("event_count"),
+                "bytes": len(body), "sha256": digest,
+            }, sort_keys=True))
+        return 0
+
+    sent, failed = 0, 0
+    for path in pending:
+        try:
+            receipt = ship_mod.ship_bundle(
+                path, endpoint,
+                token=args.token or config.get("endpoint_token"),
+                previous_token=(None if args.token
+                                else config.get("endpoint_token_previous")),
+                timeout=args.timeout)
+        except ship_mod.ShipError as exc:
+            print("FAILED {}: {}".format(os.path.basename(path), exc),
+                  file=sys.stderr)
+            failed += 1
+            continue
+        receipts[os.path.basename(path)] = receipt
+        # Written per bundle, not at the end. A crash halfway through --all must
+        # not lose the record of what already went, or the next run resends it.
+        ship_mod.save_receipts(RECEIPTS_PATH, receipts)
+        sent += 1
+        print(json.dumps(receipt, sort_keys=True))
+
+    if failed:
+        print(json.dumps({"shipped": sent, "failed": failed}, sort_keys=True),
+              file=sys.stderr)
+    return 1 if failed else 0
+
+
+# --------------------------------------------------------------------------
+# identity
+# --------------------------------------------------------------------------
+
+def cmd_whoami(args: argparse.Namespace) -> int:
+    """Print the whitelist line again.
+
+    Exists because the line printed at setup scrolls away, and the failure it
+    prevents -- a 401 an engineer cannot diagnose -- costs more than the command.
+    """
+    config = require_config()
+    if not config.get("email"):
+        raise SystemExit(
+            "no work email recorded -- run `insight setup --email "
+            "you@seta-international.vn`")
+    if not config.get("endpoint_token"):
+        raise SystemExit("no upload secret on this machine -- run "
+                         "`insight rotate-token` to mint one")
+    print_whitelist_line(config)
+    if config.get("endpoint_token_previous"):
+        import identity
+        print()
+        print("A rotation is still in flight. The previous line stays valid "
+              "until it is removed:")
+        print()
+        print("    " + identity.whitelist_line(
+            config["email"], config["endpoint_token_previous"]))
+    return 0
+
+
+def cmd_rotate_token(args: argparse.Namespace) -> int:
+    """Mint a new upload secret without breaking the old one.
+
+    The new fingerprint has to reach a ``.env`` maintained by someone else
+    before it works, so the previous secret is retained and ``ship`` falls back
+    to it on a 401. Rotation costs no downtime and needs no scheduling, which is
+    the only way it happens more than once.
+    """
+    import identity
+
+    config = require_config()
+    if not config.get("email"):
+        raise SystemExit(
+            "no work email recorded -- run `insight setup --email "
+            "you@seta-international.vn`")
+
+    if args.finish:
+        if not config.get("endpoint_token_previous"):
+            print("no rotation in flight")
+            return 0
+        config["endpoint_token_previous"] = None
+        write_json(CONFIG_PATH, config)
+        os.chmod(CONFIG_PATH, 0o600)
+        print("previous secret discarded. Ask for its line to be removed from "
+              "INSIGHT_ALLOWED.")
+        return 0
+
+    new_secret, previous = identity.rotate(config)
+    config["endpoint_token"] = new_secret
+    config["endpoint_token_previous"] = previous or None
+    write_json(CONFIG_PATH, config)
+    os.chmod(CONFIG_PATH, 0o600)
+
+    print_whitelist_line(config)
+    if previous:
+        print()
+        print("Add it ALONGSIDE the existing one rather than replacing it -- "
+              "INSIGHT_ALLOWED takes")
+        print("both as `{}:<new>:<old>`. Uploads keep working throughout."
+              .format(config["email"]))
+        print("Once it is in place, `insight rotate-token --finish` drops the "
+              "old secret here.")
+    return 0
+
+
+# --------------------------------------------------------------------------
 # status / purge
 # --------------------------------------------------------------------------
 
@@ -782,6 +1069,9 @@ def cmd_status(args: argparse.Namespace) -> int:
     bundles = sorted(
         f for f in os.listdir(REPORTS_DIR) if f.endswith(".ndjson")
     ) if os.path.isdir(REPORTS_DIR) else []
+    import identity
+    import ship as ship_mod
+    receipts = ship_mod.load_receipts(RECEIPTS_PATH)
     print(json.dumps({
         "initialised": True,
         "home": HOME,
@@ -793,6 +1083,22 @@ def cmd_status(args: argparse.Namespace) -> int:
         "repos": known_repos(),
         "bundles": len(bundles),
         "last_bundle": bundles[-1] if bundles else None,
+        "endpoint": config.get("endpoint"),
+        "email": config.get("email"),
+        # The fingerprint, never the secret. `status` output gets pasted into
+        # tickets and chat when something is wrong, so it must stay safe to paste.
+        "token_fingerprint": (
+            identity.fingerprint(config["endpoint_token"])
+            if config.get("endpoint_token") else None),
+        "rotation_in_flight": bool(config.get("endpoint_token_previous")),
+        "shipped": len(receipts),
+        # Named, not counted. "3 bundles waiting" is a number to ignore; the
+        # file names are what someone acts on.
+        "unshipped": [os.path.basename(p)
+                      for p in ship_mod.unshipped(REPORTS_DIR, receipts)],
+        "last_shipped_at": max(
+            (r.get("shipped_at") for r in receipts.values()
+             if isinstance(r, dict) and r.get("shipped_at")), default=None),
     }, indent=2, sort_keys=True))
     return 0
 
@@ -805,6 +1111,8 @@ def cmd_purge(args: argparse.Namespace) -> int:
         if answer not in ("y", "yes"):
             print("nothing deleted")
             return 1
+    import ship as ship_mod
+    shipped = len(ship_mod.load_receipts(RECEIPTS_PATH))
     removed = 0
     for directory in (BUFFER_DIR, REPORTS_DIR):
         if not os.path.isdir(directory):
@@ -812,9 +1120,19 @@ def cmd_purge(args: argparse.Namespace) -> int:
         for entry in os.listdir(directory):
             os.remove(os.path.join(directory, entry))
             removed += 1
+    if os.path.exists(RECEIPTS_PATH):
+        os.remove(RECEIPTS_PATH)
+        removed += 1
     if os.path.exists(CONFIG_PATH) and args.all:
         os.remove(CONFIG_PATH)
     print(json.dumps({"files_removed": removed, "config_removed": bool(args.all)}))
+    # Said plainly rather than implied. `purge` has always been a local command
+    # and cannot reach a bundle already sent; letting someone believe otherwise
+    # would be a worse failure of the consent model than not offering it.
+    if shipped:
+        print("{} bundle(s) had already been sent and are not affected by this "
+              "-- deleting them is a request to whoever runs the pipeline."
+              .format(shipped), file=sys.stderr)
     return 0
 
 
@@ -830,6 +1148,13 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("init", help="record consent and create the local store")
     p.add_argument("--yes", action="store_true", help="skip the consent prompt")
     p.add_argument("--force", action="store_true", help="rewrite an existing config")
+    p.add_argument("--endpoint",
+                   help="where `ship` sends bundles (default: {})".format(
+                       DEFAULT_ENDPOINT))
+    p.add_argument("--email", help="your work email -- identifies you to the "
+                                   "server whitelist, never stored in a bundle")
+    p.add_argument("--no-endpoint", action="store_true",
+                   help="do not upload; bundles are handed over by hand")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser(
@@ -838,6 +1163,13 @@ def build_parser() -> argparse.ArgumentParser:
                    help="repository to install the commit hook into (repeatable)")
     p.add_argument("--aiep", help="path to ai-engineering-platform "
                                   "(default: beside this repo)")
+    p.add_argument("--endpoint",
+                   help="where `ship` sends bundles (default: {})".format(
+                       DEFAULT_ENDPOINT))
+    p.add_argument("--email", help="your work email -- identifies you to the "
+                                   "server whitelist, never stored in a bundle")
+    p.add_argument("--no-endpoint", action="store_true",
+                   help="do not upload; bundles are handed over by hand")
     p.add_argument("--yes", action="store_true", help="skip the consent prompt")
     p.add_argument("--force", action="store_true",
                    help="replace an existing prepare-commit-msg hook")
@@ -880,6 +1212,29 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--clear", action="store_true",
                    help="remove the partitions that were packed")
     p.set_defaults(func=cmd_pack)
+
+    p = sub.add_parser(
+        "ship", help="send a sealed bundle to the collection endpoint")
+    p.add_argument("--bundle", help="a specific bundle file "
+                                    "(default: the newest not yet sent)")
+    p.add_argument("--all", action="store_true",
+                   help="send every bundle that has not gone yet")
+    p.add_argument("--endpoint", help="override the configured endpoint")
+    p.add_argument("--token", help="override the configured bearer token")
+    p.add_argument("--timeout", type=int, default=60)
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what would be sent, and send nothing")
+    p.set_defaults(func=cmd_ship)
+
+    p = sub.add_parser(
+        "whoami", help="print the whitelist line to send to the server admin")
+    p.set_defaults(func=cmd_whoami)
+
+    p = sub.add_parser(
+        "rotate-token", help="mint a new upload secret, keeping the old valid")
+    p.add_argument("--finish", action="store_true",
+                   help="discard the previous secret once the new line is live")
+    p.set_defaults(func=cmd_rotate_token)
 
     p = sub.add_parser("status", help="what is buffered and what was packed")
     p.set_defaults(func=cmd_status)

@@ -11,8 +11,11 @@ cd usage-insight
 ./insight collect         # read the emit.py buffer
 ./insight scan            # every registered repository
 ./insight pack --since 2026-08-17 --until 2026-08-23
+./insight ship            # upload it -- docs/TRANSPORT.md
+./insight whoami          # the allow-list line for the server's .env
+./insight rotate-token    # replace the upload secret, no outage
 ./insight status
-./insight purge           # delete everything collected
+./insight purge           # delete everything collected here
 ```
 
 ## Why it exists
@@ -82,3 +85,32 @@ delete their own telemetry has not consented to it.
 
 Bundles are plain NDJSON with a manifest on the first line — readable before you
 send them, and readable in six months without this tool.
+
+## `pack` and `ship` are two commands
+
+The consent model rests on an engineer being able to read their own bundle
+before deciding to send it. Folding the upload into `pack` would remove that
+property without ever mentioning it, so `ship` stays a thing someone types.
+
+`ship` never alters the bundle. A file that arrives is byte-for-byte the file
+that was sealed, which is what lets `importers/bundle.py` verify a checksum
+computed on another machine a week earlier.
+
+Re-running it is safe: the proxy keys objects by content digest and writes with
+`IfNoneMatch`, so a bundle it already holds comes back `409` and is reported as
+*already handed over*. Someone unsure whether last week went through will run it
+again, and it has to be safe when they do.
+
+## Identity, and what it is not
+
+`setup --email` mints a secret that stays on the machine, and prints
+`email:sha256(secret)` for the server's `INSIGHT_ALLOWED`. The secret is never
+transmitted to whoever keeps that list, so the list is not a credential store.
+
+`rotate-token` keeps the previous secret working — `ship` tries the new one and
+falls back on `401`. A rotation needing both people in the same minute is a
+rotation that happens once.
+
+The email is transport identity. `CONTRACT.md §1.1` forbids raw addresses in
+collected data and nothing here writes one into a bundle; it exists so a missing
+week can be chased by name instead of by machine id.

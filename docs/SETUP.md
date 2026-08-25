@@ -5,8 +5,8 @@ For engineers taking part in the AI effectiveness pilot. macOS and Ubuntu.
 *Tiếng Việt: [`SETUP.vi.md`](SETUP.vi.md)*
 
 **What this does:** records which platform agent ran, on which ticket, and what it
-cost in Copilot tokens. All of it stays on your machine until you hand a file
-over yourself.
+cost in Copilot tokens. All of it stays on your machine until you run one
+command to upload it.
 
 **What it never records:** your prompts, Copilot's replies, your code, your
 diffs, file contents, or anything you type. Counts, hashes and fixed categories
@@ -20,7 +20,8 @@ command.
 ```bash
 git clone git@github.com:seta-canhta/usage-insight.git
 cd usage-insight
-./insight setup --repo ~/work/repo-one --repo ~/work/repo-two
+./insight setup --repo ~/work/repo-one --repo ~/work/repo-two \
+    --email you@seta-international.vn
 ```
 
 Repeat `--repo` for each repository you work in. Each one is remembered, so `scan` later needs no arguments — and the repository you would have forgotten is the one that would have silently reported nothing.
@@ -34,6 +35,27 @@ correct or untouched. Doing this by hand went wrong three times in one
 afternoon here, and none of the three failures showed up as an error.
 
 Then **quit VS Code fully and reopen it** (not Reload Window).
+
+### One line to send
+
+Setup finishes by printing a line like this:
+
+```
+    you@seta-international.vn:9f2ac41e8b...c3d1
+```
+
+**Send it to whoever runs the pipeline.** It goes into the server's allow-list,
+and `./insight ship` will refuse to upload until it is there.
+
+That line is a hash, not a password — safe to paste in chat. Your actual upload
+secret is generated on this machine, stays in `~/.seta-insight/config.json`, and
+is never sent to anyone, including the person maintaining the allow-list.
+
+Lost it? `./insight whoami` prints it again.
+
+Your email is used for one thing: telling the server who is uploading, so a
+missing week can be chased by name. **It is never written into a bundle** — the
+data itself carries no email addresses at all.
 
 ## 2 · ⚠️ Know what `captureContent` does not do
 
@@ -84,20 +106,27 @@ cd ~/usage-insight
 ./insight collect                                # which agent, which ticket
 ./insight scan      # every repository you have registered
 ./insight pack --since 2026-08-17 --until 2026-08-23
+./insight ship      # upload it
 ```
 
 `otel` empties Copilot's span file after reading it — it grows without limit
 otherwise, and it is the file that may hold your prompts.
 
-`pack` prints the path of one file under `~/.seta-insight/.reports/`. Send that
-file.
+`pack` writes one file under `~/.seta-insight/.reports/` and `ship` uploads it.
+They are two commands on purpose: nothing leaves your machine until you type the
+second one.
 
 **Open it first if you want to.** It is plain text: a summary line, then one
-line per event. Nothing is hidden and nothing is compressed.
+line per event. Nothing is hidden and nothing is compressed. `./insight ship
+--dry-run` shows what would be sent without sending it.
 
-**A quiet week still needs its file.** A week with no events is a real zero; a
-week with no file is missing data, and the report has to be able to tell those
-apart. Sending an empty bundle is a useful answer.
+Running `ship` twice is safe — the server recognises a bundle it already has and
+says so. If you are unsure whether last week went through, just run it again.
+
+**A quiet week still needs its bundle.** A week with no events is a real zero; a
+week with no bundle is missing data, and the report has to be able to tell those
+apart. `pack --since ... --until ...` records the week you meant even when
+nothing happened in it, which is why those dates are worth typing.
 
 ---
 
@@ -105,10 +134,16 @@ apart. Sending an empty bundle is a useful answer.
 
 | | |
 |---|---|
-| `./insight status` | what is buffered right now |
-| `./insight purge --yes` | delete every event and bundle |
+| `./insight status` | what is buffered, and what has been uploaded |
+| `./insight ship --dry-run` | what would be sent, without sending it |
+| `./insight whoami` | your allow-list line, again |
+| `./insight rotate-token` | replace your upload secret (uploads keep working) |
+| `./insight purge --yes` | delete every event and bundle held here |
 | `./insight purge --yes --all` | that, and forget this machine entirely |
 | Turn it all off | set `otel.enabled` back to `false` and stop running `pack` |
+
+`purge` is a local command. A bundle you already uploaded is already uploaded —
+ask whoever runs the pipeline if you need one removed.
 
 ## What this is not
 
@@ -116,7 +151,8 @@ These figures describe how a way of working is going — whether AI-assisted wor
 is accepted at review, whether tests get run, what a session costs. They are
 **not a performance record**, and they do not support assessing anyone
 individually. Collection is voluntary, you can read everything before it leaves
-your machine, and you can delete it at any point. That is deliberate, and it is
+your machine, nothing uploads unless you run `ship`, and you can delete what is
+held here at any point. That is deliberate, and it is
 also the reason the data could never serve as an audit trail.
 
 Questions, or anything in a bundle that looks wrong: ask before sending it.

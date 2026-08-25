@@ -59,3 +59,27 @@ diagnostic. An empty bundle still counts as a covered week.
 The checksum catches truncation and corruption. It is **not** tamper-evidence:
 an engineer can read and edit their own bundle before handing it over, which is
 what makes the collection consensual. A voluntary record, never an audit trail.
+
+## `pull.py` — fetching a week
+
+```bash
+export INSIGHT_ENDPOINT=https://aeris-insight.seta-international.com
+export INSIGHT_ADMIN_TOKEN=...
+
+python3 pull.py --week 2026-W34 --inbox inbox/ --roster roster.txt
+python3 bundle.py --inbox inbox/ --out events.ndjson --state state/bundles.json
+```
+
+It stops at `inbox/` on purpose. `bundle.py` already parses, checksums,
+re-checks the allow-list and dedupes, and a bundle that arrived over HTTP has
+earned none of those exemptions — `pull.py` only replaces the person who used to
+save attachments into a folder.
+
+**Always pass `--roster`.** When bundles arrived by email a missing week was
+visible: no email came. Over HTTP it is silence, and silence reads as zero.
+`bundle.py`'s coverage report cannot help here by construction — it is derived
+from bundles that arrived, so someone who has never sent one is invisible to it.
+Only a roster knows who was expected.
+
+The roster is the same people as the server's `INSIGHT_ALLOWED`, one work email
+per line. Emails stay on this side: nothing written into `inbox/` carries one.

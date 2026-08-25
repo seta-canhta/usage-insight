@@ -21,7 +21,7 @@ Copilot  ──writes spans──┐                pollers  ──►  Jira
 agents   ──emit.py──────┐│                              Bitbucket
 git hook ──AI-Run-Id───┐││                              test management
                        ▼▼▼
-                   ./insight  ──weekly bundle──►  importers ──► report
+                   ./insight ──ship──► proxy ──► S3 ──pull──► importers ──► report
 ```
 
 Three signals never leave a laptop, and no amount of API polling recovers them:
@@ -29,21 +29,25 @@ Copilot's token usage, which agent ran, and the run id stamped into a commit.
 That is what the local client is for. Everything else is read centrally through
 APIs.
 
-Bundles are handed over by hand, one file a week. There is **no daemon and no
+One sealed bundle a week, uploaded with one command. There is **no daemon and no
 listening port** — Copilot writes its own span file and the client reads it when
-asked.
+asked, and `ship` only ever runs because someone typed it.
 
 ## Install
 
 ```bash
 git clone git@github.com:seta-canhta/usage-insight.git
 cd usage-insight
-./insight setup --repo ~/work/repo-one --repo ~/work/repo-two
+./insight setup --repo ~/work/repo-one --repo ~/work/repo-two \
+    --email you@seta-international.vn
 ```
 
 Python 3.9+, standard library only. Nothing to install, no virtualenv.
 
-`setup` configures VS Code, records consent, and installs the commit hook. It
+`setup` configures VS Code, records consent, installs the commit hook, and mints
+an upload secret. It prints one `email:fingerprint` line to send to whoever runs
+the pipeline — a hash, never the secret, which stays on the machine that made
+it. `whoami` prints it again; `rotate-token` replaces it without an outage. It
 backs up your settings, keeps what you already have, and **restores the backup
 if the result does not parse** — the file ends up correct or untouched.
 
@@ -59,12 +63,27 @@ Then restart VS Code. Once a week:
 ./insight collect   # which agent, which ticket
 ./insight scan      # every registered repository
 ./insight pack --since 2026-08-17 --until 2026-08-23
+./insight ship      # upload it
 ```
 
 `scan` with no `--repo` covers all of them, and keeps going if one clone has
 since been deleted.
 
-`pack` prints one file. Send it. `./insight purge --yes` deletes everything.
+`pack` seals; `ship` sends. Two commands on purpose — nothing leaves the machine
+until the second one is typed, which is what makes reading your own bundle first
+a real option rather than a claim. Re-running `ship` is safe; the server
+recognises a bundle it already holds. `./insight purge --yes` deletes everything
+held locally.
+
+Centrally, once a week:
+
+```bash
+python3 importers/pull.py --week 2026-W34 --inbox inbox/ --roster roster.txt
+python3 importers/bundle.py --inbox inbox/ --out events.ndjson
+```
+
+`pull` names who did not report. Read that line before the numbers —
+[`docs/TRANSPORT.md`](docs/TRANSPORT.md).
 
 Engineer-facing guide: [`docs/SETUP.md`](docs/SETUP.md) ·
 [tiếng Việt](docs/SETUP.vi.md)
@@ -78,9 +97,11 @@ counts, hashes, bounded categories and paths only. The allow-list is checked
 before a write, not on ingest, because the client runs on a machine full of
 exactly what it must not collect.
 
-**Absent is never rendered as zero.** With hand-collected data a gap is the
-normal case, and a report that shows a missing week as `0` shows a team getting
-worse when it is only getting quieter.
+**Absent is never rendered as zero.** A gap is the normal case — someone forgets,
+someone is on leave, someone joins mid-quarter — and a report that shows a
+missing week as `0` shows a team getting worse when it is only getting quieter.
+Automating the upload made this *more* dangerous, not less: a missing email was
+visible, and silence is not. `pull` names who did not report.
 
 **Self-reported data builds mappings, never counts.** Counting from it would
 rank people by how carefully they write reports.
@@ -112,7 +133,8 @@ that works.
 | `importers/` | weekly bundles, daily spreadsheet reconciliation |
 | `report/` | weekly Markdown, per-person workbooks |
 | `collector/` | the attribute allow-list, enforced |
+| `docs/TRANSPORT.md` | the upload contract — implement the proxy against this |
 | `schema/` | `CONTRACT.md` — the single source of truth |
 | `docs/` | [what we measure](docs/WHAT-WE-MEASURE.md), findings, architecture |
 
-355 tests: `for s in pollers report collector cli importers; do python3 -m unittest discover -s $s/tests; done`
+429 tests: `for s in pollers report collector cli importers; do python3 -m unittest discover -s $s/tests; done`

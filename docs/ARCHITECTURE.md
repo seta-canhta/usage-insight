@@ -13,9 +13,11 @@ Two sides that never talk to each other directly.
 │                     │                    │      │             .reports bundles│
 │                     ▼                    │      │                             │
 │              ~/.seta-insight/.reports/  │─────►│  collector/ ──► report/     │
-│              (NDJSON, contract events)   │ weekly, by hand      │             │
-└──────────────────────────────────────────┘      └─────────────────────────────┘
-                                                      later: S3 instead of by hand
+│              (NDJSON, contract events)   │  ship │             ▲             │
+└──────────────────────────────────────────┘   │   └─────────────│─────────────┘
+                                               ▼                 │
+                                        proxy ──► S3 ──── pull.py ┘
+                                     docs/TRANSPORT.md
 ```
 
 The engineer's machine holds everything the central side cannot see. The central side
@@ -107,7 +109,9 @@ translation layer to keep in sync — only the parts of the repo each side runs.
 ```
 ./insight init       # consent prompt, config, point Copilot at the file exporter
 ./insight pack       # read the three local sources, write the weekly bundle
-./insight status    # what is buffered, what was last packed
+./insight ship       # upload the sealed bundle -- docs/TRANSPORT.md
+./insight whoami     # the allow-list line to send to whoever runs the server
+./insight status    # what is buffered, what was last packed, what was sent
 ./insight purge      # delete everything collected
 ```
 
@@ -124,11 +128,17 @@ pack
  └── git log                    (markers and AI-Run-Id trailers)
 ```
 
-Run it once a week before handing the bundle over.
+Run it once a week, then `ship`. They stay two commands because the consent model
+rests on the engineer reading their own bundle before deciding to send it, and an
+upload folded into `pack` would remove that without saying so.
 
 `purge` exists because a person who cannot delete their own telemetry has not
 consented to it. The file exporter helps here too: the engineer can read exactly what
 Copilot recorded before deciding to hand it over.
+
+`purge` is local, and says so when it runs: it cannot reach a bundle already
+uploaded. Implying otherwise would be a worse failure of the consent model than
+not offering the command at all.
 
 **Verified 2026-08-24.** The exporter is configured with
 `github.copilot.chat.otel.exporterType: "file"` and
@@ -160,9 +170,10 @@ in the buffer — not on ingest at the far end, where it is already too late.
 
 ```
 ~/.seta-insight/
-  config.json          machine id, consent record, salt
+  config.json          machine id, consent, salt, work email, upload secret (0600)
   buffer/*.ndjson      append-only, one file per day
-  .reports/            packed bundles ready to hand over
+  .reports/            packed bundles, kept after upload so they stay readable
+  shipped.json         receipts: which bundle went where, and when
 ```
 
 **Home directory, not the project.** A `.reports/` folder inside a working repo gets
@@ -173,10 +184,12 @@ event counts by type, and a checksum.
 
 ---
 
-## Manual collection is a design constraint, not a temporary shortcut
+## Collection is voluntary and per-week, which has consequences either way
 
-Handing files over by hand every week has consequences that must be designed for now,
-because they do not become easier once S3 arrives.
+`ship` replaced the person attaching a file, but none of the following changed --
+they are consequences of *voluntary, per-week* collection, not of how the file
+travels. They were designed for before there was a transport, which is why
+adding one changed nothing below this line.
 
 | Risk | Handling |
 |---|---|
@@ -185,6 +198,7 @@ because they do not become easier once S3 arrives.
 | Someone was on leave | a bundle with zero events is a *measured* zero and looks different from an absent bundle |
 | Clock skew between machines | client stamps `event_time` in UTC; the collector stamps `ingested_at` on receipt; never sort by one alone |
 | Bundle edited before handover | out of scope to prevent — see below |
+| Bundle altered in transit | `X-Insight-Digest` over the whole file, recomputed by the proxy; the manifest's own checksum is re-verified again at import |
 
 **On tamper-evidence:** the engineer can read and edit their bundle before sending it.
 That is not a flaw to engineer away — it is what makes the collection consensual, and
@@ -194,20 +208,40 @@ wants to use these numbers for individual performance assessment should be told 
 data does not support it, before they try.
 
 **The "absent is not zero" rule matters most here.** With API polling, a gap is a bug.
-With hand-collected bundles, a gap is the normal case — someone forgets, someone is on
+With voluntary bundles, a gap is the normal case — someone forgets, someone is on
 leave, someone joins mid-quarter. A report that renders those as `0` will show a team
 getting worse when it is only getting quieter. Every aggregate carries how many machine
 weeks it actually covers.
 
+**Automation made this worse, and had to be paid for.** A bundle that never
+arrived by email was visible: no email came. A bundle that never arrived over
+HTTP is silence, and silence reads as zero unless something insists otherwise.
+That is why `importers/pull.py` takes a roster of work emails and names who did
+not report — coverage derived from bundles that *did* arrive cannot see someone
+who has never sent one.
+
 ---
 
-## Migration to S3, later
+## Transport — built, and it changed nothing else
 
-Nothing about the local design changes. `pack` already produces a sealed, manifested
-bundle; shipping becomes `POST` instead of a person attaching a file. Deliberately not
-built now — a transport with no bundles to carry is a guess about a format that does
-not exist yet.
+The prediction above held. `pack` already produced a sealed, manifested bundle, so
+shipping became one `PUT` and nothing about the local design moved. The bundle
+format, the allow-list, the import path and the coverage accounting are all
+untouched — `importers/bundle.py` verifies a checksum written on another machine a
+week earlier exactly as it did when the file arrived by email.
 
-What **is** worth doing now, because retrofitting it is expensive: keep the bundle
-format self-describing (`schema_version`, window, machine id, checksum inside the file)
-so a bundle found on disk in six months is still readable without the tool that made it.
+The full wire contract is **[`docs/TRANSPORT.md`](TRANSPORT.md)**. In brief:
+
+- The laptop `PUT`s to a small proxy that owns the S3 credentials. No SigV4 on a
+  machine full of source code, no SDK, no OAuth — the stdlib-only rule survives.
+- The **proxy chooses the object key** from the authenticated identity, so one
+  laptop can neither overwrite another's bundle nor list the team's.
+- Identity is a work email plus a secret minted on the laptop; the server's
+  `.env` holds only `sha256(secret)`. A leaked whitelist uploads nothing.
+- The email is transport only. `CONTRACT.md §1.1` forbids raw addresses in
+  collected data and nothing writes one into a bundle.
+- `409` on a duplicate, because the key is the content digest and writes use
+  `IfNoneMatch`. Idempotency is a property of the storage, not code that can rot.
+
+Keeping the bundle format self-describing turned out to be the load-bearing
+decision: the transport carries an opaque blob and needs to understand none of it.
