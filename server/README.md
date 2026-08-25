@@ -59,7 +59,7 @@ sudo python3 -m pip install -r /opt/usage-insight/server/requirements.txt
 
 sudo install -d -m 700 -o root -g root /etc/insight
 sudo tee /etc/insight/proxy.env >/dev/null <<'ENV'
-INSIGHT_STORE=s3://seta-insight/bundles
+INSIGHT_STORE=s3://aeris-insight
 INSIGHT_ADMIN_TOKEN=<python3 -c "import secrets;print(secrets.token_urlsafe(32))">
 INSIGHT_ALLOWED_FILE=/etc/insight/allowed.env
 AWS_REGION=ap-southeast-1
@@ -81,25 +81,98 @@ Adding an engineer is one line appended to `/etc/insight/allowed.env` and a
 
 ## The bucket
 
-```bash
-aws s3api create-bucket --bucket seta-insight --region ap-southeast-1 \
-    --create-bucket-configuration LocationConstraint=ap-southeast-1
-aws s3api put-public-access-block --bucket seta-insight \
-    --public-access-block-configuration \
-    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
-aws s3api put-bucket-encryption --bucket seta-insight \
-    --server-side-encryption-configuration \
-    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+```
+bucket   aeris-insight
+region   ap-southeast-1
+arn      arn:aws:s3:::aeris-insight
+store    s3://aeris-insight        ← no prefix; see below
 ```
 
-The instance role wants `s3:PutObject`, `s3:GetObject` and `s3:ListBucket` on
-that bucket, and **nothing else**. No `s3:DeleteObject`: retention is a lifecycle
-rule, and deletion is not a code path anywhere in this service.
+**No prefix.** Object keys already begin with `bundles/`, so `s3://aeris-insight/bundles`
+would file everything under `bundles/bundles/…`.
 
-`put_object` uses `IfNoneMatch: "*"`, so an existing key is never overwritten. On
-an S3-compatible store that does not support conditional writes the service
-falls back to check-then-write and says so in the log — racy, but the key is the
-content digest, so the worst case is a duplicate object rather than wrong data.
+### IAM
+
+Three actions, scoped to this bucket, and **no `s3:DeleteObject`** — retention is
+a lifecycle rule and deletion is not a code path anywhere in this service:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "WriteAndReadBundles",
+      "Effect": "Allow",
+      "Action": ["s3:PutObject", "s3:GetObject"],
+      "Resource": "arn:aws:s3:::aeris-insight/*"
+    },
+    {
+      "Sid": "ListForPull",
+      "Effect": "Allow",
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::aeris-insight"
+    }
+  ]
+}
+```
+
+`s3:ListBucket` is on the bucket ARN, the other two on `/*`. Getting that pair
+the wrong way round is the usual reason a listing returns `AccessDenied` while
+uploads work fine.
+
+Prefer an **instance role** over keys. The whole point of the proxy is that no
+long-lived S3 credential exists anywhere a laptop can reach.
+
+### Hardening and retention
+
+```bash
+aws s3api put-public-access-block --bucket aeris-insight \
+    --public-access-block-configuration \
+    BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+
+aws s3api put-bucket-encryption --bucket aeris-insight \
+    --server-side-encryption-configuration \
+    '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+
+# Retention is here, not in code. Bundles are KBs, so this is about the
+# promise made to engineers rather than about storage cost.
+aws s3api put-bucket-lifecycle-configuration --bucket aeris-insight \
+    --lifecycle-configuration '{"Rules":[
+      {"ID":"expire-bundles","Status":"Enabled",
+       "Filter":{"Prefix":"bundles/"},
+       "Expiration":{"Days":400}}]}'
+```
+
+400 days keeps a full year of week-over-week comparison plus a margin. Change
+the number to match what was promised at consent; do not change it to match
+what is convenient later.
+
+### Write-once
+
+`put_object` uses `IfNoneMatch: "*"`, so an existing key is never overwritten.
+On an S3-compatible store without conditional writes the service falls back to
+check-then-write on **every** write and logs that it did — racy, but the key is
+the content digest, so the worst case is a duplicate object rather than wrong
+data.
+
+### Before trusting it
+
+```bash
+AWS_REGION=ap-southeast-1 python3 server/verify_s3.py --store s3://aeris-insight
+```
+
+Everything in `server/tests` runs against a stub client — that proves this code
+asks S3 for the right things, not that *this bucket, this region, this role*
+answers the way the design needs. The preflight asserts the one that matters:
+a second write to an existing key is **refused**. If conditional writes are not
+honoured here, idempotency is gone and nothing downstream notices, because the
+overwritten object still parses and still checksums.
+
+It also reports, as advisory notes, whether the role can delete (it should not)
+and whether public access is blocked. It leaves one small object,
+`_preflight/probe.txt`, which says in its own body that it is safe to delete.
+
+Run it when the credentials land, and again after any bucket policy change.
 
 ## Ports
 

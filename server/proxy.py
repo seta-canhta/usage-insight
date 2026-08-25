@@ -2,7 +2,7 @@
 """The collection endpoint. Implements ``docs/TRANSPORT.md``.
 
     python3 server/proxy.py --store file:///tmp/insight --allowed-file allowed.env
-    python3 server/proxy.py --store s3://seta-insight/bundles
+    python3 server/proxy.py --store s3://aeris-insight
 
 Binds **127.0.0.1** by default. Nginx terminates TLS on 443 and exposes exactly
 one route; the read routes stay on loopback and are reached over SSH. See
@@ -415,7 +415,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Collection endpoint for usage-insight bundles.")
     parser.add_argument("--store", default=os.environ.get("INSIGHT_STORE"),
-                        help="s3://bucket/prefix or file:///path")
+                        help="s3://bucket[/prefix] or file:///path. Keys "
+                             "already start with bundles/, so a `bundles` "
+                             "prefix files everything under bundles/bundles/")
     parser.add_argument("--host", default=os.environ.get("INSIGHT_HOST", "127.0.0.1"),
                         help="default 127.0.0.1 -- nginx faces the internet, "
                              "not this")
@@ -430,7 +432,7 @@ def main(argv: Optional[List[str]] = None) -> int:
         format="%(asctime)s %(levelname)s %(message)s")
 
     if not args.store:
-        raise SystemExit("no --store -- pass s3://bucket/prefix or file:///path")
+        raise SystemExit("no --store -- pass s3://aeris-insight or file:///path")
     admin_token = os.environ.get("INSIGHT_ADMIN_TOKEN", "")
     if not admin_token:
         raise SystemExit(

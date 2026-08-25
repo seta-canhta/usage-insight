@@ -289,3 +289,45 @@ class FallbackDurabilityTests(unittest.TestCase):
         store.put("bundles/a/b/one.ndjson", b"1")
         store.put("bundles/a/b/two.ndjson", b"2")
         self.assertEqual(fake.objects["bundles/a/b/two.ndjson"], b"2")
+
+
+@unittest.skipUnless(HAVE_BOTO, "botocore not installed")
+class BotoCoreFailureTests(unittest.TestCase):
+    """Credentials, region and DNS fail differently from S3 saying no.
+
+    ClientError is what S3 *answers*; BotoCoreError is what happens before it is
+    ever asked. They share no base class, so catching only the first turns a
+    missing credential into an unhandled traceback -- a 500 from the endpoint,
+    where 503 is the truth and the one that makes `ship` retry.
+    """
+
+    def setUp(self):
+        from botocore.exceptions import NoCredentialsError
+        self.boom = NoCredentialsError
+
+    def _store(self, method):
+        fake = FakeS3()
+        setattr(fake, method, self._raise)
+        return store_mod.S3Store("bucket", "", client=fake)
+
+    def _raise(self, *a, **kw):
+        raise self.boom()
+
+    def test_a_missing_credential_on_put_is_a_StoreError(self):
+        with self.assertRaises(store_mod.StoreError):
+            self._store("put_object").put("bundles/a/b/c.ndjson", b"x")
+
+    def test_a_missing_credential_on_get_is_a_StoreError_not_KeyError(self):
+        # KeyError would become a 404: "that bundle does not exist", when the
+        # truth is "this server cannot talk to S3".
+        with self.assertRaises(store_mod.StoreError):
+            self._store("get_object").get("bundles/a/b/c.ndjson")
+
+    def test_a_missing_credential_on_list_is_a_StoreError(self):
+        with self.assertRaises(store_mod.StoreError):
+            self._store("list_objects_v2").list("bundles/")
+
+    def test_exists_treats_an_unreachable_store_as_absent(self):
+        # Only reached on the fallback path, where a StoreError from the put
+        # that follows is the honest report.
+        self.assertFalse(self._store("head_object").exists("bundles/a/b/c.ndjson"))

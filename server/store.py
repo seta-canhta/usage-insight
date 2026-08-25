@@ -106,6 +106,19 @@ class FileStore:
         return sorted(found, key=lambda o: o["key"])
 
 
+def _boto_errors() -> tuple:
+    """Every way botocore fails, as one tuple.
+
+    ``ClientError`` is what S3 *answers*; ``BotoCoreError`` is what happens
+    before it is ever asked -- no credentials, no region, DNS, connect timeout.
+    They do not share a base class, and catching only the first turns a missing
+    credential into an unhandled traceback: a 500 from the endpoint, where 503
+    is the truth and the one that makes `ship` retry instead of giving up.
+    """
+    from botocore.exceptions import BotoCoreError, ClientError  # noqa: PLC0415
+    return (ClientError, BotoCoreError)
+
+
 class S3Store:
     """A bucket. boto3 is the one wheel this service needs."""
 
@@ -121,7 +134,13 @@ class S3Store:
                 raise StoreError(
                     "s3:// needs boto3 -- `pip install -r server/requirements.txt`, "
                     "or run against file:// until the bucket exists")
-            self.client = boto3.client("s3")
+            try:
+                self.client = boto3.client("s3")
+            except Exception as exc:      # noqa: BLE001 -- e.g. NoRegionError
+                raise StoreError(
+                    "cannot create an S3 client: {} -- set AWS_REGION and make "
+                    "credentials available (an instance role is preferred)"
+                    .format(exc))
         #: Conditional writes are recent, and S3-compatible stores vary. Probed
         #: once on first refusal rather than assumed, so the write-once
         #: guarantee degrades loudly instead of silently.
@@ -131,7 +150,7 @@ class S3Store:
         return "{}/{}".format(self.prefix, key) if self.prefix else key
 
     def put(self, key: str, body: bytes, metadata: Optional[Dict[str, str]] = None) -> None:
-        from botocore.exceptions import ClientError  # noqa: PLC0415
+        errors = _boto_errors()
 
         args: Dict[str, Any] = {
             "Bucket": self.bucket, "Key": self._full(key), "Body": body,
@@ -150,8 +169,8 @@ class S3Store:
         try:
             self.client.put_object(**args)
             return
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "")
+        except errors as exc:
+            code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
             if code in ("PreconditionFailed", "ConditionalRequestConflict", "412"):
                 raise Exists(key)
             if code in ("NotImplemented", "InvalidArgument") and self._conditional:
@@ -167,31 +186,28 @@ class S3Store:
                 try:
                     self.client.put_object(**args)
                     return
-                except ClientError as retry:
+                except errors as retry:
                     raise StoreError("cannot write {}: {}".format(key, retry))
             raise StoreError("cannot write {}: {}".format(key, exc))
 
     def exists(self, key: str) -> bool:
-        from botocore.exceptions import ClientError  # noqa: PLC0415
         try:
             self.client.head_object(Bucket=self.bucket, Key=self._full(key))
             return True
-        except ClientError:
+        except _boto_errors():
             return False
 
     def get(self, key: str) -> bytes:
-        from botocore.exceptions import ClientError  # noqa: PLC0415
         try:
             response = self.client.get_object(Bucket=self.bucket, Key=self._full(key))
             return response["Body"].read()
-        except ClientError as exc:
-            code = exc.response.get("Error", {}).get("Code", "")
+        except _boto_errors() as exc:
+            code = getattr(exc, "response", {}).get("Error", {}).get("Code", "")
             if code in ("NoSuchKey", "404", "NotFound"):
                 raise KeyError(key)
             raise StoreError("cannot read {}: {}".format(key, exc))
 
     def list(self, prefix: str) -> List[Dict[str, Any]]:
-        from botocore.exceptions import ClientError  # noqa: PLC0415
         found: List[Dict[str, Any]] = []
         token = None
         try:
@@ -213,7 +229,7 @@ class S3Store:
                 if not page.get("IsTruncated"):
                     break
                 token = page.get("NextContinuationToken")
-        except ClientError as exc:
+        except _boto_errors() as exc:
             raise StoreError("cannot list {}: {}".format(prefix, exc))
         return sorted(found, key=lambda o: o["key"])
 
