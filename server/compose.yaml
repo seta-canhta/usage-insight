@@ -45,9 +45,23 @@ services:
       INSIGHT_ALLOWED_FILE: /etc/insight/allowed.env
       INSIGHT_ADMIN_TOKEN_FILE: /etc/insight/admin.token
       INSIGHT_HOST: "0.0.0.0"          # container-internal; see the note above
-      INSIGHT_PORT: "8479"
+      INSIGHT_PORT: "8479"              # full: uploads and the read routes
+      INSIGHT_UPLOAD_PORT: "8480"       # uploads and /healthz only -- published
       AWS_REGION: "${AWS_REGION:-ap-southeast-1}"
       LOG_LEVEL: "${LOG_LEVEL:-INFO}"
+
+    # A reverse proxy that is *not* on this host -- a gateway on another
+    # machine -- cannot reach a container network, so it has to be given a host
+    # port. INSIGHT_PUBLISH is that address; set it to the LAN interface only
+    # (192.168.x.y:8479), never to a bare 8479, which binds every interface.
+    #
+    # It maps to the **upload-only** listener, never to 8479 inside the
+    # container. That gateway's config decides which paths it forwards, and if
+    # it forwards all of them the read routes -- every engineer in one response
+    # -- become internet-reachable behind nothing but the admin token. The
+    # process enforces the split the network is not enforcing.
+    ports:
+      - "${INSIGHT_PUBLISH:-127.0.0.1:8479}:8480"
 
     volumes:
       - "${INSIGHT_CONF:-./etc}:/etc/insight:ro"
@@ -103,7 +117,11 @@ services:
       # network error is a watchdog that was not watching.
       - |
         while true; do
-          python3 /app/importers/watch.py             --roster /etc/insight/roster.txt             --endpoint http://insight-proxy:8479             --token "$$(cat /etc/insight/admin.token)"             --state /var/lib/insight-watch/state.json || true
+          python3 /app/importers/watch.py \
+            --roster /etc/insight/roster.txt \
+            --endpoint http://insight-proxy:8479 \
+            --token "$$(cat /etc/insight/admin.token)" \
+            --state /var/lib/insight-watch/state.json || true
           sleep "$${INSIGHT_WATCH_INTERVAL:-3600}"
         done
 

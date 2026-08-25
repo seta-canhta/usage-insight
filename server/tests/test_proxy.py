@@ -61,6 +61,7 @@ class ProxyTestCase(unittest.TestCase):
             identity.whitelist_line(person, secret)
             for person, secret in self.secrets.items()))
 
+        self.allowed = allowed
         self.store = store_mod.FileStore(os.path.join(self.tmp, "store"))
         handler = proxy_mod.build_handler(self.store, allowed, ADMIN)
         self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
@@ -282,6 +283,75 @@ class ReadRouteTests(ProxyTestCase):
         status, raw = self.get("/healthz", token=None)
         self.assertEqual(status, 200)
         self.assertTrue(self.json_of(raw)["ok"])
+
+
+class UploadOnlyListenerTests(ProxyTestCase):
+    """The listener that faces the internet when the gateway is elsewhere.
+
+    A reverse proxy on another machine cannot reach a container network, so it
+    is given a host port -- and its own config decides which paths it forwards.
+    When it forwards all of them, the route split `docs/TRANSPORT.md` describes
+    stops being enforced by the network, and the admin token becomes the only
+    thing between the internet and every engineer's telemetry. So this listener
+    enforces it in the process instead.
+    """
+
+    def setUp(self):
+        super().setUp()
+        handler = proxy_mod.build_handler(
+            self.store, self.allowed, ADMIN, read_routes=False)
+        self.public = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.public_base = "http://127.0.0.1:{}".format(
+            self.public.server_address[1])
+        threading.Thread(target=self.public.serve_forever, daemon=True).start()
+        self.addCleanup(self.public.server_close)
+        self.addCleanup(self.public.shutdown)
+
+    def public_get(self, path, token=ADMIN):
+        headers = {"Authorization": "Bearer " + token} if token else {}
+        request = urllib.request.Request(self.public_base + path, headers=headers)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status
+        except urllib.error.HTTPError as exc:
+            return exc.code
+
+    def test_uploads_still_work(self):
+        request = urllib.request.Request(
+            self.public_base + "/v1/bundle", data=bundle_bytes(), method="PUT",
+            headers={
+                "Content-Type": "application/x-ndjson",
+                "X-Insight-Machine": "a3f9c2b1f0e1",
+                "X-Insight-Window": "2026-08-17/2026-08-23",
+                "X-Insight-Schema": "1.0.0",
+                "X-Insight-Format": "seta-insight-bundle/1",
+                "X-Insight-Digest": "sha256=" + hashlib.sha256(
+                    bundle_bytes()).hexdigest(),
+                "Authorization": "Bearer " + self.secrets[CANH],
+            })
+        with urllib.request.urlopen(request, timeout=10) as response:
+            self.assertEqual(response.status, 201)
+
+    def test_healthz_still_works(self):
+        self.assertEqual(self.public_get("/healthz", token=None), 200)
+
+    def test_listing_is_404_even_with_the_admin_token(self):
+        # Not 401, and not 403. A listener that does not serve these does not
+        # need to admit they exist, and a leaked admin token must not be enough
+        # on its own -- which is the whole reason the routes were split.
+        self.assertEqual(self.public_get("/v1/bundles?week=2026-W34"), 404)
+
+    def test_fetching_a_bundle_is_404_even_with_the_admin_token(self):
+        _, raw = self.put()
+        key = self.json_of(raw)["key"]
+        self.assertEqual(self.public_get("/v1/bundle/" + key), 404)
+
+    def test_the_private_listener_still_reads(self):
+        # Same process, same store: the split is between listeners, not a
+        # feature switch that turns reading off everywhere.
+        self.put()
+        status, _ = self.get("/v1/bundles?week=2026-W34")
+        self.assertEqual(status, 200)
 
 
 class AdminTokenSourceTests(unittest.TestCase):

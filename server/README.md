@@ -45,11 +45,20 @@ checks it with the same function, so the two cannot disagree about what
 | `INSIGHT_ALLOWED` | `email:fp[:fp],...` |
 | `INSIGHT_ALLOWED_FILE` | the same, one line per engineer — easier to edit |
 | `INSIGHT_HOST` | default `127.0.0.1`; nginx is what faces the internet |
-| `INSIGHT_PORT` | default `8479` |
+| `INSIGHT_PORT` | default `8479` — uploads *and* the read routes |
+| `INSIGHT_UPLOAD_PORT` | optional second listener: uploads and `/healthz` only |
 | `AWS_REGION`, credentials | standard boto3 resolution — prefer an instance role |
 
 The admin token is required with no default. The read routes expose every
 engineer at once and are never left open by accident.
+
+`INSIGHT_UPLOAD_PORT` is for the case where the thing terminating TLS is on
+**another machine**. It cannot reach a container network, so it has to be given
+a host port — and its configuration, not yours, decides which paths it
+forwards. If it forwards all of them, the route split becomes a token check
+instead of a network boundary. Publish this port and the process enforces the
+split itself: `/v1/bundle` and `/healthz` are served, everything else is `404`
+regardless of credential.
 
 Prefer `INSIGHT_ADMIN_TOKEN_FILE` in a container. `docker inspect` prints a
 container's environment to anyone who can reach the Docker daemon, which on a
@@ -106,6 +115,9 @@ INSIGHT_STATE=./state
 INSIGHT_EDGE_NETWORK=<the reverse proxy's docker network>
 INSIGHT_STORE=file:///var/lib/insight     # or s3://aeris-insight
 AWS_REGION=ap-southeast-1
+# Only if the TLS terminator is on another machine. LAN interface, not a bare
+# port -- and it maps to the upload-only listener, not to 8479.
+# INSIGHT_PUBLISH=192.168.x.y:8479
 ENV
 
 python3 -c "import secrets;print(secrets.token_urlsafe(32))" > ~/aeris-insight/etc/admin.token
@@ -299,14 +311,26 @@ addresses, which is exactly what the allow-list excludes.
 
 ## Deployed, 2026-08-25
 
-Running on the office box behind the Traefik that already owns 443 there, as
-`insight-proxy` and `insight-watch` on its Docker network. `docker compose ...
-up -d` from `~/aeris-insight` is the whole operation; there is no systemd unit
-and nothing was installed on the host.
+**Live at `https://aeris-insight.seta-international.com`.**
 
-Exercised end to end at `https://aeris-insight.seta-international.com` with the
-real hostname and SNI (resolved to the origin, since the DNS record is not
-finished — see below):
+```
+laptop → Cloudflare → office gateway (nginx, holds the LE cert)
+                    → 192.168.90.127:8479  ← the upload-only listener
+                    → insight-proxy
+```
+
+Running on the office box as `insight-proxy` and `insight-watch`. `docker
+compose ... up -d` from `~/aeris-insight` is the whole operation; there is no
+systemd unit and nothing was installed on the host.
+
+Two reverse proxies reach it, and they get different things. The office gateway
+is on another machine, so it is given a host port — mapped to the **upload-only**
+listener, because that gateway forwards every path and the read routes must not
+be internet-reachable behind a token alone. The Traefik already running on the
+box reaches the full listener over the Docker network, which is how the read
+routes are served on the LAN.
+
+Exercised end to end over the public URL, no tunnel and no host-file trickery:
 
 | | |
 |---|---|
@@ -318,32 +342,31 @@ finished — see below):
 | an unknown secret, and a fingerprint used as one | `401` each |
 | 1.2 MiB body | `413` at the edge, before the process buffers it |
 | an engineer's own secret on a read route | `401` |
-| the read route from an address outside the allow-list | `403` |
+| a read route from the internet, **with the admin token** | `404` |
+| the same read route from the LAN | `200` |
+| the read route from an address outside Traefik's allow-list | `403` |
 | uploads and `/healthz` from that same address | still served |
 | the watchdog | ran, found one silent person, and **did not alert** — new to the roster |
 
-The last two rows are the ones worth having run: the source restriction was
-checked by narrowing it to an address this machine does not have and confirming
-the read route closed while uploads stayed open, and the watchdog's restraint on
-a first day is the false positive that would otherwise page the whole team on
-day one.
+The rows worth having run are the read routes and the watchdog. A `404` on a
+listing *while holding the admin token* is the split being enforced by the
+process rather than promised by a config file on someone else's machine — and
+it was a `200` for about ten minutes before this listener existed, which is how
+it got found. The watchdog's restraint on a first day is the false positive that
+would otherwise page the whole team on day one.
 
 ### What the endpoint is still waiting for
 
-Two things, both outside this repo:
+One thing, outside this repo.
 
-**1. The Cloudflare record.** `aeris-insight.seta-international.com` resolves to
-Cloudflare and Cloudflare answers `502`: its origin for that hostname is not the
-box. Sibling hostnames on the same zone work, and their requests arrive at the
-same Traefik, so the fix is to make this record match one of those — a proxied
-`A` record to the office's public address. Nothing on the box changes.
+*(Resolved on the day: the `502` everything returned at first was the office
+gateway's vhost for this hostname proxying to `192.168.90.127:8479` with nothing
+listening there — the container published no host port. Cloudflare was relaying
+the origin's own `502` faithfully. Also resolved: Cloudflare's browser integrity
+check refuses `Python-urllib/*` zone-wide with `403 error code: 1010`, which the
+client's own `User-Agent` now avoids. No Cloudflare rule was needed for either.)*
 
-Cloudflare's browser integrity check also refuses `Python-urllib/*` with
-`403 error code: 1010`, zone-wide, before the request reaches any origin. The
-client now sends its own `User-Agent`, which that check accepts; no Cloudflare
-rule is needed for it.
-
-**2. A service credential for S3.** `INSIGHT_STORE` is `file:///var/lib/insight`
+**A service credential for S3.** `INSIGHT_STORE` is `file:///var/lib/insight`
 today, not `s3://aeris-insight`. That is a one-line change and a restart — and
 deliberately not made yet, because the only credential in the account that can
 write to the bucket is a *human* IAM user that can also delete objects in the

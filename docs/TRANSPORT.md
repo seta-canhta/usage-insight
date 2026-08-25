@@ -535,6 +535,20 @@ on the read router in place of the loopback bind. The rule is the same: uploads
 and `/healthz` public, everything else reachable only from the office network or
 an SSH tunnel.
 
+**When the TLS terminator is on another machine, the split has to move into the
+process.** A gateway elsewhere on the network cannot reach a loopback bind or a
+container network, so it is given a host port — and *its* configuration decides
+which paths it forwards. If it forwards all of them, everything above is
+undone: the read routes are on the internet behind nothing but a token. So the
+endpoint can run a **second listener that serves uploads and `/healthz` and
+nothing else** (`INSIGHT_UPLOAD_PORT`), answering `404` to a read route no
+matter what credential is attached. Publish that one; keep the full listener on
+the private side.
+
+That is worth being blunt about: a route split enforced by a config file on a
+machine you do not administer is not a boundary, it is a convention. This one
+is checked where the bytes are served.
+
 ### Anything in front of the endpoint
 
 The moment a CDN or WAF sits between the laptops and the proxy, some `4xx`

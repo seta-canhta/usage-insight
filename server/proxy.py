@@ -34,6 +34,7 @@ import json
 import logging
 import os
 import sys
+import threading
 from datetime import date, datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any, Dict, List, Optional, Tuple
@@ -210,6 +211,8 @@ class Handler(BaseHTTPRequestHandler):
     allowed: Dict[str, List[str]] = {}
     admin_token: str = ""
     by_person_key: Dict[str, str] = {}
+    #: False on a listener that faces the internet. See ``serve_upload_only``.
+    read_routes: bool = True
 
     # -- plumbing ---------------------------------------------------------
 
@@ -334,6 +337,13 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, {"ok": True, "people": len(self.allowed)})
                 return
 
+            if not self.read_routes:
+                # This listener is the public one. The read routes list every
+                # engineer at once, and "guarded by a token" is not the same
+                # promise as "not reachable". 404 rather than 403: a listener
+                # that does not serve these does not need to admit they exist.
+                raise Rejected(404, "no such route")
+
             self._require_admin()
 
             if parsed.path == "/v1/bundles":
@@ -428,12 +438,13 @@ def _now() -> str:
 # --------------------------------------------------------------------------
 
 def build_handler(store: Any, allowed: Dict[str, List[str]],
-                  admin_token: str) -> type:
+                  admin_token: str, read_routes: bool = True) -> type:
     return type("BoundHandler", (Handler,), {
         "store": store,
         "allowed": allowed,
         "admin_token": admin_token,
         "by_person_key": {identity.person_key(e): e for e in allowed},
+        "read_routes": read_routes,
     })
 
 
@@ -449,6 +460,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "not this")
     parser.add_argument("--port", type=int,
                         default=int(os.environ.get("INSIGHT_PORT", "8479")))
+    parser.add_argument("--upload-port", type=int,
+                        default=int(os.environ.get("INSIGHT_UPLOAD_PORT") or 0),
+                        help="a second listener serving uploads and /healthz "
+                             "only. Publish this one when the reverse proxy is "
+                             "on another machine and forwards every path")
     parser.add_argument("--allowed-file", default=os.environ.get("INSIGHT_ALLOWED_FILE"),
                         help="file of email:fingerprint lines")
     parser.add_argument("--admin-token-file",
@@ -484,12 +500,41 @@ def main(argv: Optional[List[str]] = None) -> int:
     log.info(json.dumps({"event": "listening", "host": args.host,
                          "port": args.port, "store": args.store,
                          "people": len(allowed)}, sort_keys=True))
+
+    # A second listener that serves uploads and nothing else.
+    #
+    # `docs/TRANSPORT.md` splits the routes by exposure, not by token: uploading
+    # has to be reachable from every laptop, and reading exposes the whole team
+    # at once. Where a reverse proxy on this host enforces that split, this is
+    # not needed. Where the gateway is on *another* machine -- so it cannot
+    # reach a container network and must be given a host port -- the split has
+    # to be enforced here instead, because that gateway's config may forward
+    # every path, and then the admin token is the only thing left between the
+    # internet and every engineer's telemetry.
+    #
+    # Publish this port; keep the one above on the private side.
+    upload_server = None
+    if args.upload_port:
+        if args.upload_port == args.port:
+            raise SystemExit(
+                "--upload-port must differ from --port; the whole point is that "
+                "one of them serves the read routes and the other does not")
+        upload_server = ThreadingHTTPServer(
+            (args.host, args.upload_port),
+            build_handler(store, allowed, admin_token, read_routes=False))
+        threading.Thread(target=upload_server.serve_forever, daemon=True).start()
+        log.info(json.dumps({"event": "listening_upload_only",
+                             "host": args.host, "port": args.upload_port},
+                            sort_keys=True))
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         log.info(json.dumps({"event": "stopping"}))
     finally:
         server.server_close()
+        if upload_server is not None:
+            upload_server.shutdown()
+            upload_server.server_close()
     return 0
 
 
