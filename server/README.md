@@ -155,6 +155,29 @@ check-then-write on **every** write and logs that it did — racy, but the key i
 the content digest, so the worst case is a duplicate object rather than wrong
 data.
 
+### Verified against the real bucket, 2026-08-25
+
+Run end to end against `aeris-insight` in `ap-southeast-1` with a real
+credential, not a stub:
+
+| | |
+|---|---|
+| `ListBucket`, `PutObject`, `GetObject` | pass |
+| **write-once (`IfNoneMatch`)** | **refused conditionally** — real S3 honours it |
+| byte-for-byte round trip | pass |
+| public access block | all four settings on |
+| two engineers ship → `201`, resend → `409` | pass |
+| `pull.py` → `bundle.py` | 6 events, 0 rejected, 0 email addresses in the event path |
+
+The conditional write was the one thing no stub could settle, and the one that
+loses data silently if it is not honoured. It is honoured.
+
+⚠️ **One advisory:** the credential used for that run can delete objects. That
+was a human IAM user, which is expected — but **the production instance role
+should not have `s3:DeleteObject`**, per the policy above. `verify_s3.py`
+reports this on every run, so it will say so again if the deployed role is
+over-scoped.
+
 ### Before trusting it
 
 ```bash

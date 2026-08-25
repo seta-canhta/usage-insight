@@ -392,6 +392,12 @@ low thousands of events, so bundles run from a few KB to a couple of MB.
 Fourteen engineers for a year is comfortably under 2 GB — a rounding error on
 S3, and well inside a single-`PUT` object.
 
+**Verified 2026-08-25** against `aeris-insight` in `ap-southeast-1`: real S3
+honours `IfNoneMatch: "*"`, so the `409`-on-duplicate this document promises is
+enforced by the storage layer rather than by code that can rot. Two clients
+shipped, a resend was refused, and `pull.py` fetched both back through
+`bundle.py` with nothing rejected. See `server/README.md`.
+
 **Retention is an S3 lifecycle rule**, server-side, and the client is never
 given `DeleteObject`. `insight purge` stays what it always was: a *local*
 command. A bundle already handed over has already been handed over, and the
