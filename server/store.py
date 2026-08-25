@@ -21,9 +21,7 @@ delete; retention is a lifecycle rule and deletion is not a code path.
 
 from __future__ import annotations
 
-import errno
 import os
-import shutil
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse
 
@@ -143,6 +141,11 @@ class S3Store:
             args["Metadata"] = metadata
         if self._conditional:
             args["IfNoneMatch"] = "*"
+        elif self.exists(key):
+            # Check-then-write, on every write and not only on the one that
+            # discovered the store lacks conditional writes. Skipping it here
+            # would not make write-once racy, it would switch it off.
+            raise Exists(key)
 
         try:
             self.client.put_object(**args)
@@ -244,11 +247,3 @@ def _stamp(value: Any) -> str:
     except AttributeError:
         return str(value)
 
-
-def disk_free_bytes(path: str) -> int:
-    try:
-        return shutil.disk_usage(path).free
-    except OSError as exc:
-        if exc.errno == errno.ENOENT:
-            return 0
-        raise

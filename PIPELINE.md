@@ -79,8 +79,21 @@ Three non-negotiables carried by every component (CONTRACT §1):
 | `hooks/` | `prepare-commit-msg` / `post-commit` — append `AI-Run-Id` trailers, emit `scm.commit`. Never touches the commit subject. |
 | `collector/` | Validates, deduplicates and lands events into `raw.*`. Rejects unknown `event_type` and forbidden attribute names. |
 | `pollers/` | Bitbucket, CI and Jira pull jobs for the outcomes a client never sees — review, merge, decline, revert, pipeline, transition. |
+| `cli/` | `./insight` — the local client. Reads the three local-only signals, packs a bundle, uploads it hourly. Stdlib only; see `cli/README.md`. |
+| `server/` | The collection endpoint. One `PUT` in front of S3, so no laptop holds a bucket credential. See `docs/TRANSPORT.md`. |
+| `importers/` | `pull.py` fetches a week, `bundle.py` verifies and merges it, `watch.py` says something when a machine stops reporting. |
 | `sql/` | BigQuery DDL and the `raw → core → marts` transforms, plus the `dq.dq_findings` checks. |
-| `tests/` | Contract and transform tests. |
+
+Tests live beside the code they cover, one `tests/` per package:
+
+```bash
+for s in pollers report collector cli importers server; do
+  python3 -m unittest discover -s $s/tests
+done
+```
+
+The commit hook is `cli/hooks/prepare-commit-msg`, installed per repository by
+`./insight install-hook`.
 
 The emitter CLI itself is `emit.py` at the root of this directory. The subset the
 instrumented agents use:
@@ -129,6 +142,7 @@ anything earlier to pay off.
 | 3 | **`hooks/`** — `prepare-commit-msg` trailers | The deterministic SCM anchor. Does **not** touch the commit subject, so the existing `[AUTH_BY_COPILOT] [{TICKET}]` convention and all 43 marked commits stay valid. |
 | 4 | **Agent instrumentation** (already applied to the three agents above) | Supplies the jira key, PR id and artifact identity that OTel cannot see. |
 | 5 | **`collector/` + `sql/` raw tables** | First point at which events are durable and queryable. |
+| 5a | **`server/` + `./insight setup`** | The three local-only signals reach the pipeline. Until this exists the report measures engineering output and calls it AI effectiveness — `FINDINGS.md §2`. See `docs/TRANSPORT.md`. |
 | 6 | **`pollers/`** — Bitbucket first | Acceptance is an *outcome*; no client-side event can observe a merge, a decline or a revert. |
 | 7 | **`sql/` core + marts**, then dashboards | Only meaningful once ~6–8 weeks of events exist (§9.1). |
 | 8 | **Individual capability metrics (§7.6)** | **Last, and only after the §11.5 governance statement is signed off.** The constraint is organisational, not technical. |

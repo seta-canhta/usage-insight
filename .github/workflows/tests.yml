@@ -31,7 +31,14 @@ jobs:
           python3 - <<'PY'
           import ast, pathlib, sys
           stdlib = set(sys.stdlib_module_names)
-          local = {"common", "main", "insight"}
+          # Sibling modules, discovered rather than listed. A hardcoded list
+          # silently rots into a red build every time a module is added -- which
+          # is what happened, and why this check went unread for a while. The
+          # question it is asking is "does cli/ reach outside the standard
+          # library", and a module sitting in cli/ is never that.
+          local = {p.stem for p in pathlib.Path("cli").rglob("*.py")}
+          local |= {p.stem for p in pathlib.Path("pollers").rglob("*.py")}
+          local |= {p.stem for p in pathlib.Path("collector").rglob("*.py")}
           bad = []
           for path in sorted(pathlib.Path("cli").rglob("*.py")):
               tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
@@ -46,11 +53,43 @@ jobs:
           if bad:
               print("\n".join(sorted(set(bad))))
               raise SystemExit("cli/ must stay standard library only")
-          print("cli/ is standard library only: confirmed")
+          print(f"cli/ is standard library only: confirmed ({len(local)} local modules)")
+          PY
+
+      # The endpoint is allowed exactly one wheel, and only on the s3:// path.
+      # Anything else creeping in turns a service that runs anywhere into one
+      # that needs a dependency resolver on the box it is deployed to.
+      - name: The server depends on nothing but boto3
+        run: |
+          python3 - <<'PY'
+          import ast, pathlib, sys
+          stdlib = set(sys.stdlib_module_names)
+          allowed = {"boto3", "botocore"}
+          local = {p.stem for p in pathlib.Path("server").rglob("*.py")}
+          local |= {p.stem for p in pathlib.Path("cli").rglob("*.py")}
+          bad = []
+          for path in sorted(pathlib.Path("server").rglob("*.py")):
+              tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+              for node in ast.walk(tree):
+                  names = []
+                  if isinstance(node, ast.Import):
+                      names = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                      names = [node.module.split(".")[0]]
+                  bad += [f"{path}: {n}" for n in names
+                          if n not in stdlib | allowed | local]
+          if bad:
+              print("\n".join(sorted(set(bad))))
+              raise SystemExit("server/ may depend on boto3 and nothing else")
+          print("server/ depends on boto3 and nothing else: confirmed")
           PY
 
       - name: Optional extras for the central pipeline
-        run: python3 -m pip install --quiet openpyxl
+        # openpyxl writes the workbooks; boto3 is the endpoint's S3 backend.
+        # Both degrade to a stdlib path when absent, which is why the suite is
+        # meaningful either way -- but the S3 tests only run when botocore is
+        # importable, and skipped tests prove nothing.
+        run: python3 -m pip install --quiet openpyxl boto3
 
       # Suites run one at a time. Every tests/ directory would otherwise be
       # the same package name, and the second one to load shadows the first.
@@ -70,10 +109,28 @@ jobs:
               raise SystemExit(1)
           PY
 
+      # The S3 backend cannot be reached by the end-to-end suite, so its tests
+      # skip themselves when botocore is missing. A skip that nobody notices is
+      # the production path going untested, which is how it shipped once.
+      - name: The S3 backend is actually exercised, not skipped
+        run: |
+          python3 - <<'PY'
+          import subprocess, sys
+          out = subprocess.run(
+              [sys.executable, "-m", "unittest", "-v",
+               "server.tests.test_store"],
+              capture_output=True, text=True)
+          text = out.stdout + out.stderr
+          if "skipped" in text.lower():
+              print(text)
+              raise SystemExit("S3 tests skipped -- botocore is not installed")
+          print("S3 backend tests ran")
+          PY
+
       - name: Tests
         run: |
           set -e
-          for suite in pollers report collector cli importers; do
+          for suite in pollers report collector cli importers server; do
             echo "--- $suite"
             python3 -m unittest discover -s "$suite/tests"
           done
