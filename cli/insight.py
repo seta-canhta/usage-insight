@@ -545,6 +545,23 @@ def cmd_setup(args: argparse.Namespace) -> int:
                 steps.append({"step": "hook", "ok": False, "repo": repo,
                               "detail": str(exc)})
 
+        # A machine with no repository registered collects nothing from git and
+        # uploads a bundle a day saying so. That bundle is well formed: it
+        # declares its window and reports zero events, which is exactly what a
+        # genuinely quiet day looks like. Nothing downstream can tell the two
+        # apart, so a setup that went wrong here reads as a person who did no
+        # work -- a wrong answer, not a missing one, and the one failure mode
+        # this whole design exists to avoid.
+        #
+        # Said here because here is the only place anyone is looking.
+        config = load_config() or {}
+        if not config.get("repos"):
+            steps.append({
+                "step": "repos", "ok": False,
+                "detail": "none registered -- nothing will be collected from "
+                          "git. Run `./insight setup --repo <path>` for each "
+                          "repository you work in"})
+
     print()
     for step in steps:
         mark = "  ok  " if step.get("ok") else " FAIL "
@@ -558,6 +575,14 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("Restart VS Code (quit fully, not Reload Window) so the settings "
               "take effect.")
         final = load_config() or {}
+        if not final.get("repos"):
+            # Ahead of the reassuring line below, which would otherwise be the
+            # last thing read and is not true yet.
+            print("No repository is registered, so there is nothing to collect "
+                  "from git yet.")
+            print("Run `./insight setup --repo <path>` for each repository you "
+                  "work in.")
+            print()
         if not args.no_schedule and any(
                 s["step"] == "schedule" and s["ok"] for s in steps):
             print("Collection runs hourly from now on. Nothing else to remember.")

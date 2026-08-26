@@ -218,6 +218,24 @@ class TestSetupAdoptsAnIssuedToken(ClientTestCase):
         _, out = self.setup_cli("--email", "ngoc@aeris.net")
         self.assertIn("Send this line", out)
 
+    def test_setup_says_when_no_repository_is_registered(self):
+        # The failure this design exists to avoid: a machine that collects
+        # nothing still uploads a well-formed bundle declaring zero events,
+        # which is indistinguishable from a genuinely quiet day. Nothing
+        # downstream can tell them apart, so it has to be said here.
+        self.init()
+        _, out = self.setup_cli("--token", "issued")
+        self.assertIn("No repository is registered", out)
+        self.assertIn("--repo", out)
+
+    def test_setup_is_quiet_about_repos_once_one_is_registered(self):
+        self.init()
+        config = self.insight.load_config()
+        config["repos"] = ["/somewhere/a-repo"]
+        self.insight.write_json(self.insight.CONFIG_PATH, config)
+        _, out = self.setup_cli("--token", "issued")
+        self.assertNotIn("No repository is registered", out)
+
     def test_the_endpoint_defaults_to_the_real_one(self):
         self.init()
         self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")

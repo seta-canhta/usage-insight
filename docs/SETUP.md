@@ -23,9 +23,14 @@ collected is disturbed, and the machine keeps its identity and its salt.
 
 ```bash
 git pull
-./insight setup --token <the secret you were sent>
+./insight setup --token <the secret you were sent> --repo ~/work/<each repo>
 ./insight ship --all        # send everything collected so far
 ```
+
+**`--repo` matters.** A machine with none registered collects nothing from git
+and still uploads a bundle a day declaring zero events — which is exactly what
+a genuinely quiet day looks like, and nothing downstream can tell them apart.
+`setup` says so if you forget, and `./insight status` lists what is registered.
 
 No address needed alongside it: the server resolves the secret to a person
 itself — that is what the whitelist *is* — and `ship` has never sent an email

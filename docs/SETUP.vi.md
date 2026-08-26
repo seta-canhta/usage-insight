@@ -19,9 +19,14 @@ nguyên, máy giữ nguyên định danh và salt.
 
 ```bash
 git pull
-./insight setup --token <secret được gửi>
+./insight setup --token <secret được gửi> --repo ~/work/<từng repo>
 ./insight ship --all        # gửi hết những gì đã thu thập
 ```
+
+**`--repo` quan trọng.** Máy không đăng ký repo nào thì không thu được gì từ
+git, nhưng vẫn upload mỗi ngày một bundle báo 0 sự kiện — trông y hệt một ngày
+thật sự không làm gì, và phía sau không phân biệt được. `setup` sẽ nhắc nếu
+quên, và `./insight status` liệt kê repo đã đăng ký.
 
 Không cần kèm email: server tự tra secret ra người — đó chính là ý nghĩa của
 whitelist — và `ship` chưa bao giờ gửi địa chỉ email trong bất kỳ header nào.
