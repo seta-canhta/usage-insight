@@ -12,17 +12,15 @@
 # accident -- which it was, the first time.
 #
 # ---------------------------------------------------------------------------
-# It installs, and then it stops.
+# It installs, and then it runs `setup` -- one command, not two.
 #
-# It does not run `setup`, does not pass `--yes`, and never touches
-# ~/.seta-insight/. Piping into `sh` means there is no terminal, so running
-# setup from here would have to pass `--yes` -- and that records consent nobody
-# was shown, which is the one thing every design decision in this codebase
-# refuses. The whitelist line `setup` prints at the end is also text a person
-# has to read and act on, and text at the tail of a piped installer is text
-# people scroll past.
+# It never passes `--yes`. Piping into `sh` puts the script on stdin, but a
+# terminal is still attached to the process, so `setup` reads its one question
+# from /dev/tty (cli/insight.py, `_tty`). Consent is still typed by a person.
 #
-# So the last thing this prints is: run `insight setup`.
+# With no terminal at all -- CI, a container, a provisioning script -- `setup`
+# is skipped and the last line printed says to run it. Nothing is ever set up
+# on somebody's behalf.
 # ---------------------------------------------------------------------------
 # POSIX sh. On Ubuntu `sh` is dash: no `[[`, no arrays, no `pipefail`, no
 # `local` beyond one word. Checked with `shellcheck -s sh` in the release job.
@@ -414,17 +412,30 @@ INSIGHT_PYTHON, or clone the repository and run ./insight instead."
     repoint_schedule
     report_untouched_config
     path_advice
+    run_setup
+}
+
+# `setup` is where a person is asked for their work email, and where the
+# whitelist line to send is printed. Running it here is what makes the install
+# one command. It is skipped, with instructions, when there is no terminal to
+# ask on -- and when this machine is already set up, where `setup` would have
+# nothing to ask.
+run_setup() {
+    if [ -f "$HOME/.seta-insight/config.json" ]; then
+        say ""
+        say "Already set up; nothing to answer. \`insight status\` confirms."
+        return 0
+    fi
+    if [ ! -r /dev/tty ] || [ ! -w /dev/tty ]; then
+        say ""
+        say "No terminal here, so nothing was set up. When you have one:"
+        say ""
+        say "    insight setup"
+        say ""
+        return 0
+    fi
     say ""
-    say "Now run:"
-    say ""
-    say "    insight setup"
-    say ""
-    # Said here and not sold: `setup` is where the question is actually asked,
-    # with a default and a sentence about what it means. This is the one line
-    # that stops it being a surprise if the answer there is yes.
-    say "(setup will ask whether this machine may install its own updates."
-    say " Either answer is fine; \`insight update --off\` changes it later.)"
-    say ""
+    "$BIN_DIR/insight" setup || true
 }
 
 # ---------------------------------------------------------------------------

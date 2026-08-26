@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -1384,3 +1385,92 @@ class TestMultipleRepos(TestScan):
         self.run_cli("install-hook", "--repo", self.repo)
         self.run_cli("init", "--yes", "--force")
         self.assertIn(self.repo, self.insight.known_repos())
+
+
+class TestOneQuestion(ClientTestCase):
+    """`setup` asks for the email and nothing else, and can ask over /dev/tty."""
+
+    def _answers(self, *replies):
+        """Stand in for the terminal, recording every prompt put to it."""
+        asked = []
+        replies = list(replies)
+
+        class _Reader(object):
+            def readline(self_inner):
+                return (replies.pop(0) if replies else "") + "\n"
+
+        class _Writer(object):
+            def write(self_inner, text):
+                asked.append(text)
+
+            def flush(self_inner):
+                pass
+
+        self.insight._TTY = (_Reader(), _Writer())
+        self.addCleanup(setattr, self.insight, "_TTY", None)
+        return asked
+
+    def test_init_asks_only_for_the_email(self):
+        asked = self._answers("ngoc@seta-international.vn")
+        code, _ = self.run_cli("init")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(asked), 1, asked)
+        self.assertIn("email", asked[0].lower())
+        self.assertEqual(self.insight.load_config()["email"],
+                         "ngoc@seta-international.vn")
+
+    def test_an_empty_answer_declines_and_writes_nothing(self):
+        self._answers("")
+        code, out = self.run_cli("init")
+        self.assertEqual(code, 1)
+        self.assertIsNone(self.insight.load_config())
+        self.assertIn("no data will be collected", out)
+
+    def test_a_typo_costs_a_retry_not_the_run(self):
+        asked = self._answers("not-an-address", "ngoc@seta-international.vn")
+        code, _ = self.run_cli("init")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(asked), 2)
+
+    def test_prompting_falls_back_to_the_terminal_when_stdin_is_a_pipe(self):
+        # What makes `curl ... | sh` able to run setup itself: stdin holds the
+        # script, and the person is still on /dev/tty.
+        self.insight._TTY = None
+        opened = []
+
+        def fake_open(path, mode, *a, **kw):
+            opened.append((path, mode))
+            return io.StringIO("ngoc@seta-international.vn\n") \
+                if "r" in mode else io.StringIO()
+
+        with mock.patch.object(self.insight.sys.stdin, "isatty",
+                               return_value=False), \
+                mock.patch("builtins.open", side_effect=fake_open):
+            stream = self.insight._tty()
+        self.addCleanup(setattr, self.insight, "_TTY", None)
+        self.assertIsNotNone(stream)
+        self.assertEqual([p for p, _ in opened], ["/dev/tty", "/dev/tty"])
+
+    def test_no_terminal_at_all_is_refused_not_guessed(self):
+        self.insight._TTY = None
+        with mock.patch.object(self.insight.sys.stdin, "isatty",
+                               return_value=False), \
+                mock.patch("builtins.open", side_effect=OSError("no tty")):
+            with self.assertRaises(self.insight.NoTerminal):
+                self.insight.ask("Your work email: ")
+        self.addCleanup(setattr, self.insight, "_TTY", None)
+
+
+class TestHelpCommand(ClientTestCase):
+
+    def test_help_says_what_is_collected_and_what_is_not(self):
+        code, out = self.run_cli("help")
+        self.assertEqual(code, 0)
+        for phrase in ("WHAT IT READS", "WHAT IT NEVER READS", "insight purge",
+                       "not a", "performance record"):
+            self.assertIn(phrase, out)
+
+    def test_a_bare_invocation_prints_the_guide_rather_than_an_error(self):
+        code, out = self.run_cli()
+        self.assertEqual(code, 0)
+        self.assertIn("WHAT IT READS", out)

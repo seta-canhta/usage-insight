@@ -37,9 +37,9 @@ What it must NOT be used for
 how much rtk believes it saved. Two separate cautions apply and they are not
 the same:
 
-1. *Self-report.* `docs/WHAT-WE-MEASURE.md` forbids counting from self-reported
-   data -- the same rule that keeps the daily-sync spreadsheet's "AI Usage"
-   column out of the adoption figure. A number a tool publishes about its own
+1. *Self-report.* Nothing is ever counted from self-reported data -- the same
+   rule that keeps the daily-sync spreadsheet's "AI Usage" column out of the
+   adoption figure. A number a tool publishes about its own
    value is exactly that.
 2. *Basis unknown.* "Saved" is a difference against a baseline, and nothing on
    these machines says what the baseline is. If it is `tokens(raw output) -

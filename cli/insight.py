@@ -9,7 +9,7 @@ at commit time. This reads those and packs them into one bundle to hand over.
 **There is no daemon.** Copilot CLI writes its own session journal whether or
 not anything is watching -- no exporter, no setting, nothing listening -- and
 this reads it when asked. ``pack`` is a batch read of local files, run once a
-week. See ``docs/ARCHITECTURE.md``.
+week.
 
 Standard library only, Python 3.9+. No virtualenv, nothing to install, nothing
 to resolve on someone else's machine.
@@ -294,12 +294,10 @@ def require_config() -> Dict[str, Any]:
 class NoTerminal(SystemExit):
     """Raised when a prompt is reached with nothing to read from.
 
-    ``input()`` on a closed stdin raises ``EOFError``, which nothing used to
-    catch, so piping anything into `setup` produced a traceback. That was
-    unreachable while flags were the normal path; with a wizard as the normal
-    path it is one ``insight setup < /dev/null`` away -- and the installer
-    documentation now tells people to run `setup` right after a `curl | sh`,
-    which is exactly the moment someone tries to chain the two.
+    Not the same thing as a non-tty stdin. `curl ... | sh` leaves stdin holding
+    the script while a terminal is still attached, so the questions are asked on
+    /dev/tty -- see ``_tty``. This is for the case where there is genuinely
+    nobody there: cron, CI, a container.
     """
 
     def __init__(self) -> None:
@@ -309,15 +307,50 @@ class NoTerminal(SystemExit):
             "`insight setup --email you@seta-international.vn --yes`.")
 
 
+_TTY = None  # type: Optional[Any]
+
+
+def _tty():
+    """The terminal, whatever stdin happens to be. ``None`` if there is none.
+
+    The installer pipes itself into `sh` and then runs `setup`, which inherits
+    that pipe as stdin. A terminal is still attached to the process; it is just
+    not on fd 0. Reaching it through /dev/tty is what lets the install be one
+    command instead of two without ever passing --yes on someone's behalf.
+
+    Two handles rather than one `r+`: a tty is not seekable, and Python's
+    buffered read-write mode demands that it be, so `open("/dev/tty", "r+")`
+    raises `io.UnsupportedOperation` on macOS and takes the terminal with it.
+    """
+    global _TTY
+    if _TTY is not None:
+        return _TTY or None
+    if sys.stdin.isatty():
+        _TTY = (sys.stdin, sys.stdout)
+        return _TTY
+    try:
+        _TTY = (open("/dev/tty", "r"), open("/dev/tty", "w"))
+    except (OSError, IOError, ValueError):
+        _TTY = False
+        return None
+    return _TTY
+
+
 def ask(prompt: str, default: str = "") -> str:
     """One wizard question. Refuses to guess when there is nobody to ask."""
-    if not sys.stdin.isatty():
+    stream = _tty()
+    if stream is None:
         raise NoTerminal()
+    reader, writer = stream
     try:
-        answer = input(prompt).strip()
+        writer.write(prompt)
+        writer.flush()
+        answer = reader.readline()
+        if answer == "":
+            raise EOFError
     except EOFError:
         raise NoTerminal()
-    return answer or default
+    return answer.strip() or default
 
 
 def ask_yes(prompt: str, default: bool = False) -> bool:
@@ -325,17 +358,22 @@ def ask_yes(prompt: str, default: bool = False) -> bool:
     return answer in ("y", "yes")
 
 
-def ask_email() -> str:
+def ask_email(allow_cancel: bool = False) -> str:
     """Ask until the address parses.
 
     A typo costs a retry, not a restart. `normalise_email` raising
     ``SystemExit`` mid-wizard would discard every answer already given.
+
+    With ``allow_cancel`` an empty line means no, which is what makes this the
+    only question `setup` asks: the address is both the answer and the consent.
     """
     import identity
 
     while True:
         raw = ask("Your work email: ")
         if not raw:
+            if allow_cancel:
+                return ""
             print("  An address is needed -- `ship` uploads under it.")
             continue
         try:
@@ -370,9 +408,15 @@ def cmd_init(args: argparse.Namespace) -> int:
     else:
         transport = TRANSPORT_MANUAL.format(home=HOME)
     print(CONSENT_TEXT.format(home=HOME, transport=transport))
-    if not args.yes:
-        answer = input("Collect telemetry from this machine? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
+    if not args.yes and not email:
+        # One question, and it is this one. Typing the address is the consent:
+        # the text above says what is collected, and there is nothing to upload
+        # under without it. A separate y/N in front of it asked the same person
+        # the same thing twice.
+        print("Enter your work email to start collecting, or press Enter to "
+              "stop here.")
+        email = ask_email(allow_cancel=True)
+        if not email:
             print("nothing was written; no data will be collected")
             return 1
 
@@ -590,18 +634,17 @@ def check_allowed(event: Dict[str, Any]) -> List[str]:
 # --------------------------------------------------------------------------
 
 def cmd_setup(args: argparse.Namespace) -> int:
-    """Set this machine up, by asking.
+    """Set this machine up. Asks for one thing: the work email.
 
-    It used to be one command carrying flags: ``--email``, ``--token``, and a
-    repeated ``--repo``. Two of those are gone and the third is optional, so
-    what is left is a short conversation -- which is also what makes it
-    survivable at the end of a ``curl | sh``: the installer puts the tool on
-    the machine and stops, and this is the step where a person is present.
+    Everything else is on by default -- automatic collection, self-update, and
+    the commit hook -- because every other answer either has one sensible value
+    or silently empties a metric when refused. `--no-schedule`,
+    `--no-auto-update` and `--no-commit-hook` opt out, and each is reversible
+    afterwards.
 
-    That order matters and is not incidental. Consent obtained by a flag on a
-    pipe is consent nobody was shown, and the whitelist line printed at the end
-    is the one thing here somebody has to actually read and act on. Text at the
-    tail of a piped installer is text people scroll past.
+    The consent text is printed above the question, so typing the address is
+    the consent. Prompts go to /dev/tty rather than stdin, which is what lets
+    the installer run this itself at the end of a `curl | sh`.
 
     The flags still work (``--email``, ``--yes``) so this is scriptable and so
     the test suite does not need a terminal.
@@ -613,7 +656,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     if wizard:
         print()
-        print("This sets up collection on this machine. Four questions.")
+        print("This sets up collection on this machine. One question.")
         print()
 
     # Beside the repo is only a meaningful default when there is a repo. From
@@ -668,9 +711,9 @@ def cmd_setup(args: argparse.Namespace) -> int:
     if not args.dry_run:
         email = args.email
         if load_config() is None:
-            # `init` prints the consent text and asks; the wizard's own email
-            # question comes after it, because agreeing to collection is the
-            # decision and an address is only bookkeeping once it is made.
+            # `init` prints the consent text and asks for the address. That is
+            # the only question in the whole of setup; everything below it is
+            # a default with a flag to turn it off.
             if cmd_init(argparse.Namespace(
                     yes=args.yes, force=False, endpoint=args.endpoint,
                     no_endpoint=args.no_endpoint, email=email,
@@ -681,6 +724,8 @@ def cmd_setup(args: argparse.Namespace) -> int:
                       "detail": "recorded" if load_config() else "declined"})
 
         if wizard and not (load_config() or {}).get("email"):
+            # Reached only when a config already existed without an address --
+            # a machine set up before the endpoint did.
             print()
             email = ask_email()
 
@@ -716,11 +761,6 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # busy ones, and `pull` cannot tell those apart from the outside.
         # `--no-schedule` opts out; `schedule --off` reverses it later.
         hourly = not args.no_schedule
-        if wizard and config is not None:
-            print()
-            hourly = ask_yes(
-                "Collect and upload once an hour, automatically? [Y/n] ",
-                default=True)
         # Asked, not assumed, and only where hourly was taken -- the check
         # lives inside `auto`, so on a machine that runs things by hand there
         # is nothing to switch on. Default yes, on the same reasoning that
@@ -729,17 +769,7 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # would want if they thought about it. It is still a question, and the
         # consent text records the answer.
         if hourly and config is not None:
-            import update as update_mod
             auto_update = not args.no_auto_update
-            if wizard and update_mod.installation(_archive()):
-                print()
-                print("Install its own updates when a new version is released?")
-                print("Checked once a day, verified against a checksum from")
-                print("{}, and a major version always waits".format(
-                    config.get("endpoint") or "the endpoint"))
-                print("for you. `insight update --off` reverses it.")
-                auto_update = ask_yes("Keep this tool up to date? [Y/n] ",
-                                      default=True)
             fresh = load_config() or {}
             fresh["auto_update"] = bool(auto_update)
             write_json(CONFIG_PATH, fresh)
@@ -825,21 +855,26 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # which is in turn the only thing admitted to cost-per-output. Without
         # it every link stays heuristic and that metric stays empty. So it is
         # offered, once, with what it buys said plainly.
-        if wizard and discovered:
-            print()
-            print("Copilot has worked in {} repositor{} on this machine."
-                  .format(len(discovered), "y" if len(discovered) == 1 else "ies"))
-            print("A commit hook can stamp which agent run produced each commit.")
-            print("Without it, cost per accepted output cannot be computed.")
-            if ask_yes("Install it? [y/N] "):
-                for repo in discovered:
-                    try:
-                        cmd_install_hook(argparse.Namespace(
-                            repo=repo, force=False))
-                        steps.append({"step": "hook", "ok": True, "repo": repo})
-                    except SystemExit as exc:
-                        steps.append({"step": "hook", "ok": False,
-                                      "repo": repo, "detail": str(exc)})
+        if discovered and not args.no_commit_hook:
+            # Installed, not offered. It writes an `AI-Run-Id` trailer at commit
+            # time, and that trailer is the only evidence that earns
+            # `link.method = 'explicit'` (CONTRACT.md 2.4), which is the only
+            # thing admitted to cost-per-output. A question whose no answer
+            # silently empties a metric is a question worth not asking.
+            # `--no-commit-hook` opts out; the hook is a file in .git/hooks and
+            # deleting it reverses this.
+            installed, failed = 0, []
+            for repo in discovered:
+                try:
+                    cmd_install_hook(argparse.Namespace(repo=repo, force=False))
+                    installed += 1
+                except SystemExit as exc:
+                    failed.append("{}: {}".format(os.path.basename(repo), exc))
+            steps.append({
+                "step": "trailer", "ok": True,
+                "detail": "commit hook in {} of {} repositories{}".format(
+                    installed, len(discovered),
+                    "" if not failed else " ({})".format("; ".join(failed)))})
 
     print()
     for step in steps:
@@ -1957,8 +1992,7 @@ def cmd_schedule(args: argparse.Namespace) -> int:
         print()
         print("`./insight schedule --off` reverses this at any time.")
         print()
-        answer = input("Collect and upload hourly from this machine? [y/N] ").strip().lower()
-        if answer not in ("y", "yes"):
+        if not ask_yes("Collect and upload hourly from this machine? [y/N] "):
             print("nothing was scheduled")
             return 1
 
@@ -2154,10 +2188,9 @@ def cmd_status(args: argparse.Namespace) -> int:
 
 def cmd_purge(args: argparse.Namespace) -> int:
     if not args.yes:
-        answer = input(
-            "Delete every event, bundle and the config in {}? [y/N] ".format(HOME)
-        ).strip().lower()
-        if answer not in ("y", "yes"):
+        if not ask_yes(
+                "Delete every event, bundle and the config in {}? [y/N] ".format(
+                    HOME)):
             print("nothing deleted")
             return 1
     import ship as ship_mod
@@ -2196,6 +2229,82 @@ def cmd_purge(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
+# help -- the guide, in the tool
+# --------------------------------------------------------------------------
+
+GUIDE = """\
+insight -- what your AI assistance actually produces, measured from the
+records Copilot already keeps on this machine.
+
+SETUP
+
+    curl -fsSL {endpoint}/install | sh
+
+    One command. It installs, then asks for your work email, then prints one
+    line to send to whoever runs the pipeline. That line is a fingerprint, not
+    a secret.
+
+WHAT IT READS
+
+    ~/.copilot/session-state/     premium requests, token counts, model ids,
+                                  tool names and their verdicts
+    VS Code chatSessions/         per-call latency, tool names, tokens
+    rtk history, if installed     per-command token counts
+    git, in repos Copilot used    commit hashes, line counts, AI trailers
+
+WHAT IT NEVER READS
+
+    Prompts, replies, source code, diffs, file contents, secrets. Counts,
+    hashes and fixed categories only. Paths are repo-relative, so your
+    username never leaves. Your email travels in one header and is stored as
+    a salted hash.
+
+WHEN IT RUNS
+
+    When Copilot runs. A hook at ~/.copilot/hooks/seta-insight.json fires
+    before each tool call, returns in milliseconds, and collects at most once
+    every 10 minutes. Uploads are batched at most once an hour. No daemon, no
+    open port.
+
+SEEING WHAT LEAVES
+
+    insight status                what is buffered, what has been sent
+    insight pack                  seal what is buffered
+    insight ship --dry-run        what would be sent, without sending
+    insight ship                  send it
+
+CONTROL
+
+    insight whoami                your allow-list line, again
+    insight rotate-token          replace the upload secret
+    insight schedule --off        stop collecting automatically
+    insight purge --yes           delete every event and bundle held here
+    insight purge --yes --all     that, and forget this machine entirely
+
+    Everything here is local. A bundle already uploaded is already uploaded;
+    removing one is a request to whoever runs the pipeline.
+
+These figures describe how a way of working is going. They are not a
+performance record and do not support assessing anyone individually.
+
+`insight <command> --help` for any command. Full list: `insight --help`.
+"""
+
+
+def cmd_help(args: argparse.Namespace) -> int:
+    """The guide, in the tool.
+
+    `--help` lists commands; it does not say what the thing does or what it
+    keeps off the machine. Somebody deciding whether to run this should not
+    have to find a web page to answer that.
+    """
+    config = load_config() or {}
+    print(GUIDE.format(
+        endpoint=config.get("endpoint") or DEFAULT_ENDPOINT))
+    return 0
+
+
+# --------------------------------------------------------------------------
 
 class _VersionAction(argparse.Action):
     def __init__(self, option_strings, dest, **kwargs):
@@ -2217,7 +2326,10 @@ def build_parser() -> argparse.ArgumentParser:
     # to the one call that asks.
     parser.add_argument("--version", action=_VersionAction,
                         help="version, schema, interpreter and this file's digest")
-    sub = parser.add_subparsers(dest="command", required=True)
+    sub = parser.add_subparsers(dest="command")
+
+    p = sub.add_parser("help", help="what this collects, and how to control it")
+    p.set_defaults(func=cmd_help)
 
     p = sub.add_parser("init", help="record consent and create the local store")
     p.add_argument("--yes", action="store_true", help="skip the consent prompt")
@@ -2248,6 +2360,8 @@ def build_parser() -> argparse.ArgumentParser:
                    help="do not collect hourly; run the commands by hand")
     p.add_argument("--no-auto-update", action="store_true",
                    help="do not install new versions automatically")
+    p.add_argument("--no-commit-hook", action="store_true",
+                   help="do not write AI-Run-Id trailers into commits")
     p.add_argument("--yes", action="store_true",
                    help="skip the questions and accept the defaults")
     p.add_argument("--force", action="store_true",
@@ -2375,7 +2489,12 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[List[str]] = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        # A bare `insight` used to be an argparse error on stderr with exit 2.
+        # The person who typed it is asking what this is; that is the guide.
+        return cmd_help(args)
     return args.func(args)
 
 

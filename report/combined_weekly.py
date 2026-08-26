@@ -403,7 +403,7 @@ def section_coverage(index: int, coverage_path: Optional[str]) -> List[str]:
             "Bitbucket and AIO, which are read directly and are complete for "
             "the window.",
             "",
-            "This is a stated absence, not a zero. See `docs/WHAT-WE-MEASURE.md`.",
+            "This is a stated absence, not a zero.",
             "",
         ]
         return out

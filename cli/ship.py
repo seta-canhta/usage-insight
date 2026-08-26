@@ -3,7 +3,7 @@
 
 ``pack`` seals a bundle; this carries it. Those stay two commands, and the
 separation is load-bearing rather than tidy: the consent model in
-``docs/ARCHITECTURE.md`` rests on the engineer being able to *read exactly what
+The consent model rests on the engineer being able to *read exactly what
 was recorded before deciding to hand it over*. Uploading automatically at pack
 time would delete that property without ever mentioning it.
 

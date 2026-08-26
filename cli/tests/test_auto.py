@@ -183,7 +183,7 @@ class TestQuietHours(AutoTestCase):
         # An empty bundle with a declared day window is a *measured* zero: the
         # machine was on and did no AI work. That is the distinction the whole
         # report depends on -- a day with no bundle at all is missing data, and
-        # rendering the two the same is the failure ARCHITECTURE.md warns about.
+        # rendering the two the same is the failure this guards against.
         # Once is the point, though: not once an hour.
         self.init()
         sent = self.fake_ship({})

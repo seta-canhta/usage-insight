@@ -28,15 +28,15 @@ design choice could serve either, it serves this.
 
 ## Status
 
-Measured figures live in [`docs/FINDINGS.md`](docs/FINDINGS.md) — one metric is
+Measured figures live in [`docs/METRICS.md`](docs/METRICS.md) — one metric is
 live, one is reportable with a caveat, two are permanently out of scope, and the
 rest are blocked. Read it before quoting a number: two of those figures were
 marked live in an earlier draft of *this* file and were wrong.
 
 ## Rules that outrank convenience
 
-These come from `schema/CONTRACT.md` and `docs/WHAT-WE-MEASURE.md`. They have
-each already prevented a wrong number from shipping.
+These come from `schema/CONTRACT.md` and `docs/METRICS.md`. They have each
+already prevented a wrong number from shipping.
 
 - **Never synthesise a join key** (AR-1). Measured: `extract_jira_key` invented
   `AUG-25` (a date) from `fix/AUG-25`; fabricated keys outnumbered real ones
@@ -112,6 +112,16 @@ What each module is for:
 | `pollers/poll_jira.py` | tickets, AI labels, transitions — metric 5 |
 | `common/` | the shared library every other package depends on |
 | `schema/CONTRACT.md` | single source of truth; it wins over any code |
+
+## Docs
+
+Four files, and there is no fifth. What it is (`README.md`), how to install it
+(`docs/INSTALL.md`), what it measures (`docs/METRICS.md`), how to run the
+pipeline (`docs/OPERATE.md`), plus `schema/CONTRACT.md` for field-level truth.
+Anything that reads as design narrative or an investigation log belongs in a
+commit message, not a new markdown file.
+
+`insight help` carries the user-facing version of the same thing, in the tool.
 
 ## Testing
 

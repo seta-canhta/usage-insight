@@ -4,24 +4,21 @@
 pollers, warehouse, metric SQL) MUST conform to it. Do not redefine these structures
 locally. If a change is needed, change it here and bump `schema_version`.
 
-Design reference: `docs/spikes/ai-effectiveness-observability.md` §5, §6, §8, §9, §11.
-
 ---
 
 ## 1. Non-negotiable rules
 
 1. **Never store content.** No prompts, no responses, no source code, no diffs, no
    secrets, no error message bodies, no raw email addresses. Store hashes, counts,
-   bounded enums, and file paths only. (Design §11.3)
+   bounded enums, and file paths only.
 2. **Fail open.** Telemetry must never block, slow, or fail an agent run. Every
    client-side error is swallowed and logged locally.
 3. **Idempotent.** `event_id` is the dedup key. Re-delivery must be safe.
 4. **Append-only.** Never update or delete a raw event. Corrections are new events.
 5. **Bounded dimensions.** Any field used as a metric dimension must have < 100
    distinct values. High-cardinality ids live in the payload, not in metric labels.
-   (Design §6.1, enforced by DQ-15)
-6. **No ROI, no counterfactual.** Per design §9.1 Decision 2 there is no non-AI
-   control group. Do not compute `time_saved` as a headline, and do not emit any
+   (enforced by DQ-15)
+6. **No ROI, no counterfactual.** There is no non-AI control group. Do not compute `time_saved` as a headline, and do not emit any
    monetary "value delivered" field. The economic metric is cost per accepted output.
 
 ---
@@ -54,7 +51,6 @@ Every event is one JSON object with exactly these top-level keys.
                                       //   silently unattributed row
   "parent_run_id":  null,             // string|null — sub-agent -> supervisor
   "span_id":        "spn_<uuid4hex>", // string|null — one phase
-  "workflow_id":    "wf-PRJ-6383-20260819", // string|null — legacy bridge
 
   "actor":   { ... },                 // §2.1, required
   "context": { ... },                 // §2.2, required
@@ -123,7 +119,7 @@ everything else is `heuristic` or `marker_only`.
 | 5 | `model.call` | **journal** | `model_id`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_write_tokens`, `reasoning_tokens`, `latency_ms`, `retry_count`, `finish_reason`, `request_count`, `premium_requests`, `nano_aiu`, `tool_definitions_tokens`, `system_tokens`, `conversation_tokens`. **Source changed in 1.1.0** from Copilot's OTel span stream to its own session journal; the wire names below are that journal's. **Wire names, measured 2026-08-26:** `session.shutdown.modelMetrics.<model>.usage.{inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens}`, `.requests.count` (→ `request_count`), `.requests.cost` (→ `premium_requests`), `.totalNanoAiu`. **`premium_requests` is the billing unit** — Copilot charges per seat plus premium requests, never per token, so a token figure is an economic weight and this is the invoice line. One event covers every call to one model in one session: the journal totals usage per session, so `latency_ms` is carried only where a session used a single model (`totalApiDurationMs` is the session's, and dividing it by `request_count` would be modelling). `retry_count` and `finish_reason` are **not recorded by this source** and stay NULL — never 0. The three `*_tokens` context fields are a **level, not a total**: what the model was carrying at the end of the session and paid for on every request in it, from `session.shutdown.{toolDefinitionsTokens, systemTokens, conversationTokens}`. `tool_definitions_tokens` measured 14,318–34,219 across only 7 distinct values in 57 sessions — a step function, and it steps when an MCP server is connected, making it the only measure in this contract that prices that decision. Its share of context is **17.1–73.8%, median 34.2%**, and the three fields sum to `session.shutdown.currentTokens` within 4 tokens on all 57, so they are the whole context rather than a subset. Multiplying any of the three by `request_count` would be modelling, not measurement |
 | 6 | `tool.call` | **journal** | `tool_name`, `tool_kind` (`mcp`\|`terminal`\|`file`\|`http`\|`other`), `duration_ms`, `status`, `error_class`. **Source changed in 1.1.0.** `status` was structurally NULL under the span source — spans carried no status field — so the weekly report's tool-failure count was always 0 by construction, not by measurement. `tool.execution_complete.success` now supplies a real verdict and `error.code`/`.message` a bounded `error_class`; the message itself is read to classify and discarded. `duration_ms` stays NULL: the journal timestamps the two ends of a call, and the gap includes waiting for a human to approve it, which is not the tool's duration |
 | 7 | `human.turn` | emitter | `turn_index`, `turn_kind` (`clarification`\|`correction`\|`approval`\|`rejection`), `chars` |
-| 8 | `output.generated` | emitter, git hook, **journal** | `output_id`, `artifact_type` (`code`\|`test`\|`spec`\|`mock`\|`doc`\|`csv`\|`config`), `file_path`, `lines_added`, `lines_removed`, `output_content_hash`, `reuse_source`, `acceptance_state`. **`acceptance_state` added in 1.1.0** — `weekly_report.py` has grouped outputs by it since it was written and this list never permitted it, so ingest stripped every one and the acceptance section rendered empty for reasons that had nothing to do with the emitter. The journal supplies these per edit (`toolTelemetry.metrics.linesAdded`/`linesRemoved`), which is the first source that attributes a written file to the agent that wrote it rather than to the commit that carried it. `file_path` is **repo-relative**: journal paths are absolute and begin with somebody's home directory, and design §11.3 keeps raw identifiers out of the stream |
+| 8 | `output.generated` | emitter, git hook, **journal** | `output_id`, `artifact_type` (`code`\|`test`\|`spec`\|`mock`\|`doc`\|`csv`\|`config`), `file_path`, `lines_added`, `lines_removed`, `output_content_hash`, `reuse_source`, `acceptance_state`. **`acceptance_state` added in 1.1.0** — `weekly_report.py` has grouped outputs by it since it was written and this list never permitted it, so ingest stripped every one and the acceptance section rendered empty for reasons that had nothing to do with the emitter. The journal supplies these per edit (`toolTelemetry.metrics.linesAdded`/`linesRemoved`), which is the first source that attributes a written file to the agent that wrote it rather than to the commit that carried it. `file_path` is **repo-relative**: journal paths are absolute and begin with somebody's home directory, and rule 1 keeps raw identifiers out of the stream |
 | 9 | `gate.evaluated` | emitter, **journal** | `gate_name` (`build`\|`test`\|`lint`\|`secrets`\|`coverage`), `status` (`pass`\|`fail`\|`skipped`), `quality_score`, `coverage_pct`, `attempt_index`. A shell command that runs a test, lint or build **is** a gate evaluation whether or not an agent emitted one, so the journal synthesises these from the command — read to classify, then discarded. **`status` is a real verdict as of 1.1.0:** Copilot's bash tool appends `<exited with exit code N>` to the output it returns, matched anchored at the end so a command that merely prints the phrase cannot forge a result, and only the integer is taken. Absent on ~12% of calls (still running, or output truncated), and absent means NULL — a missing verdict and a passing one are different facts. `success` on the tool call is **not** the verdict: a failing test suite is a successful bash call, and reading it that way would report every red build green |
 | 10 | `run.completed` | emitter | `duration_ms`, `phases_completed` |
 | 11 | `run.failed` | emitter | `duration_ms`, `failure_class`, `dependency_failed` (`vpn`\|`network`\|`jira`\|`bitbucket`\|`mcp`\|`aio`\|`ci`\|`none`) |
@@ -137,7 +133,7 @@ everything else is `heuristic` or `marker_only`.
 | 19 | `scm.revert` | **poller** | `reverted_commit_sha`, `revert_commit_sha`, `days_to_revert` |
 | 20 | `ci.pipeline.completed` | **poller** | `pipeline_id`, `commit_sha`, `status`, `duration_ms`, `tests_total`, `tests_passed`, `tests_failed`, `coverage_pct`, `ci_provider`, `ci_kind` (`build`\|`deploy`), `job_name`, `job_branch`, `build_number`. **Measured 2026-08-19:** CI is self-hosted **Jenkins**, not Bitbucket Pipelines. The source is `/commit/{sha}/statuses`, which needs no Jenkins credential. `tests_*` and `coverage_pct` are NOT available on that path and stay NULL — never 0 |
 | 21 | `jira.transition` | **poller** | `from_status`, `to_status`, `transitioned_at`, `status_category`, `issue` (snapshot sub-object: status, assignee accountId, issue type, labels, parent, estimates), `attribution` (AR-3 evidence sub-object: `rule`, `ai_labels`, `has_ai_labels`, `label_authored_by_ai`, `label_planned_by_ai`, `label_generated_by_ai`, `label_reviewed_by_ai`, `unrecognised_ai_labels`, `has_ai_label_drift`, `is_delivery_ticket_candidate`, `delivery_ticket_key`, `feature_ticket_key`, `feature_ticket_source`, `resolution_confidence`, `linked_issues`, `parent_key`). Issue creation is synthesised as a transition so every issue yields ≥1 event — the enum is closed, so there is no separate snapshot event. **`unrecognised_ai_labels` is a DQ signal, never a count:** it carries label *names* outside the §3.1 closed set, and those tickets are deliberately excluded from every AI figure |
-| 22 | `test.run.completed` | **poller** | `test_case_key`, `test_cycle_key`, `test_run_id`, `status` (AIO run status name), `status_category` (`passed`\|`failed`\|`blocked`\|`skipped`\|`in_progress`\|`not_run`\|`other`), `is_automated`, `executed_by_person_id`, `assigned_to_person_id`, `executed_at`, `effort_seconds`, `defect_count`, `folder_name`, `priority`. **Added 2026-08-20**, when an AioAuth key first made AIO TCMS reachable — the enum stopped at 21 because this source was blocked (`401 Invalid or missing API Token`), not because test execution did not matter. For a QA engineer the test cycle *is* the delivery record; pull requests are not. `test_case_title` is deliberately **not** carried: titles are free text and belong to the design §11.3 exclusions. A run that has never been executed emits `status_category = not_run` with a NULL `executed_at` — it is **not** a failure and must never be counted as one |
+| 22 | `test.run.completed` | **poller** | `test_case_key`, `test_cycle_key`, `test_run_id`, `status` (AIO run status name), `status_category` (`passed`\|`failed`\|`blocked`\|`skipped`\|`in_progress`\|`not_run`\|`other`), `is_automated`, `executed_by_person_id`, `assigned_to_person_id`, `executed_at`, `effort_seconds`, `defect_count`, `folder_name`, `priority`. **Added 2026-08-20**, when an AioAuth key first made AIO TCMS reachable — the enum stopped at 21 because this source was blocked (`401 Invalid or missing API Token`), not because test execution did not matter. For a QA engineer the test cycle *is* the delivery record; pull requests are not. `test_case_title` is deliberately **not** carried: titles are free text, which rule 1 excludes. A run that has never been executed emits `status_category = not_run` with a NULL `executed_at` — it is **not** a failure and must never be counted as one |
 | 23 | `test.case.snapshot` | **poller** | `test_case_key`, `automation_status` (AIO's own value, e.g. `Automated` / `To Be Automated`, or NULL when nobody has set it), `automation_owner_person_id`, `has_automation_key`, `test_case_status`, `script_type`, `folder_name`, `priority`, `is_archived`, `created_at`, `updated_at`. **Added 2026-08-20.** This is the *inventory* event, and it exists because the denominator of Automation Coverage is invisible to event 22: a test case nobody has ever executed emits no run, and those are exactly the un-automated cases the coverage metric has to count. `automation_status` is passed through verbatim and is **NULL for roughly half the estate** — an unset field is not "not automated", so a coverage figure must state its known-status denominator or it is measuring how diligently the field is filled in |
 
 ### 3.1 Provenance markers — two closed sets, not one
@@ -182,9 +178,9 @@ from the AI figure until reconciled, so the names must reach a report.
 > names survive the guard.
 >
 > Key-name screening is only the first layer. Both emitter and collector MUST also
-> screen string *values* against the secret patterns in `skills/dev-quality-gates/SKILL.md`
-> (`password\s*=`, `api[_-]?key`, `BEGIN * PRIVATE KEY`, `AKIA[0-9A-Z]{16}`), plus
-> Atlassian `ATATT` and GitHub `gh[pousr]_` tokens. On rejection log the **field name
+> screen string *values* against the secret patterns `password\s*=`, `api[_-]?key`,
+> `BEGIN * PRIVATE KEY`, `AKIA[0-9A-Z]{16}`, plus Atlassian `ATATT` and GitHub
+> `gh[pousr]_` tokens. On rejection log the **field name
 > and the check that fired — never the value**.
 
 ---
@@ -317,7 +313,7 @@ An unpriced `model_id` ⇒ `cost_usd = NULL` (**never 0**) + DQ-6 finding.
 
 ## 5. Acceptance state machine
 
-Computed nightly on `fct_ai_output`. (Design §8.7, §9.2)
+Computed nightly on `fct_ai_output`.
 
 ```mermaid
 stateDiagram-v2

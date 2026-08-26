@@ -13,7 +13,7 @@ hour is fourteen requests an hour, so ``ThreadingHTTPServer`` is not a compromis
 here -- it is the right size, and it lets the process import ``cli/identity.py``
 directly rather than reimplementing the whitelist rules.
 
-That import is the point. ``ARCHITECTURE.md`` refuses a second implementation of
+That import is the point. A second implementation of
 the contract on the grounds that the two drift, and the piece most worth not
 drifting is the one deciding who may upload. The client mints the secret and
 derives the fingerprint; this checks it with the same function.

@@ -1,151 +1,90 @@
 # usage-insight
 
-Measures what AI assistance actually contributes to software delivery — by
-reading systems that already record the work, rather than asking anyone.
+Measures how much AI assistance contributes to QA test automation, by reading
+systems that already record the work: Copilot's own journals on the laptop,
+Jira, Bitbucket, and AIO TCMS.
 
-Three questions a weekly report cannot otherwise answer: **which agent ran, on
-which ticket, and what it cost.** It refuses the ones the data cannot support.
-
-## What you get
-
-One Markdown report a week. A real section, from real data:
-
-```
-## 1. Adoption
-
-| Metric                    | This week | Prior |
-|---------------------------|----------:|------:|
-| AI runs                   |        28 |    18 |
-| ...started fresh          |         9 |     7 |
-| ...resumed                |         8 |     9 |
-| ...sub-agent invocations  |        11 |     2 |
-| Active people             |         8 |     1 |
-| Distinct skills used      |         3 |     2 |
-
-## 6. Cost
-
-| Metric                  | Value      | Basis                          |
-|-------------------------|-----------:|--------------------------------|
-| Premium requests        |         21 | measured — the unit Copilot bills |
-| API requests            |        358 | not the billed unit            |
-| Input tokens            | 22,431,999 | economic weight, not spend     |
-| ...of which cache reads | 94.0%      | higher is better               |
-| Token cost (modelled)   |          — | derived in the warehouse       |
-| Seat cost               |   excluded | a contract term, not telemetry |
-```
-
-Ten sections: adoption, acceptance, speed, quality, test execution, cost,
-reliability, human involvement, trend, data quality. Full sample:
+Output is one Markdown report a week. Sample:
 [`reports/2026-W34/weekly-2026-W34.md`](reports/2026-W34/weekly-2026-W34.md).
+
+The ten metrics it exists to produce, and which ones are actually live today,
+are in [`docs/METRICS.md`](docs/METRICS.md). Read that before quoting a number.
 
 ## Install
 
+On an engineer's laptop, one command:
+
 ```bash
 curl -fsSL https://aeris-insight.seta-international.com/install | sh
-insight setup
 ```
 
-Python 3.9+, standard library only — the artifact is a single zipapp, nothing to
-install and no virtualenv. The installer installs and stops; `setup` is a short
-conversation (work email, hourly yes/no, commit hook yes/no) because consent
-obtained from a pipe is consent nobody was shown.
+It installs, then asks for a work email and nothing else. Automatic collection,
+self-update and the commit hook are on by default; each has a flag to turn it
+off and each is reversible later. It ends by printing one `email:fingerprint`
+line to send to whoever runs the pipeline. That line is a hash; the secret stays
+on the machine.
 
-`setup` prints one `email:fingerprint` line to send to whoever runs the
-pipeline. It is a hash; the secret never leaves the machine.
+Python 3.9+, standard library only. The whole client is one zipapp.
 
-Developing on it? `git clone` and `./insight` work unchanged, and behave
-identically. See [`docs/SETUP.md`](docs/SETUP.md) · [tiếng Việt](docs/SETUP.vi.md).
+`insight help` explains what is collected and how to stop it, from the terminal.
+Longer version: [`docs/INSTALL.md`](docs/INSTALL.md).
 
-## What runs
+Running the pipeline instead: [`docs/OPERATE.md`](docs/OPERATE.md).
 
-Hourly, on its own, from `setup`:
+## What it collects
 
-```bash
-insight copilot   # Copilot's session journal — tokens, premium requests, tools
-insight collect   # which agent, which ticket
-insight scan      # every repository Copilot has worked in
-insight pack && insight ship
-```
+From the laptop:
 
-`insight schedule --off` stops it. A quiet hour uploads nothing; a quiet day
-still uploads one empty bundle, because a measured zero and missing data must
-never look the same.
+| Source | What is read |
+|---|---|
+| `~/.copilot/session-state/*/events.jsonl` | premium requests, token counts, model ids, tool names and verdicts |
+| VS Code `chatSessions/*.jsonl` | per-call latency, tool names, prompt/output tokens |
+| `rtk` history, where installed | per-command token counts |
+| git, in repos Copilot has worked in | commit hashes, line counts, AI trailers |
 
-Nothing is registered by hand — Copilot records `context.gitRoot` for every
-session, so `scan` finds the repositories itself. `pack` seals and `ship` sends,
-two commands on purpose: nothing leaves until the second is typed, which is what
-makes reading your own bundle first a real option rather than a claim.
+From the servers: Jira issues and transitions, Bitbucket PRs and reviews, AIO
+test cycles and runs.
 
-Centrally, once a week:
+Collection runs when Copilot runs. `insight setup` installs a hook at
+`~/.copilot/hooks/seta-insight.json` that Copilot calls before each tool use.
+The hook returns in milliseconds and detaches a collector, debounced to 10
+minutes. Uploads are batched hourly. An hourly timer stays as a fallback for
+machines where the hook cannot be installed.
 
-```bash
-python3 importers/pull.py --week 2026-W34 --inbox inbox/ --roster roster.txt
-python3 importers/bundle.py --inbox inbox/ --out events.ndjson
-```
+Field-by-field definitions: [`schema/CONTRACT.md`](schema/CONTRACT.md).
 
-`pull` names who did not report. Read that line before the numbers.
+## What it never collects
 
-## What it can see
+- **Content.** No prompts, replies, source, diffs, file contents. Readers name
+  the fields they keep and never look at the rest.
+- **Absolute paths.** Paths are repo-relative, so no username ships.
+- **Raw emails.** Only a salted hash.
+- **Self-reported counts.** The daily sync sheet maps person to team to ticket.
+  It is never a source for a number.
+- **Client-side cost.** `premium_requests` is measured on the laptop; `cost_usd`
+  is derived in the warehouse against dated pricing.
 
-The source is `~/.copilot/session-state/<id>/events.jsonl`, the journal Copilot
-CLI keeps for its own `/resume`. It is written whether or not anything is
-watching — no exporter, no setting, no port — and `insight copilot` never alters
-or deletes it.
-
-Measured on one real tree of 22 journals:
-
-| | |
-|---|---:|
-| Contract events produced | 2,935 |
-| Absolute paths, or usernames, in the output | **0** |
-| Repositories discovered with nothing registered | 7 |
-| Tool calls, with a real verdict | 2,000 ok · 62 error |
-| Shell-command gates carrying an exit-code verdict | ~88% |
-| Sessions whose token usage is **unknowable** | 2 of 22 |
-
-The last two rows are limits, not results. A gate with no exit code is a gate
-with **no verdict**, not a pass. A session that ended without `session.shutdown`
-carries no usage at all — unavailable, not zero.
-
-**It does not see everything.** VS Code's Copilot Chat panel and inline
-completions write nothing to this journal and are unmeasured. Pilot usage is
-mixed across all three surfaces, so every run publishes a `coverage` block
-naming what it could not see.
-
-## What it will not do
-
-**Never stores content.** No prompts, responses, source code or diffs — counts,
-hashes, bounded categories and repo-relative paths only. The journal is *mostly*
-content, so the reader **names the fields it keeps** and drops the rest without
-looking: an exclusion list is only as good as today's knowledge of a format that
-gains keys without asking. The allow-list is checked before a write, not on
-ingest, because the client runs on a machine full of what it must not collect.
-
-**Never renders absent as zero.** A gap is the normal case — leave, a new joiner,
-a quiet week — and a missing week shown as `0` shows a team getting worse when it
-is only getting quieter.
-
-**Never synthesises a join key.** Where two sources cannot be linked with
-evidence, the answer is "cannot attribute", not the nearest match.
-
-**Never counts from self-reported data.** It builds mappings only; counting from
-it would rank people by how carefully they fill in forms.
-
-**Not a performance record.** Local collection is voluntary and reversible,
-which is what makes it consensual and also what makes it useless as an audit
-trail. Say so before someone tries.
+A gap is never rendered as zero. VS Code stores no token counts for some calls,
+so those fields stay NULL.
 
 ## Layout
 
 | | |
 |---|---|
-| `cli/` | `insight` — the local client, stdlib only |
-| `pollers/` | Jira, Bitbucket, test management |
+| `cli/` | `insight`, the local client |
+| `common/` | shared library the other packages import |
+| `pollers/` | Jira, Bitbucket, AIO, CI |
 | `importers/` | weekly bundles, daily reconciliation |
 | `report/` | weekly Markdown, per-person workbooks |
-| `collector/` | the attribute allow-list, enforced |
-| `server/` | the collection endpoint — S3 behind one `PUT` |
+| `collector/` | ingest service; enforces the attribute allow-list |
+| `server/` | collection endpoint; S3 behind one PUT |
 | `schema/CONTRACT.md` | the single source of truth |
-| `docs/` | [what we measure](docs/WHAT-WE-MEASURE.md), [architecture](docs/ARCHITECTURE.md), [findings](docs/FINDINGS.md) |
+| `sql/` | the warehouse |
 
-798 tests: `for s in pollers report collector cli importers server; do python3 -m unittest discover -s $s/tests; done`
+## Tests
+
+```bash
+for s in pollers report collector cli importers server; do
+  python3 -m unittest discover -s $s/tests
+done
+```

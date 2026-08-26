@@ -19,7 +19,7 @@ Two jobs, and the second is the one people forget:
 On integrity: the checksum catches truncation and accidental corruption. It is
 **not** tamper-evidence -- an engineer can read and edit their own bundle before
 handing it over, which is what makes the collection consensual. These figures
-are a voluntary record, never an audit trail. See ``docs/ARCHITECTURE.md``.
+are a voluntary record, never an audit trail.
 """
 
 from __future__ import annotations

@@ -11,8 +11,8 @@ just replaces the person who used to save attachments into a folder.
 
 **The roster is the point.** When bundles arrived by email, a missing week was
 visible: no email came. Automate the transport and silence turns ambiguous --
-nobody worked, or nobody uploaded? ``ARCHITECTURE.md`` is emphatic that absent
-must never render as zero, and automation makes that failure *more* likely
+nobody worked, or nobody uploaded? An unmeasured quantity and a measured zero
+must never render the same, and automation makes that failure *more* likely
 rather than less. So this reports coverage against a declared roster, and names
 who sent nothing.
 
