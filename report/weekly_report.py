@@ -1642,7 +1642,7 @@ def render_markdown(
     add("")
     add("*No ROI, no monetary value-delivered, and no AI-vs-human comparison appear in "
         "this report. AI is applied to essentially all work, so no control group exists "
-        "and no attribution is possible. See design §8.16 and §9.1 Decision 2.*")
+        "and no attribution is possible.*")
     add("")
     return "\n".join(out)
 

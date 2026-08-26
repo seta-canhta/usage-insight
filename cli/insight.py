@@ -2273,6 +2273,24 @@ SEEING WHAT LEAVES
     insight ship --dry-run        what would be sent, without sending
     insight ship                  send it
 
+SENDING NOW, AND BACKFILLING
+
+    insight auto --force-ship     collect and upload now, ignoring the hourly
+                                  batch window
+
+    Copilot's journals go back as far as they go, and installing this does not
+    start the clock -- the readers see everything already on disk:
+
+    insight copilot               every session journal
+    insight vscode                every VS Code chat session
+    insight rtk                   rtk history, if installed
+    insight scan --since-days 90  commit metadata that far back
+    insight pack --since 2026-08-01 --until 2026-08-26
+    insight ship --all
+
+    Re-running any of it is safe. Event ids are derived from the fact, not
+    minted per run, so a day packed twice is one day at the far end.
+
 CONTROL
 
     insight whoami                your allow-list line, again

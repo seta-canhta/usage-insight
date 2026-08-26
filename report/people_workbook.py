@@ -1054,7 +1054,7 @@ def build_coverage_sheet(wb: Workbook, sources: Sequence[Sequence[Any]],
         "fixture, and a small one is often the hard bug.",
         "There is no AI-vs-no-AI comparison here. Essentially all work in this "
         "org now uses AI, so there is no control group and any such number would "
-        "be a model presented as a measurement (design §8.16).",
+        "be a model presented as a measurement.",
         "Two people is below any threshold at which a percentage means anything. "
         "Read the rows, not the ratios.",
     ):
