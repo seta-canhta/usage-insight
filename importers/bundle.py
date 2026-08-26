@@ -148,6 +148,29 @@ def iso_weeks(start: Optional[str], end: Optional[str]) -> List[str]:
     return weeks
 
 
+def measured(manifest: Dict[str, Any]) -> bool:
+    """Did this bundle come from a machine that could measure anything?
+
+    A zero is only a zero if something was watching. A bundle from a machine
+    with no repository registered, no Copilot exporter and no agent emitter is
+    well formed and reports no events -- indistinguishable, from the outside,
+    from a genuinely quiet day. Counting it as a measured zero turns a setup
+    that never finished into a person who did no work, which is a wrong answer
+    rather than a missing one.
+
+    Bundles written before the client declared its sources have no ``sources``
+    key. Those are treated as measured: they predate the question, and guessing
+    the other way would retroactively erase real weeks.
+    """
+    if manifest.get("event_count"):
+        return True                     # it measured something, by definition
+    sources = manifest.get("sources")
+    if not isinstance(sources, dict):
+        return True                     # older bundle; not ours to reinterpret
+    return bool(sources.get("repos") or sources.get("otel")
+                or sources.get("agent"))
+
+
 def import_inbox(inbox: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     state = state or {}
     seen = set(state.get("event_ids") or [])
@@ -175,12 +198,16 @@ def import_inbox(inbox: str, state: Optional[Dict[str, Any]] = None) -> Dict[str
             rejected.append({"file": name, "reason": problem})
 
         machine = manifest.get("machine_id") or "unknown"
-        entry = coverage.setdefault(machine, {"weeks": [], "bundles": 0, "events": 0})
+        entry = coverage.setdefault(machine, {"weeks": [], "bundles": 0,
+                                              "events": 0, "unmeasured": 0})
+        entry.setdefault("unmeasured", 0)   # state written before this existed
         for week in iso_weeks(manifest.get("window_start"), manifest.get("window_end")):
             if week not in entry["weeks"]:
                 entry["weeks"].append(week)
         entry["bundles"] += 1
         entry["events"] += len(kept)
+        if not measured(manifest):
+            entry["unmeasured"] += 1
 
         for event in kept:
             event_id = event.get("event_id")
@@ -225,11 +252,20 @@ def coverage_report(coverage: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
             "weeks_missing_within_span": [w for w in span if w not in weeks],
             "bundles": entry["bundles"],
             "events": entry["events"],
+            # Bundles from a machine that had nothing configured to read.
+            "unmeasured_bundles": entry.get("unmeasured", 0),
         }
+    # Machines that have sent only unmeasured bundles. Named separately because
+    # they are the ones an aggregate would silently count as zeros -- a setup
+    # that never finished, reported as a person who did no work.
+    unconfigured = sorted(
+        machine for machine, entry in coverage.items()
+        if entry["bundles"] and entry.get("unmeasured", 0) == entry["bundles"])
     return {
         "machines": len(coverage),
         "weeks_seen": all_weeks,
         "machine_weeks_covered": sum(len(e["weeks"]) for e in coverage.values()),
+        "machines_measuring_nothing": unconfigured,
         "by_machine": machines,
     }
 
@@ -278,11 +314,19 @@ def main(argv: Optional[List[str]] = None) -> int:
         "events_written": len(result["events"]),
         "duplicates_skipped": result["duplicates"],
         "machine_weeks_covered": report["machine_weeks_covered"],
+        "machines_measuring_nothing": len(report["machines_measuring_nothing"]),
     }
     print(json.dumps(summary, sort_keys=True), file=sys.stderr)
     for problem in result["rejected"]:
         print("REJECTED {}: {}".format(problem["file"], problem["reason"]),
               file=sys.stderr)
+    for machine in report["machines_measuring_nothing"]:
+        # Not a rejection: the bundles are valid and the machine is reporting.
+        # It has nothing configured to read, so its zeros are not measurements
+        # and must not be averaged in as though they were.
+        print("NOT MEASURING {}: every bundle came from a machine with no "
+              "repository, no Copilot exporter and no agent emitter. Its zeros "
+              "are not measured zeros.".format(machine[:8]), file=sys.stderr)
     return 0
 
 

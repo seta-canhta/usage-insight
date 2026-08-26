@@ -183,5 +183,79 @@ class RosterTests(unittest.TestCase):
                          ["canh@seta-international.vn"])
 
 
+def bundle_body(events=0, sources=None):
+    """A minimal well-formed bundle, as the endpoint would return it."""
+    import hashlib
+    body = "".join(json.dumps({"event_id": "e%d" % i}, sort_keys=True) + "\n"
+                   for i in range(events))
+    manifest = {
+        "format": "seta-insight-bundle/1", "schema_version": "1.0.0",
+        "machine_id": "a3f9c2b1", "packed_at": "2026-08-24T00:00:00Z",
+        "window_start": "2026-08-17T00:00:00Z",
+        "window_end": "2026-08-23T23:59:59Z",
+        "event_count": events,
+        "sha256": hashlib.sha256(body.encode()).hexdigest(),
+    }
+    if sources is not None:
+        manifest["sources"] = sources
+    return (json.dumps({"_manifest": manifest}, sort_keys=True) + "\n"
+            + body).encode("utf-8")
+
+
+class MeasuringNothingTests(unittest.TestCase):
+    """Somebody who uploads faithfully and measures nothing.
+
+    Worse than being missing: missing is already named in the coverage report,
+    while these arrive looking like a week of zeros and are averaged in as
+    though somebody had measured them.
+    """
+
+    ROSTER = ["canh@seta-international.vn", "minh@seta-international.vn"]
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.inbox = os.path.join(self.tmp, "inbox")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def pull(self, bodies):
+        endpoint = Endpoint(OBJECTS, bodies)
+        return pull_mod.pull_week("http://x", "2026-W34", "t", self.inbox,
+                                  roster=self.ROSTER, get=endpoint)
+
+    def test_a_reporter_with_nothing_configured_is_named(self):
+        result = self.pull({
+            "bundles/2026-W34/a3f9c2b1/aaa.ndjson": bundle_body(
+                0, {"repos": 0, "otel": False, "agent": False}),
+            "bundles/2026-W34/7b1e0092/bbb.ndjson": bundle_body(
+                3, {"repos": 2, "otel": True, "agent": False})})
+        self.assertEqual(result["coverage"]["reported_but_measuring_nothing"],
+                         ["canh@seta-international.vn"])
+
+    def test_a_quiet_but_configured_machine_is_not_named(self):
+        # The distinction the whole change exists for: this really is a zero.
+        result = self.pull({
+            "bundles/2026-W34/a3f9c2b1/aaa.ndjson": bundle_body(
+                0, {"repos": 3, "otel": False, "agent": False}),
+            "bundles/2026-W34/7b1e0092/bbb.ndjson": bundle_body(
+                0, {"repos": 1, "otel": False, "agent": False})})
+        self.assertEqual(result["coverage"]["reported_but_measuring_nothing"], [])
+
+    def test_they_still_count_as_having_reported(self):
+        # They did report. Moving them into `missing` would swap one wrong
+        # reading for another, and hide that the transport is working.
+        result = self.pull({
+            "bundles/2026-W34/a3f9c2b1/aaa.ndjson": bundle_body(
+                0, {"repos": 0, "otel": False, "agent": False}),
+            "bundles/2026-W34/7b1e0092/bbb.ndjson": bundle_body(3)})
+        self.assertIn("canh@seta-international.vn", result["coverage"]["reported"])
+        self.assertEqual(result["coverage"]["missing"], [])
+
+    def test_older_bundles_without_sources_are_left_alone(self):
+        result = self.pull({
+            "bundles/2026-W34/a3f9c2b1/aaa.ndjson": bundle_body(0),
+            "bundles/2026-W34/7b1e0092/bbb.ndjson": bundle_body(0)})
+        self.assertEqual(result["coverage"]["reported_but_measuring_nothing"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

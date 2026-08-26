@@ -135,14 +135,40 @@ def _who(obj: Dict[str, Any]) -> str:
     return str(obj.get("email") or obj.get("machine") or "").strip().lower()
 
 
-def coverage(objects: List[Dict[str, Any]], roster: List[str]) -> Dict[str, Any]:
+def bundle_measured(path: str) -> bool:
+    """Whether a bundle on disk came from a machine that could measure anything.
+
+    Shares the rule with ``bundle.py`` rather than restating it -- the two
+    disagreeing about what a zero means is exactly the confusion this is here
+    to remove. An unreadable file is left to `bundle.py`, which rejects it
+    loudly and whole; inventing a second opinion here would only add noise.
+    """
+    import bundle as bundle_mod                                  # noqa: PLC0415
+
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            manifest = json.loads(handle.readline()).get("_manifest")
+    except (OSError, ValueError, AttributeError):
+        return True
+    return bundle_mod.measured(manifest) if isinstance(manifest, dict) else True
+
+
+def coverage(objects: List[Dict[str, Any]], roster: List[str],
+             measured: Optional[Dict[str, bool]] = None) -> Dict[str, Any]:
     """Who reported this week, and who was expected and did not."""
     arrived = sorted({_who(o) for o in objects if _who(o)})
     expected = sorted({str(p).strip().lower() for p in roster if str(p).strip()})
+    measured = measured or {}
     return {
         "expected": len(expected),
         "arrived": len(arrived),
         "reported": arrived,
+        # Reported, and every bundle came from a machine with nothing
+        # configured to read. Worse than missing: missing is visible in the
+        # line above, while these arrive looking like a week of zeros and get
+        # averaged in as though somebody had measured them.
+        "reported_but_measuring_nothing": [
+            p for p in arrived if not measured.get(p, True)],
         # Absent, not zero. Named so a reader can weigh the week honestly
         # rather than reading a smaller total as a quieter team.
         "missing": [p for p in expected if p not in arrived],
@@ -161,6 +187,7 @@ def pull_week(endpoint: str, week: str, token: str, inbox: str,
     os.makedirs(inbox, exist_ok=True)
 
     written, skipped = [], []
+    measured: Dict[str, bool] = {}
     for obj in objects:
         key = obj.get("key")
         if not key:
@@ -185,11 +212,18 @@ def pull_week(endpoint: str, week: str, token: str, inbox: str,
             # bytes. Re-running a pull is cheap and safe, which matters because
             # a week gets pulled again whenever someone ships late.
             skipped.append(name)
-            continue
-        body = fetch(endpoint, key, token, timeout, get)
-        with open(path, "wb") as handle:
-            handle.write(body)
-        written.append(name)
+        else:
+            body = fetch(endpoint, key, token, timeout, get)
+            with open(path, "wb") as handle:
+                handle.write(body)
+            written.append(name)
+
+        # One measured bundle in the week is enough: somebody who configured
+        # the client on Wednesday has a Monday of empty bundles that are not
+        # evidence of anything, and is still reporting properly now.
+        person = _who(obj)
+        if person:
+            measured[person] = measured.get(person, False) or bundle_measured(path)
 
     result = {
         "week": week,
@@ -199,7 +233,7 @@ def pull_week(endpoint: str, week: str, token: str, inbox: str,
         "inbox": inbox,
     }
     if roster is not None:
-        result["coverage"] = coverage(objects, roster)
+        result["coverage"] = coverage(objects, roster, measured)
     return result
 
 
@@ -246,6 +280,14 @@ def main(argv: Optional[List[str]] = None) -> int:
             print("These are absent, not zero. Every aggregate over this week "
                   "carries how many machine-weeks it actually covers.",
                   file=sys.stderr)
+        if report.get("reported_but_measuring_nothing"):
+            print("measuring nothing: {}".format(
+                ", ".join(report["reported_but_measuring_nothing"])),
+                file=sys.stderr)
+            print("These uploaded, and their machines have no repository, no "
+                  "Copilot exporter and no agent emitter configured. Their "
+                  "zeros are not measured zeros -- chase the setup rather than "
+                  "reading them as a quiet week.", file=sys.stderr)
         if report["unexpected"]:
             print("not on the roster: {}".format(
                 ", ".join(report["unexpected"])), file=sys.stderr)

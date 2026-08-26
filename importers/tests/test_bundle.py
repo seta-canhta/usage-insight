@@ -20,7 +20,7 @@ from importers import bundle as bundle_mod  # noqa: E402
 
 def make_bundle(path, events, machine="m1", window=("2026-08-03T00:00:00Z",
                                                     "2026-08-09T00:00:00Z"),
-                corrupt=False, declared_count=None):
+                corrupt=False, declared_count=None, sources=None):
     body = "".join(json.dumps(e, sort_keys=True) + "\n" for e in events)
     manifest = {
         "format": bundle_mod.BUNDLE_FORMAT,
@@ -32,6 +32,8 @@ def make_bundle(path, events, machine="m1", window=("2026-08-03T00:00:00Z",
         "event_count": declared_count if declared_count is not None else len(events),
         "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
     }
+    if sources is not None:
+        manifest["sources"] = sources
     with open(path, "w", encoding="utf-8") as handle:
         handle.write(json.dumps({"_manifest": manifest}, sort_keys=True) + "\n")
         handle.write(body + ("tampered\n" if corrupt else ""))
@@ -215,3 +217,95 @@ class TestEndToEnd(InboxTestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+NOTHING = {"repos": 0, "otel": False, "agent": False}
+SOMETHING = {"repos": 2, "otel": False, "agent": False}
+
+
+class MeasuredZeroTests(unittest.TestCase):
+    """A zero is only a zero if something was watching.
+
+    The bug this exists for: a machine with no repository registered uploads a
+    well-formed bundle declaring its window and no events -- identical, from
+    here, to a genuinely quiet day. Averaged in as a zero it says the person
+    did no work, which is a wrong answer rather than a missing one.
+    """
+
+    def test_events_make_it_measured_whatever_the_sources_say(self):
+        self.assertTrue(bundle_mod.measured(
+            {"event_count": 3, "sources": NOTHING}))
+
+    def test_a_zero_from_a_configured_machine_is_a_real_zero(self):
+        self.assertTrue(bundle_mod.measured(
+            {"event_count": 0, "sources": SOMETHING}))
+
+    def test_a_zero_from_a_machine_with_nothing_configured_is_not(self):
+        self.assertFalse(bundle_mod.measured(
+            {"event_count": 0, "sources": NOTHING}))
+
+    def test_any_single_source_is_enough(self):
+        for key in ("repos", "otel", "agent"):
+            sources = dict(NOTHING)
+            sources[key] = 1 if key == "repos" else True
+            self.assertTrue(bundle_mod.measured(
+                {"event_count": 0, "sources": sources}), key)
+
+    def test_a_bundle_from_before_this_existed_is_left_alone(self):
+        # No `sources` key at all. Guessing the other way would retroactively
+        # erase real weeks that were genuinely quiet.
+        self.assertTrue(bundle_mod.measured({"event_count": 0}))
+        self.assertTrue(bundle_mod.measured({"event_count": 0, "sources": None}))
+
+
+class UnmeasuredCoverageTests(InboxTestCase):
+
+    def test_a_machine_measuring_nothing_is_named(self):
+        make_bundle(os.path.join(self.inbox, "a.ndjson"), [],
+                    machine="idle-but-configured", sources=SOMETHING)
+        make_bundle(os.path.join(self.inbox, "b.ndjson"), [],
+                    machine="never-set-up", sources=NOTHING)
+        report = bundle_mod.coverage_report(
+            bundle_mod.import_inbox(self.inbox)["coverage"])
+        self.assertEqual(report["machines_measuring_nothing"], ["never-set-up"])
+
+    def test_a_machine_that_measured_once_is_not_named(self):
+        # Somebody who finished the setup on Wednesday has Monday's empty
+        # bundles on file. They are reporting properly now.
+        make_bundle(os.path.join(self.inbox, "mon.ndjson"), [],
+                    machine="m9", sources=NOTHING)
+        make_bundle(os.path.join(self.inbox, "wed.ndjson"), [event("e1")],
+                    machine="m9", sources=SOMETHING)
+        report = bundle_mod.coverage_report(
+            bundle_mod.import_inbox(self.inbox)["coverage"])
+        self.assertEqual(report["machines_measuring_nothing"], [])
+
+    def test_unmeasured_bundles_are_counted_per_machine(self):
+        for name in ("a", "b"):
+            make_bundle(os.path.join(self.inbox, name + ".ndjson"), [],
+                        machine="m9", sources=NOTHING)
+        report = bundle_mod.coverage_report(
+            bundle_mod.import_inbox(self.inbox)["coverage"])
+        self.assertEqual(report["by_machine"]["m9"]["unmeasured_bundles"], 2)
+
+    def test_the_week_is_still_counted_as_covered(self):
+        # The machine did report. Dropping its week would turn one wrong
+        # reading into a different wrong reading.
+        make_bundle(os.path.join(self.inbox, "a.ndjson"), [],
+                    machine="m9", sources=NOTHING)
+        report = bundle_mod.coverage_report(
+            bundle_mod.import_inbox(self.inbox)["coverage"])
+        self.assertEqual(report["machine_weeks_covered"], 1)
+
+    def test_state_written_before_this_existed_still_loads(self):
+        old_state = {"event_ids": [],
+                     "coverage": {"m9": {"weeks": ["2026-W32"], "bundles": 1,
+                                         "events": 0}}}
+        make_bundle(os.path.join(self.inbox, "a.ndjson"), [],
+                    machine="m9", sources=NOTHING)
+        result = bundle_mod.import_inbox(self.inbox, old_state)
+        self.assertEqual(result["coverage"]["m9"]["unmeasured"], 1)
+
+
+if __name__ == "__main__":
+    unittest.main()

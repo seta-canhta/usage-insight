@@ -56,6 +56,36 @@ on leave, someone joins mid-quarter. Coverage is what lets a report tell a
 measured zero from an absent one, so it is a first-class output rather than a
 diagnostic. An empty bundle still counts as a covered week.
 
+## A zero is only a zero if something was watching
+
+A bundle from a machine with no repository registered, no Copilot exporter and
+no agent emitter is well formed: it declares its window and reports no events —
+which is exactly what a genuinely quiet day looks like. Averaged in, it says
+that person did no work. That is a *wrong* answer, not a missing one, and it is
+the failure this whole design exists to prevent.
+
+So the client declares what it was in a position to measure — counts and flags,
+never paths — in the manifest's `sources`. `bundle.py` uses it to separate the
+two, and names any machine whose every bundle was unmeasured:
+
+```
+NOT MEASURING 96f52ad6: every bundle came from a machine with no repository,
+no Copilot exporter and no agent emitter. Its zeros are not measured zeros.
+```
+
+`pull.py` says the same thing in the language the roster uses, because that is
+where somebody is in a position to go and fix it:
+
+```
+measuring nothing: ngoc.nguyen@aeris.net
+```
+
+They still count as having reported — the transport *is* working, and moving
+them into `missing` would swap one wrong reading for another. Bundles written
+before the client declared its sources have no `sources` key and are left
+alone: they predate the question, and guessing would retroactively erase real
+quiet weeks.
+
 The checksum catches truncation and corruption. It is **not** tamper-evidence:
 an engineer can read and edit their own bundle before handing it over, which is
 what makes the collection consensual. A voluntary record, never an audit trail.

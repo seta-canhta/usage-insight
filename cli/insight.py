@@ -971,6 +971,27 @@ def cmd_otel(args: argparse.Namespace) -> int:
 # pack
 # --------------------------------------------------------------------------
 
+def sources_of(config: Dict[str, Any]) -> Dict[str, Any]:
+    """Which local sources this machine is set up to read.
+
+    Deliberately not "did the last run succeed": that changes hour to hour and
+    would make an idle afternoon look like a broken install. This is the slower
+    fact -- whether there is anything here to read at all -- which is what
+    separates a quiet day from a setup that never finished.
+    """
+    return {
+        # Registered repositories. Zero means `scan` has nothing to walk, and
+        # every bundle from this machine will be empty until one is added.
+        "repos": len(config.get("repos") or []),
+        # Copilot's exporter has written here at least once. `otel` truncates
+        # the file after reading it, so the file outliving its contents is the
+        # point: it says the exporter is wired up.
+        "otel": os.path.exists(COPILOT_SPANS),
+        # The platform emitter's buffer directory, created on its first run.
+        "agent": os.path.isdir(EMIT_BUFFER),
+    }
+
+
 def cmd_pack(args: argparse.Namespace) -> int:
     config = require_config()
     events = read_buffer(args.since, args.until)
@@ -1001,6 +1022,18 @@ def cmd_pack(args: argparse.Namespace) -> int:
         "days_covered": sorted({partition_of(e) for e in events}),
         "event_count": len(events),
         "event_counts_by_type": counts,
+        # What this machine was in a position to measure at all.
+        #
+        # Without it a zero is ambiguous in the one way that matters. A bundle
+        # from a machine with no repository registered is well formed: it
+        # declares its window and reports no events, which is exactly what a
+        # genuinely quiet day looks like. Read as a measurement it says the
+        # person did no work -- a wrong answer, not a missing one, and the only
+        # failure this whole design exists to prevent.
+        #
+        # Counts and booleans, never paths. `importers/bundle.py` uses this to
+        # separate a measured zero from a machine that measured nothing.
+        "sources": sources_of(config),
         "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
     }
 

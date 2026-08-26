@@ -243,6 +243,47 @@ class TestSetupAdoptsAnIssuedToken(ClientTestCase):
                          self.insight.SETA_ENDPOINT)
 
 
+class TestPackDeclaresSources(ClientTestCase):
+    """What the machine was in a position to measure, recorded in the bundle.
+
+    Without it, an empty bundle from a machine that was never finished being
+    set up is indistinguishable from a genuinely quiet day, and gets averaged
+    in as a zero.
+    """
+
+    def manifest(self):
+        import ship as ship_mod
+        _, out = self.run_cli("pack")
+        return ship_mod.read_manifest(json.loads(out)["bundle"])
+
+    def test_a_fresh_machine_declares_that_it_has_nothing(self):
+        self.init()
+        sources = self.manifest()["sources"]
+        self.assertEqual(sources["repos"], 0)
+        self.assertFalse(sources["otel"])
+
+    def test_a_registered_repository_is_counted(self):
+        self.init()
+        self.run_cli("scan", "--repo", os.path.dirname(
+            os.path.dirname(os.path.abspath(self.insight.__file__))))
+        self.assertEqual(self.manifest()["sources"]["repos"], 1)
+
+    def test_it_carries_counts_and_flags_but_never_paths(self):
+        # CONTRACT.md 1.1: the bundle is the thing that leaves the machine.
+        self.init()
+        self.run_cli("scan", "--repo", os.path.dirname(
+            os.path.dirname(os.path.abspath(self.insight.__file__))))
+        blob = json.dumps(self.manifest()["sources"])
+        self.assertNotIn("/", blob)
+
+    def test_declaring_sources_does_not_disturb_the_event_checksum(self):
+        # `auto` dedupes on the manifest's sha256, which covers the events
+        # alone. If this had moved it, every hourly run would upload again.
+        self.init()
+        first = self.manifest()["sha256"]
+        self.assertEqual(self.manifest()["sha256"], first)
+
+
 class TestAllowList(ClientTestCase):
 
     def test_an_attribute_outside_the_allow_list_is_reported(self):
