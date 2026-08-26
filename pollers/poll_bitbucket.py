@@ -70,6 +70,7 @@ from common import (  # noqa: E402
     make_agent,
     make_context,
     make_link,
+    validated_projects,
     min_ts,
     ms_between,
     paginate,
@@ -135,6 +136,11 @@ def derive_review_timeline(
     merged_at: Optional[str] = None
     declined_at: Optional[str] = None
     decline_actor: Optional[str] = None
+    #: Every OPEN update, in the order they happened. Bitbucket writes one when
+    #: the PR is created, one per push, and one when a declined PR is reopened.
+    #: Told apart below by position and by what came before them.
+    opened: List[str] = []
+    declines: List[str] = []
 
     for entry in activity or []:
         update = entry.get("update")
@@ -143,7 +149,12 @@ def derive_review_timeline(
             when = to_rfc3339(update.get("date"))
             if state == "MERGED":
                 merged_at = min_ts(merged_at, when) if merged_at else when
+            elif state == "OPEN":
+                if when:
+                    opened.append(when)
             elif state == "DECLINED":
+                if when:
+                    declines.append(when)
                 if declined_at is None or (
                     parse_ts(when) and parse_ts(when) < parse_ts(declined_at)
                 ):
@@ -220,6 +231,29 @@ def derive_review_timeline(
     for index, slot in enumerate(ordered):
         slot["is_first_review"] = index == 0
 
+    # A reopen is an OPEN that follows a DECLINE. Nothing else in the feed says
+    # "this was rejected and came back", and a PR that had to come back is the
+    # clearest rework signal Bitbucket gives -- stronger than a comment, which
+    # may be praise, and stronger than a push, which may be a rebase.
+    #
+    # Counted against the *earliest* decline rather than paired up one-to-one:
+    # the feed can carry a decline whose reopen was itself later declined, and
+    # pairing them would need an ordering the API does not promise. This counts
+    # how many times the PR was opened after having been declined at all, which
+    # is the question metric 4 asks.
+    opened.sort(key=parse_ts)
+    declines.sort(key=parse_ts)
+    reopens = ([when for when in opened if parse_ts(when) > parse_ts(declines[0])]
+               if declines else [])
+
+    # Pushes, not counting the one that created the PR. `revision_count` is
+    # every push; the second is the subset that landed after somebody had
+    # already looked, which is the one that means rework rather than drafting.
+    pushes = opened[1:]
+    revisions_after_first_review = (
+        [when for when in pushes if parse_ts(when) > parse_ts(first_review_at)]
+        if first_review_at else [])
+
     return {
         "first_review_at": first_review_at,
         "first_reviewer_person_id": ordered[0]["person_id"] if ordered else None,
@@ -229,6 +263,10 @@ def derive_review_timeline(
         "decline_actor_key": decline_actor,
         "self_comment_count": self_comments,
         "bot_activity_count": bot_activity,
+        "reopened_at": reopens[0] if reopens else None,
+        "reopen_count": len(reopens),
+        "revision_count": len(pushes),
+        "revisions_after_first_review": len(revisions_after_first_review),
     }
 
 
@@ -646,8 +684,20 @@ class BitbucketPoller:
         branch = (
             ((pull_request.get("source") or {}).get("branch") or {}).get("name") or None
         )
-        jira_key = extract_jira_key(branch, pull_request.get("title"),
-                                    projects=self.config.jira_project_keys)
+        # Every field the pull request states its own subject in, in order of
+        # how deliberately a person puts a ticket there. A PR is a work record,
+        # not a prompt: reading all of it is free, and reading only two of the
+        # four is how a PR that names its ticket in the description alone --
+        # or that targets `release/IML-6500` from a scratch branch -- was
+        # counted as having no ticket at all. Only the key is kept; none of
+        # this text reaches an event.
+        destination = (
+            ((pull_request.get("destination") or {}).get("branch") or {})
+            .get("name") or None)
+        jira_key = extract_jira_key(
+            branch, pull_request.get("title"),
+            pull_request.get("description"), destination,
+            projects=validated_projects(self.config.jira_project_keys))
         return (
             make_context(
                 jira_issue_key=jira_key,
@@ -710,6 +760,15 @@ class BitbucketPoller:
                 1 for r in timeline["reviewers"] if r["action"] == "changes_requested"
             ),
             "commits_after_first_review": commits_after_first_review,
+            # Rework, as the review timeline records it. A reopen is the
+            # strongest signal here and was not being read at all; a push after
+            # the first review is the weaker, commoner one. Both are counts of
+            # things that happened, not judgements about them.
+            "reopened_at": timeline["reopened_at"],
+            "reopen_count": timeline["reopen_count"],
+            "revision_count": timeline["revision_count"],
+            "revisions_after_first_review":
+                timeline["revisions_after_first_review"],
             "self_comment_count": timeline["self_comment_count"],
             "bot_comment_count": comments["bot_comment_count"],
             "comment_count": comments["comment_count"],
@@ -877,7 +936,7 @@ class BitbucketPoller:
             jira_key = extract_jira_key(
                 commit_subject(reverted) if reverted else None,
                 commit_subject(revert),
-                projects=self.config.jira_project_keys,
+                projects=validated_projects(self.config.jira_project_keys),
             )
             author_user = (revert.get("author") or {}).get("user")
             events.append(

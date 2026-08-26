@@ -64,6 +64,7 @@ from common import (  # noqa: E402
     make_agent,
     make_context,
     make_link,
+    validated_projects,
     ms_between,
     paginate,
     parse_ts,
@@ -282,8 +283,8 @@ class CiPoller:
                     aggregate[key] = (aggregate[key] or 0) + value
             tests = aggregate
 
-        jira_key = extract_jira_key(ref_name,
-                                    projects=self.config.jira_project_keys)
+        jira_key = extract_jira_key(
+            ref_name, projects=validated_projects(self.config.jira_project_keys))
         return build_event(
             "ci.pipeline.completed",
             completed_on,

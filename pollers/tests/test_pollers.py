@@ -276,7 +276,10 @@ def bitbucket_routes():
 def make_bitbucket_poller(transport=None):
     transport = transport or FakeTransport(bitbucket_routes())
     poller = poll_bitbucket.BitbucketPoller(
-        client_for(transport), "acme", "watchtower", Config(email_salt="test-salt")
+        client_for(transport), "acme", "watchtower",
+        # PRJ is this fixture's real project. Configured on purpose: an
+        # unconfigured poller now emits no key rather than guessing (AR-1).
+        Config(email_salt="test-salt", jira_project_keys=("PRJ",)),
     )
     return poller, transport
 
@@ -326,6 +329,29 @@ class TestJiraKeyExtractionIsAllowListed(unittest.TestCase):
     def test_the_allow_list_is_case_insensitive(self):
         self.assertEqual(common.extract_jira_key("IML-1", projects=("iml",)),
                          "IML-1")
+
+    def test_an_unconfigured_emitter_emits_no_key_rather_than_a_guess(self):
+        """The call site passed `projects=`; the configuration was None.
+
+        Measured 2026-08-26 in `reports/2026-W34/exports/bitbucket.ndjson`:
+        fabricated keys (JUL 20, AUG 11, JUN 9, TC 3, CY 2) outnumbered real
+        ones (IML 7, APR 2) 45 to 9, from a poller whose every call site
+        already read `projects=self.config.jira_project_keys`. Unset env var,
+        None allow-list, guard off. AR-1.
+        """
+        for unset in (None, (), []):
+            self.assertEqual(common.validated_projects(unset), ())
+            self.assertIsNone(
+                common.extract_jira_key(
+                    "fix/AUG-20", projects=common.validated_projects(unset)),
+                "an unconfigured poller must not invent AUG-20")
+
+    def test_a_configured_emitter_still_extracts_real_keys(self):
+        allow = common.validated_projects(self.REAL)
+        self.assertEqual(allow, self.REAL)
+        self.assertEqual(
+            common.extract_jira_key("IML-6500/release/26.8", projects=allow),
+            "IML-6500")
 
 
 class TestPrCreatedCarriesTheCommitEdge(unittest.TestCase):
@@ -984,9 +1010,17 @@ class TestBitbucketPollerEndToEnd(unittest.TestCase):
         self.out = os.path.join(self.tmp.name, "events.ndjson")
         self.state = os.path.join(self.tmp.name, "state.json")
         self.transport = FakeTransport(bitbucket_routes())
+        # PRJ is this fixture's real project. Without the allow-list the
+        # poller now declines to guess a key at all, which is the point.
+        self._prev = os.environ.get("JIRA_PROJECT_KEYS")
+        os.environ["JIRA_PROJECT_KEYS"] = "PRJ"
 
     def tearDown(self):
         self.tmp.cleanup()
+        if self._prev is None:
+            os.environ.pop("JIRA_PROJECT_KEYS", None)
+        else:
+            os.environ["JIRA_PROJECT_KEYS"] = self._prev
 
     def _run(self, extra=()):
         code = poll_bitbucket.main(
@@ -1465,9 +1499,17 @@ class TestCiPoller(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.out = os.path.join(self.tmp.name, "ci.ndjson")
         self.state = os.path.join(self.tmp.name, "state.json")
+        # PRJ is this fixture's real project. Without the allow-list the
+        # poller now declines to guess a key at all, which is the point.
+        self._prev = os.environ.get("JIRA_PROJECT_KEYS")
+        os.environ["JIRA_PROJECT_KEYS"] = "PRJ"
 
     def tearDown(self):
         self.tmp.cleanup()
+        if self._prev is None:
+            os.environ.pop("JIRA_PROJECT_KEYS", None)
+        else:
+            os.environ["JIRA_PROJECT_KEYS"] = self._prev
 
     def test_emits_ci_pipeline_completed_with_test_counts(self):
         transport = FakeTransport(ci_routes())
@@ -2202,3 +2244,67 @@ class TrustStoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
+
+
+class TestReopenAndRework(unittest.TestCase):
+    """A declined PR that comes back is the clearest rework signal Bitbucket
+    gives, and the activity feed was being read for MERGED and DECLINED only.
+    """
+
+    def _timeline(self, activity):
+        return poll_bitbucket.derive_review_timeline(
+            {"author": {"uuid": "{author}"}}, activity)
+
+    @staticmethod
+    def _update(state, date):
+        return {"update": {"state": state, "date": date,
+                           "author": {"uuid": "{author}"}}}
+
+    def test_an_open_after_a_decline_is_a_reopen(self):
+        t = self._timeline([
+            self._update("OPEN", "2026-08-17T09:00:00+00:00"),
+            self._update("DECLINED", "2026-08-18T09:00:00+00:00"),
+            self._update("OPEN", "2026-08-19T09:00:00+00:00"),
+        ])
+        self.assertEqual(t["reopen_count"], 1)
+        self.assertEqual(t["reopened_at"], "2026-08-19T09:00:00.000Z")
+
+    def test_a_pr_that_was_never_declined_has_no_reopen(self):
+        t = self._timeline([
+            self._update("OPEN", "2026-08-17T09:00:00+00:00"),
+            self._update("OPEN", "2026-08-18T09:00:00+00:00"),
+            self._update("MERGED", "2026-08-19T09:00:00+00:00"),
+        ])
+        self.assertEqual(t["reopen_count"], 0)
+        self.assertIsNone(t["reopened_at"])
+        # The second OPEN is a push, and pushes are counted separately.
+        self.assertEqual(t["revision_count"], 1)
+
+    def test_the_creating_open_is_not_a_revision(self):
+        t = self._timeline([self._update("OPEN", "2026-08-17T09:00:00+00:00")])
+        self.assertEqual(t["revision_count"], 0)
+        self.assertEqual(t["revisions_after_first_review"], 0)
+
+    def test_only_pushes_after_a_review_count_as_post_review(self):
+        """A push before anyone looked is drafting, not rework."""
+        t = self._timeline([
+            self._update("OPEN", "2026-08-17T09:00:00+00:00"),
+            self._update("OPEN", "2026-08-17T10:00:00+00:00"),
+            # A real person: no name and no account id is machinery, and
+            # `looks_like_bot` excludes it -- which is correct, and which an
+            # earlier version of this fixture tripped over.
+            {"comment": {"user": {"uuid": "{reviewer}", "nickname": "hana",
+                                  "account_id": "acc-2"},
+                         "created_on": "2026-08-17T11:00:00+00:00"}},
+            self._update("OPEN", "2026-08-17T12:00:00+00:00"),
+        ])
+        self.assertEqual(t["revision_count"], 2)
+        self.assertEqual(t["revisions_after_first_review"], 1)
+
+    def test_an_empty_feed_reports_zero_not_none(self):
+        """These are counts of events in a feed that was read. A feed with no
+        reopen measured zero reopens; that is a measurement, not an absence."""
+        t = self._timeline([])
+        self.assertEqual(t["reopen_count"], 0)
+        self.assertEqual(t["revision_count"], 0)
+        self.assertIsNone(t["reopened_at"])
