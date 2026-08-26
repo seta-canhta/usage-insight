@@ -128,3 +128,40 @@ class PeopleOutputTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class UserAgentTests(unittest.TestCase):
+    """urllib's default agent is refused by the CDN before it reaches us.
+
+    `cli/ship.py` records this: Cloudflare's browser integrity check answers
+    `Python-urllib/3.x` with 403 error 1010, in front of the endpoint, so no
+    token or header of ours can help. Every client here sets one; this one
+    did not, and the failure was a 403 with an empty body that looks nothing
+    like an auth problem.
+    """
+
+    def test_every_request_names_the_client(self):
+        os.environ["INSIGHT_ADMIN_TOKEN"] = "t"
+        self.addCleanup(os.environ.pop, "INSIGHT_ADMIN_TOKEN", None)
+        seen = {}
+
+        class FakeResponse:
+            status = 200
+
+            def read(self):
+                return b"{}"
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *a):
+                return False
+
+        def fake_urlopen(request, **kwargs):
+            seen["agent"] = request.get_header("User-agent")
+            return FakeResponse()
+
+        with mock.patch("urllib.request.urlopen", fake_urlopen):
+            admin.call("GET", "/v1/people")
+        self.assertIsNotNone(seen["agent"])
+        self.assertNotIn("urllib", seen["agent"].lower())

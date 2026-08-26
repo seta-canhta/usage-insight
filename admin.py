@@ -38,6 +38,13 @@ import common  # noqa: E402
 ADMIN_ENV = os.path.join(_ROOT, ".admin.env")
 DEFAULT_ENDPOINT = "http://127.0.0.1:8479"
 
+#: Sent as ``User-Agent``, for the same reason ``cli/ship.py`` sends one:
+#: urllib's default is ``Python-urllib/3.x``, and Cloudflare's browser
+#: integrity check answers that with a 403 before the request reaches the
+#: endpoint, so no header or token of ours can help. Verified against the live
+#: hostname -- the same call is 200 as `curl` and 403 as `Python-urllib`.
+USER_AGENT = "seta-insight-admin/1 (+usage-insight)"
+
 
 # --------------------------------------------------------------------------
 # configuration
@@ -88,6 +95,7 @@ def call(method: str, path: str, payload: Optional[Dict[str, Any]] = None,
     request = urllib.request.Request(
         endpoint() + path, data=body, method=method,
         headers={"Authorization": "Bearer " + admin_token(),
+                 "User-Agent": USER_AGENT,
                  "Content-Type": "application/json"})
     try:
         with urllib.request.urlopen(request, timeout=timeout,
