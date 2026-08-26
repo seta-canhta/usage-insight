@@ -26,8 +26,12 @@ RUN python -m pip install --no-cache-dir -r /app/server/requirements.txt
 
 # The service, and the client module it shares rather than reimplements.
 # cli/identity.py is the whitelist contract; a second copy of it in this image
-# is exactly the drift ARCHITECTURE.md refuses. tests/ is deliberately absent.
-COPY server/proxy.py server/store.py /app/server/
+# would be exactly the drift this project refuses. tests/ is deliberately absent.
+#
+# Every server/*.py the process imports has to be named here. A module added to
+# server/ and not to this line is a container that starts, passes its health
+# check, and fails on the first request that reaches the missing import.
+COPY server/proxy.py server/store.py server/registry.py /app/server/
 COPY cli/identity.py /app/cli/identity.py
 
 # The watchdog, which runs from this same image with a different entrypoint

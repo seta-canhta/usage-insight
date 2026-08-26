@@ -819,3 +819,26 @@ class EnrolmentTests(unittest.TestCase):
         with open(self.allowed_path, "w", encoding="utf-8") as handle:
             handle.write(identity.whitelist_line(MINH, secret) + "\n")
         self.assertEqual(self.people.identify(secret), MINH)
+
+
+class DockerfileTests(unittest.TestCase):
+    """The image has to carry every module the process imports.
+
+    `server/registry.py` was added and not named in the Dockerfile. That
+    container starts, passes its health check, and fails on the first request
+    that reaches the missing import -- which is a worse failure than not
+    starting, because the health check says it is fine.
+    """
+
+    def test_every_server_module_is_copied_into_the_image(self):
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        dockerfile = os.path.join(root, "Dockerfile")
+        with open(dockerfile, "r", encoding="utf-8") as handle:
+            text = handle.read()
+        for name in sorted(os.listdir(root)):
+            if not name.endswith(".py") or name.startswith("test"):
+                continue
+            if name in ("verify_s3.py",):   # a diagnostic, run from a checkout
+                continue
+            self.assertIn("server/" + name, text,
+                          "{} is not COPYd into the image".format(name))
