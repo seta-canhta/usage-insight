@@ -15,9 +15,17 @@
 # reverse proxy in the next container could not reach it -- and says so in its
 # startup log. That warning is about a host bind; here there is no host bind.
 #
-# Configuration lives in ./etc, mounted read-only:
-#   etc/allowed.env    one `./insight whoami` line per engineer (fingerprints)
-#   etc/admin.token    the admin token, guarding the read routes
+# Two config directories, and the split is the point:
+#
+#   ./etc         read-only. admin.token, and nothing this process may rewrite.
+#   ./registry    read-write. allowed.env and roster.txt, which the endpoint
+#                 writes when a machine enrols itself.
+#
+# Self-enrolment means the process has to write one of its own inputs. Putting
+# that file in the same mount as the admin token would hand it the ability to
+# rewrite its own authentication, which is a strictly larger permission than
+# the feature needs. So the writable pair moves out, and /etc/insight stays
+# read-only -- the token is the one thing here that is a credential.
 #
 # Both are files rather than environment variables on purpose: `docker inspect`
 # prints the environment to anyone who can reach the Docker daemon, and on a
@@ -42,7 +50,14 @@ services:
       # credential at all, and the report pipeline cannot tell the difference:
       # importers/pull.py reads through this endpoint, never from the bucket.
       INSIGHT_STORE: "${INSIGHT_STORE:-file:///var/lib/insight}"
-      INSIGHT_ALLOWED_FILE: /etc/insight/allowed.env
+      # In the writable mount: the endpoint appends to this when a machine
+      # enrols. Still a file an operator can read and edit; still re-read when
+      # it changes, so a hand edit needs no restart.
+      INSIGHT_ALLOWED_FILE: /var/lib/insight-registry/allowed.env
+      # Who is expected to report. An address on this list may enrol itself,
+      # which is what removes the fingerprint-by-chat step. Without it the
+      # whitelist is fixed and enrolment 403s -- so this is opt-in.
+      INSIGHT_ROSTER_FILE: /var/lib/insight-registry/roster.txt
       INSIGHT_ADMIN_TOKEN_FILE: /etc/insight/admin.token
       # The installer served at GET /install, so onboarding is one curl instead
       # of a git clone. Copy the install.sh from the release into ./etc beside
@@ -97,6 +112,7 @@ services:
 
     volumes:
       - "${INSIGHT_CONF:-./etc}:/etc/insight:ro"
+      - "${INSIGHT_REGISTRY:-./registry}:/var/lib/insight-registry"
       - "${INSIGHT_DATA:-./data}:/var/lib/insight"   # only the file:// store
 
     # It reads a whitelist and writes bundles. It needs nothing else.
@@ -140,6 +156,8 @@ services:
 
     volumes:
       - "${INSIGHT_CONF:-./etc}:/etc/insight:ro"
+      # Read-only here. The watchdog reads the roster; it never changes it.
+      - "${INSIGHT_REGISTRY:-./registry}:/var/lib/insight-registry:ro"
       - "${INSIGHT_STATE:-./state}:/var/lib/insight-watch"
 
     entrypoint: ["/bin/sh", "-c"]
@@ -150,7 +168,7 @@ services:
       - |
         while true; do
           python3 /app/importers/watch.py \
-            --roster /etc/insight/roster.txt \
+            --roster /var/lib/insight-registry/roster.txt \
             --endpoint http://insight-proxy:8479 \
             --token "$$(cat /etc/insight/admin.token)" \
             --state /var/lib/insight-watch/state.json || true

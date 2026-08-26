@@ -14,8 +14,8 @@ jobs:
   release:
     # GitHub-hosted, and explicitly NOT the self-hosted runners.
     #
-    # server/README.md records that the endpoint host runs two self-hosted
-    # Actions runners as the same user that owns the Docker socket, and refuses
+    # The endpoint host runs two self-hosted Actions runners as the same user
+    # that owns the Docker socket, and this project refuses
     # to put an S3 credential on that box for exactly that reason. Building the
     # artifact that then installs itself on fourteen laptops is a strictly
     # larger thing to put inside that blast radius than a bucket key. Pinned
