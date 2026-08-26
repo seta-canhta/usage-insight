@@ -41,7 +41,7 @@ def bundle_bytes(events=1, machine="a3f9c2b1f0e1"):
     body = "".join(json.dumps({"event_id": "evt_%d" % i}, sort_keys=True) + "\n"
                    for i in range(events))
     manifest = {
-        "format": "seta-insight-bundle/1", "schema_version": "1.0.0",
+        "format": "seta-insight-bundle/1", "schema_version": "1.1.0",
         "machine_id": machine, "packed_at": "2026-08-24T00:00:00Z",
         "window_start": "2026-08-17T00:00:00Z",
         "window_end": "2026-08-23T23:59:59Z",
@@ -79,7 +79,7 @@ class ProxyTestCase(unittest.TestCase):
             "Content-Type": "application/x-ndjson",
             "X-Insight-Machine": "a3f9c2b1f0e1",
             "X-Insight-Window": "2026-08-17/2026-08-23",
-            "X-Insight-Schema": "1.0.0",
+            "X-Insight-Schema": "1.1.0",
             "X-Insight-Format": "seta-insight-bundle/1",
             "X-Insight-Digest": "sha256=" + hashlib.sha256(body).hexdigest(),
             "Authorization": "Bearer " + (secret or self.secrets[person]),
@@ -279,6 +279,14 @@ class ReadRouteTests(ProxyTestCase):
         self.assertEqual(status, 200)
         self.assertEqual(self.json_of(raw)["objects"], [])
 
+    def test_healthz_advertises_the_schemas_it_will_accept(self):
+        # A client deciding whether to replace itself needs to know what this
+        # endpoint takes. Protocol, not disclosure -- and worth nothing to
+        # anyone who cannot already authenticate.
+        _, raw = self.get("/healthz", token=None)
+        self.assertEqual(self.json_of(raw)["schemas"],
+                         sorted(proxy_mod.KNOWN_SCHEMAS))
+
     def test_healthz_needs_no_credential(self):
         status, raw = self.get("/healthz", token=None)
         self.assertEqual(status, 200)
@@ -323,7 +331,7 @@ class UploadOnlyListenerTests(ProxyTestCase):
                 "Content-Type": "application/x-ndjson",
                 "X-Insight-Machine": "a3f9c2b1f0e1",
                 "X-Insight-Window": "2026-08-17/2026-08-23",
-                "X-Insight-Schema": "1.0.0",
+                "X-Insight-Schema": "1.1.0",
                 "X-Insight-Format": "seta-insight-bundle/1",
                 "X-Insight-Digest": "sha256=" + hashlib.sha256(
                     bundle_bytes()).hexdigest(),
@@ -407,6 +415,232 @@ class AdminTokenSourceTests(unittest.TestCase):
     def test_nothing_at_all_refuses_to_start(self):
         with self.assertRaises(SystemExit):
             proxy_mod.load_admin_token(None, None)
+
+
+#: A rendered ``server/install.sh.in``, cut down to the four assignments the
+#: endpoint reads. Kept in the shape the real one has -- the point of
+#: ``install_manifest`` is that it parses what the release job produces.
+RENDERED = ("""#!/bin/sh
+set -eu
+VERSION="0.4.0"
+SHA256="%s"
+URL="https://github.com/seta-canhta/usage-insight/releases/download/v0.4.0/insight-0.4.0.pyz"
+ENDPOINT="https://aeris-insight.seta-international.com"
+SCHEMA="1.1.0"
+main "$@"
+""" % ("d" * 64)).encode()
+
+
+class InstallManifestTests(unittest.TestCase):
+    """``/install.json`` is derived from ``install.sh``, never configured twice.
+
+    A second file holding the same version and digest is a second file that can
+    disagree with the first, and the disagreement is invisible from outside:
+    laptops either update to something the installer does not serve, or refuse
+    an update that exists. So the endpoint parses the script it already has.
+    """
+
+    def test_the_four_fields_come_out(self):
+        got = json.loads(proxy_mod.install_manifest(RENDERED))
+        self.assertEqual(got["version"], "0.4.0")
+        self.assertEqual(got["sha256"], "d" * 64)
+        self.assertEqual(got["client_schema"], "1.1.0")
+
+    def test_it_advertises_what_this_endpoint_actually_accepts(self):
+        # Not a constant typed twice: a client compares its candidate release
+        # against exactly the set check_upload() enforces.
+        got = json.loads(proxy_mod.install_manifest(RENDERED))
+        self.assertEqual(got["schemas"], sorted(proxy_mod.KNOWN_SCHEMAS))
+
+    def test_nothing_configured_is_no_manifest_rather_than_an_error(self):
+        self.assertIsNone(proxy_mod.install_manifest(None))
+        self.assertIsNone(proxy_mod.install_manifest(b""))
+
+    def test_an_unrendered_template_refuses_to_start(self):
+        # The failure this exists to catch: server/install.sh.in copied into
+        # /etc/insight instead of the rendered install.sh from the release.
+        template = RENDERED.replace(b'"0.4.0"', b'"@VERSION@"')
+        with self.assertRaises(SystemExit) as caught:
+            proxy_mod.install_manifest(template)
+        self.assertIn("@VERSION@", str(caught.exception))
+
+    def test_a_script_with_no_digest_refuses_to_start(self):
+        for broken in (RENDERED.replace(b'SHA256="' + b"d" * 64 + b'"', b""),
+                       RENDERED.replace(b"d" * 64, b"not-a-digest")):
+            with self.assertRaises(SystemExit):
+                proxy_mod.install_manifest(broken)
+
+    def test_a_non_https_artifact_url_refuses_to_start(self):
+        broken = RENDERED.replace(b"https://github.com", b"http://github.com")
+        with self.assertRaises(SystemExit):
+            proxy_mod.install_manifest(broken)
+
+    def test_something_that_is_not_the_installer_refuses_to_start(self):
+        with self.assertRaises(SystemExit):
+            proxy_mod.install_manifest(b"#!/bin/sh\necho hello\n")
+
+
+class InstallRouteTests(ProxyTestCase):
+    """``GET /install`` -- the one public route that is not an upload.
+
+    Exercised on the *public* listener, because that is the one it exists for:
+    ``curl -fsSL https://.../install | sh`` comes from a laptop that has no
+    credential yet and, on a first install, no ``insight`` either.
+
+    Everything here is really one assertion said four ways -- the bytes served
+    are a constant, and nothing in a request can change which bytes they are.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.script = RENDERED
+        handler = proxy_mod.build_handler(
+            self.store, self.allowed, ADMIN, read_routes=False,
+            install_script=self.script)
+        self.public = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.public_base = "http://127.0.0.1:{}".format(
+            self.public.server_address[1])
+        threading.Thread(target=self.public.serve_forever, daemon=True).start()
+        self.addCleanup(self.public.server_close)
+        self.addCleanup(self.public.shutdown)
+
+    def fetch(self, path):
+        request = urllib.request.Request(self.public_base + path)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, response.read(), dict(response.headers)
+        except urllib.error.HTTPError as exc:
+            return exc.code, exc.read(), dict(exc.headers)
+
+    def test_the_installer_is_served_with_no_credential(self):
+        status, body, _ = self.fetch("/install")
+        self.assertEqual(status, 200)
+        self.assertEqual(body, self.script)
+
+    def test_install_sh_is_the_same_bytes(self):
+        self.assertEqual(self.fetch("/install.sh")[1], self.fetch("/install")[1])
+
+    def test_it_is_served_as_text_a_shell_can_read(self):
+        _, _, headers = self.fetch("/install")
+        self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
+        self.assertEqual(headers["Cache-Control"], "public, max-age=300")
+
+    def test_a_traversal_cannot_reach_the_admin_token(self):
+        # The route takes no path parameter, so there is nothing to traverse
+        # *through* -- this asserts the absence stays absent. /etc/insight is
+        # mounted into the container beside allowed.env and admin.token.
+        for path in ("/install/../etc/insight/admin.token",
+                     "/install/../../etc/insight/allowed.env",
+                     "/install.sh/../admin.token"):
+            status, body, _ = self.fetch(path)
+            self.assertEqual(status, 404, path)
+            self.assertNotIn(b"insight installer", body, path)
+
+    def test_a_query_string_changes_nothing(self):
+        for path in ("/install?f=/etc/insight/admin.token",
+                     "/install?../../etc/passwd", "/install.sh?v=2"):
+            status, body, _ = self.fetch(path)
+            self.assertEqual(status, 200, path)
+            self.assertEqual(body, self.script, path)
+
+    def test_a_path_under_install_is_not_a_route(self):
+        for path in ("/install.sh/x", "/install/x", "/install/", "/installer",
+                     "/install.json/x"):
+            self.assertEqual(self.fetch(path)[0], 404, path)
+
+    def test_the_manifest_is_served_beside_the_script(self):
+        status, body, headers = self.fetch("/install.json")
+        self.assertEqual(status, 200)
+        self.assertEqual(headers["Content-Type"], "application/json; charset=utf-8")
+        got = json.loads(body.decode())
+        self.assertEqual(got["version"], "0.4.0")
+        self.assertEqual(got["schemas"], sorted(proxy_mod.KNOWN_SCHEMAS))
+
+    def test_the_manifest_and_the_script_cannot_disagree(self):
+        # Derived from the same bytes, so this is a tautology -- which is the
+        # entire point of deriving it rather than configuring it separately.
+        manifest = json.loads(self.fetch("/install.json")[1].decode())
+        script = self.fetch("/install")[1].decode()
+        self.assertIn('VERSION="{}"'.format(manifest["version"]), script)
+        self.assertIn('SHA256="{}"'.format(manifest["sha256"]), script)
+
+    def test_the_manifest_carries_no_secret(self):
+        body = self.fetch("/install.json")[1]
+        self.assertNotIn(ADMIN.encode(), body)
+        for person in self.allowed:
+            self.assertNotIn(person.encode(), body)
+
+    def test_the_read_routes_are_still_404_on_this_listener(self):
+        # Adding a public route must not have opened the others by accident.
+        request = urllib.request.Request(
+            self.public_base + "/v1/bundles?week=2026-W34",
+            headers={"Authorization": "Bearer " + ADMIN})
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                status = response.status
+        except urllib.error.HTTPError as exc:
+            status = exc.code
+        self.assertEqual(status, 404)
+
+
+class InstallRouteUnsetTests(ProxyTestCase):
+    """No ``--install-script`` means the route does not exist.
+
+    404 rather than 503: the same shape as the read-routes guard. A deployment
+    that does not serve this does not need to admit the route is there.
+    """
+
+    def test_unset_is_404_not_an_empty_200(self):
+        status, body = self.get("/install", token=None)
+        self.assertEqual(status, 404)
+        self.assertEqual(self.get("/install.sh", token=None)[0], 404)
+        self.assertEqual(self.get("/install.json", token=None)[0], 404)
+        self.assertNotIn(b"#!/bin/sh", body)
+
+
+class InstallScriptLoadingTests(unittest.TestCase):
+    """It is read once, at startup, from a name given on the command line.
+
+    That is not a performance choice. It is the reason the route can have no
+    path parameter: there is no per-request filesystem access to point at
+    anything, so there is no traversal to find.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="insight-install-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def write(self, body):
+        path = os.path.join(self.tmp, "install.sh")
+        with open(path, "wb") as handle:
+            handle.write(body)
+        return path
+
+    def test_nothing_configured_is_none_rather_than_an_error(self):
+        self.assertIsNone(proxy_mod.load_install_script(None))
+        self.assertIsNone(proxy_mod.load_install_script(""))
+
+    def test_a_file_is_read_verbatim(self):
+        body = b"#!/bin/sh\nset -eu\nmain \"$@\"\n"
+        self.assertEqual(proxy_mod.load_install_script(self.write(body)), body)
+
+    def test_a_missing_file_refuses_to_start_and_names_it(self):
+        missing = os.path.join(self.tmp, "nope.sh")
+        with self.assertRaises(SystemExit) as caught:
+            proxy_mod.load_install_script(missing)
+        self.assertIn(missing, str(caught.exception))
+
+    def test_an_empty_file_refuses_to_start(self):
+        # Serving zero bytes to `| sh` is a silent no-op install: the shell
+        # exits 0 having done nothing, and the engineer types `insight setup`
+        # into a machine with no insight on it.
+        with self.assertRaises(SystemExit):
+            proxy_mod.load_install_script(self.write(b"\n  \n"))
+
+    def test_something_far_too_large_is_not_the_installer(self):
+        with self.assertRaises(SystemExit):
+            proxy_mod.load_install_script(
+                self.write(b"x" * (proxy_mod.MAX_INSTALL_SCRIPT + 1)))
 
 
 class TraversalTests(ProxyTestCase):

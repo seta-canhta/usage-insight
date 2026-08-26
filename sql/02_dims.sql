@@ -107,7 +107,7 @@ OPTIONS (
 -- =====================================================================================
 CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.core.dim_model_pricing`
 (
-  model_id                 STRING  NOT NULL OPTIONS (description = 'EXACT runtime model id as reported by gen_ai.response.model, e.g. "GPT-5.3-Codex". Must match byte-for-byte — a mismatch produces a DQ-6 unpriced-model finding and cost_usd = NULL, never 0.'),
+  model_id                 STRING  NOT NULL OPTIONS (description = 'EXACT runtime model id. Since 1.1.0 that means the KEY of session.shutdown.modelMetrics in the Copilot session journal, e.g. "claude-sonnet-4.6"; pre-cutover rows were keyed on the span field gen_ai.response.model. Must match byte-for-byte — a mismatch produces a DQ-6 unpriced-model finding and cost_usd = NULL, never 0.'),
   model_family             STRING           OPTIONS (description = 'Bounded rollup dimension, e.g. "gpt-5", "claude-sonnet". Used for reporting when individual ids churn.'),
   vendor                   STRING           OPTIONS (description = 'Bounded: openai | anthropic | github | other.'),
 
@@ -162,6 +162,25 @@ OPTIONS (
 -- effective_from is set to the first AI-marked commit date observed in this
 -- repository (2026-03-25, design §9.1b [V]) so that the window covers all telemetry
 -- the platform could ever have collected.
+--
+-- ⚠ PROVENANCE CORRECTED 2026-08-26 (contract 1.1.0). The note under these rows used
+-- to read "Verified against real Copilot Chat spans, 2026-08-19", where "the wire"
+-- meant the OTel attribute gen_ai.response.model. That stream is gone. The key the
+-- pricing join now matches is the MAP KEY of session.shutdown.modelMetrics in
+-- Copilot CLI's own journal, which is a different field from a different producer —
+-- so the old sentence was a provenance claim about a source no longer read. Left
+-- alone it would have looked like verification of something nobody had checked.
+--
+-- The join at 04_transform_run.sql is EXACT on model_id, so a one-character drift
+-- between these seeds and the journal keys prices EVERYTHING to NULL. Re-check the
+-- keys, do not assume them:
+--
+--   python3 cli/copilot_read.py --root ~/.copilot 2>/dev/null \
+--     | python3 -c 'import json,sys;print(sorted({json.loads(l)["attributes"]["model_id"] \
+--         for l in sys.stdin if json.loads(l)["event_type"]=="model.call"}))'
+--
+-- DQ-MODEL in 07_dq_checks.sql runs the warehouse-side equivalent nightly, so a model
+-- id that appears on the wire and not here becomes a finding rather than a silent NULL.
 -- -------------------------------------------------------------------------------------
 INSERT INTO `${PROJECT_ID}.core.dim_model_pricing`
   (model_id, model_family, vendor,
@@ -170,35 +189,42 @@ INSERT INTO `${PROJECT_ID}.core.dim_model_pricing`
    is_placeholder, source_url, notes, updated_at)
 VALUES
   -- ⚠ MODEL IDS BELOW ARE THE ONES OBSERVED ON THE WIRE, not the ones written in
-  -- agent frontmatter. Copilot reports gen_ai.response.model in lowercase,
-  -- hyphenated, sometimes date-stamped form:
-  --     frontmatter "Claude Sonnet 4.6"  ->  wire "claude-sonnet-4.6"
-  --     (no frontmatter equivalent)      ->  wire "gpt-4o-mini-2024-07-18"
-  -- The join in 04_transform_run.sql is EXACT on model_id, so seeding the
-  -- frontmatter spelling would miss every row and price everything to NULL.
-  -- Verified against real Copilot Chat spans, 2026-08-19.
+  -- agent frontmatter, which spells the same model differently:
+  --     frontmatter "Claude Sonnet 4.6"  ->  journal key "claude-sonnet-4.6"
+  -- Seeding the frontmatter spelling would miss every row and price everything to
+  -- NULL, because the join is exact.
+  --
+  -- [1.1.0 — CURRENT] Observed as a session.shutdown.modelMetrics key in Copilot
+  -- CLI's own journal, measured 2026-08-26 across 22 sessions on the reference
+  -- machine. This is the only id the live source has produced.
   ('claude-sonnet-4.6', 'claude-sonnet', 'anthropic',
    DATE '2026-03-25', NULL,
    NULL, NULL, NULL,
    TRUE, NULL,
-   'PLACEHOLDER ROW — NOT VENDOR PRICING. model_id OBSERVED via gen_ai.response.model [V]. Rates intentionally NULL so cost_usd resolves to NULL and DQ-6 fires, per CONTRACT §4. Populate with sql/09_set_model_price.sql.',
+   'PLACEHOLDER ROW — NOT VENDOR PRICING. model_id OBSERVED 2026-08-26 as a session.shutdown.modelMetrics key in the Copilot CLI journal [V] — the 1.1.0 source. Rates intentionally NULL so cost_usd resolves to NULL and DQ-6 fires, per CONTRACT §4. Populate with sql/09_set_model_price.sql.',
    CURRENT_TIMESTAMP()),
 
+  -- [LEGACY — pre-cutover only] Seen on the OTel span stream as
+  -- gen_ai.response.model, 2026-08-19. That stream is frozen (see 01_raw.sql), so
+  -- this id will not appear on a new event. It is KEPT because raw.otel_span rows
+  -- inside the 90-day window still reprocess through the legacy branch of
+  -- 04_transform_run.sql, and an unpriceable id there would restate historical cost
+  -- to NULL. Delete it when the last pre-cutover partition expires, not before.
   ('gpt-4o-mini-2024-07-18', 'gpt-4o', 'openai',
    DATE '2026-03-25', NULL,
    NULL, NULL, NULL,
    TRUE, NULL,
-   'PLACEHOLDER ROW — NOT VENDOR PRICING. model_id OBSERVED via gen_ai.response.model [V]. Copilot uses this small model for internal housekeeping (conversation titling), so it appears even when the agent declares a different model. Populate with 09_set_model_price.sql.',
+   'PLACEHOLDER ROW — NOT VENDOR PRICING. LEGACY: model_id observed 2026-08-19 via gen_ai.response.model on the now-frozen span stream [V]. Copilot used this small model for internal housekeeping (conversation titling), so it appeared even when the agent declared a different model. Retained to keep pre-cutover reprocessing priceable. Populate with 09_set_model_price.sql.',
    CURRENT_TIMESTAMP()),
 
   -- Declared in agents/development/developer.implementer.agent.md frontmatter but
-  -- NOT yet observed on the wire. Kept so a run using it prices rather than
+  -- NOT observed on either source. Kept so a run using it prices rather than
   -- silently failing DQ-6; remove if it never appears.
   ('GPT-5.3-Codex', 'gpt-5', 'openai',
    DATE '2026-03-25', NULL,
    NULL, NULL, NULL,
    TRUE, NULL,
-   'PLACEHOLDER ROW — NOT VENDOR PRICING. model_id taken from agent frontmatter [V], NOT yet confirmed on the wire. Populate with 09_set_model_price.sql.',
+   'PLACEHOLDER ROW — NOT VENDOR PRICING. model_id taken from agent frontmatter [V], NOT confirmed on the span stream or in the session journal. Populate with 09_set_model_price.sql.',
    CURRENT_TIMESTAMP());
 
 
@@ -209,8 +235,9 @@ VALUES
 -- "agent version before vs after a prompt change" experiment in design §9.1 possible.
 --
 -- model_declared_id is the frontmatter value. The transform compares it against the
--- model the runtime actually reported (raw.otel_span.gen_ai_response_model) to detect
--- MODEL DRIFT — an agent declaring GPT-5.3-Codex whose runs are answered by something
+-- model the runtime actually reported (since 1.1.0 the model.call `model_id`, i.e. the
+-- session.shutdown.modelMetrics key; before the cutover, raw.otel_span
+-- .gen_ai_response_model) to detect MODEL DRIFT — an agent declaring GPT-5.3-Codex whose runs are answered by something
 -- else is a finding, not a rounding error, because the cost comparison in §9.1
 -- silently becomes meaningless.
 --

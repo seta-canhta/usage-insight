@@ -17,6 +17,7 @@ import sys
 import tempfile
 import time
 import unittest
+import unittest.mock
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,12 +27,22 @@ class AutoTestCase(unittest.TestCase):
         self.home = tempfile.mkdtemp(prefix="insight-auto-")
         os.environ["SETA_INSIGHT_HOME"] = self.home
         os.environ["SETA_INSIGHT_ENDPOINT"] = "https://endpoint.test"
+        # Every local source is pointed at the sandbox, not at this machine.
+        # Without this, `auto` read the developer's real VS Code chat store --
+        # 937 sessions on the machine this was written on -- once per test:
+        # four minutes of suite time, and tests touching data they have no
+        # business reading. A sandbox that leaks into $HOME is not a sandbox.
+        os.environ["COPILOT_HOME"] = os.path.join(self.home, "copilot")
+        os.environ["VSCODE_HOME"] = os.path.join(self.home, "vscode")
         sys.modules.pop("insight", None)
+        sys.modules.pop("vscode_read", None)
+        sys.modules.pop("copilot_read", None)
         import insight
         self.insight = insight
         self.addCleanup(shutil.rmtree, self.home, True)
-        self.addCleanup(os.environ.pop, "SETA_INSIGHT_HOME", None)
-        self.addCleanup(os.environ.pop, "SETA_INSIGHT_ENDPOINT", None)
+        for name in ("SETA_INSIGHT_HOME", "SETA_INSIGHT_ENDPOINT",
+                     "COPILOT_HOME", "VSCODE_HOME"):
+            self.addCleanup(os.environ.pop, name, None)
 
     def run_cli(self, *argv):
         buffer = io.StringIO()
@@ -67,12 +78,14 @@ class AutoTestCase(unittest.TestCase):
         with open(self.insight.LOG_PATH, "r", encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
 
-    def fake_ship(self, receipts):
+    def fake_ship(self, receipts, fail=False):
         """Replace the network with something that records what it was given."""
         import ship as ship_mod
         sent = []
 
         def ship_bundle(path, endpoint, token=None, previous_token=None, **kw):
+            if fail:
+                raise ship_mod.ShipError("endpoint unreachable (test)")
             # Mirrors the real receipt, content_sha256 included. `auto` dedupes
             # on that field, so a fake without it would let every one of these
             # tests pass against code that uploads hourly duplicates.
@@ -106,6 +119,13 @@ class TestQuietHours(AutoTestCase):
         self.assertEqual(len(sent), 1, "second run re-uploaded unchanged data")
         self.assertEqual(self.log_lines()[-1]["event"], "no_change")
 
+    def expire_ship_stamp(self):
+        """Push the upload stamp far enough back that a run is due."""
+        path = self.insight.SHIP_STAMP
+        if os.path.exists(path):
+            old = time.time() - self.insight.SHIP_MIN_INTERVAL_S - 60
+            os.utime(path, (old, old))
+
     def test_an_unchanged_hour_leaves_no_bundle_behind(self):
         self.init()
         self.seed()
@@ -115,15 +135,49 @@ class TestQuietHours(AutoTestCase):
         self.run_cli("auto")
         self.assertEqual(len(os.listdir(self.insight.REPORTS_DIR)), before)
 
-    def test_new_events_are_uploaded_on_the_next_run(self):
+    def test_new_events_are_uploaded_on_the_next_due_run(self):
+        # Uploads are batched: collection runs on Copilot activity, which on a
+        # busy machine is often, and shipping each trigger would put dozens of
+        # nearly-empty objects a day on the endpoint. So the second run sends
+        # only once its interval has passed -- and it does send, whole.
         self.init()
         self.seed(tag="a")
         sent = self.fake_ship({})
         self.run_cli("auto")
         self.seed(tag="b")
+        self.expire_ship_stamp()
         self.run_cli("auto")
         self.assertEqual(len(sent), 2)
         self.assertNotEqual(sent[0]["content_sha256"], sent[1]["content_sha256"])
+
+    def test_a_second_run_inside_the_interval_is_held_not_dropped(self):
+        # Held, not lost: the bundle stays on disk and the next due run ships
+        # the day whole, because `pack` re-seals the same day.
+        self.init()
+        self.seed(tag="a")
+        sent = self.fake_ship({})
+        self.run_cli("auto")
+        self.assertEqual(len(sent), 1)
+
+        self.seed(tag="b")
+        self.run_cli("auto")                     # inside the interval
+        self.assertEqual(len(sent), 1, "shipped inside the batching interval")
+        self.assertEqual(self.log_lines()[-1]["event"], "batched")
+
+        self.expire_ship_stamp()
+        self.run_cli("auto")
+        self.assertEqual(len(sent), 2, "the held bundle never went")
+        self.assertNotEqual(sent[0]["content_sha256"], sent[1]["content_sha256"])
+
+    def test_a_failed_upload_leaves_the_next_run_due(self):
+        # The stamp is written on success only. A machine whose endpoint was
+        # down must retry on the next trigger, not wait out an interval it
+        # never used.
+        self.init()
+        self.seed(tag="a")
+        self.fake_ship({}, fail=True)
+        self.run_cli("auto")
+        self.assertTrue(self.insight.ship_due())
 
     def test_a_quiet_day_uploads_one_empty_bundle_then_stops(self):
         # An empty bundle with a declared day window is a *measured* zero: the
@@ -165,12 +219,12 @@ class TestKeepsGoing(AutoTestCase):
         def explode(args):
             raise RuntimeError("no span file")
 
-        self.addCleanup(setattr, self.insight, "cmd_otel", self.insight.cmd_otel)
-        self.insight.cmd_otel = explode
+        self.addCleanup(setattr, self.insight, "cmd_copilot", self.insight.cmd_copilot)
+        self.insight.cmd_copilot = explode
 
         self.run_cli("auto")
         self.assertEqual(len(sent), 1)
-        self.assertTrue(any("otel" in p for p in self.log_lines()[-1]["problems"]))
+        self.assertTrue(any("copilot" in p for p in self.log_lines()[-1]["problems"]))
 
     def test_a_failed_upload_keeps_the_bundle_for_the_next_run(self):
         self.init()
@@ -288,3 +342,101 @@ class TestConsentText(AutoTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestTheCopilotHook(AutoTestCase):
+    """Collection fires on activity, and must never be felt.
+
+    The hook sits in the latency path of somebody's editor: `PreToolUse` runs
+    before every tool call, and there were 2,062 of those in 22 measured
+    sessions. It has a 5s budget it should never approach.
+    """
+
+    def fake_spawn(self):
+        """Record what would be detached, without detaching it.
+
+        Spawning for real leaves an orphan collector per test. What matters
+        here is that the hook hands the work off rather than doing it.
+        """
+        import subprocess as sp
+        spawned = []
+
+        def popen(argv, **kw):
+            spawned.append((argv, kw))
+            return unittest.mock.Mock()
+
+        self.addCleanup(setattr, sp, "Popen", sp.Popen)
+        sp.Popen = popen
+        return spawned
+
+    def test_the_hook_returns_without_collecting(self):
+        self.init()
+        self.seed()
+        sent = self.fake_ship({})
+        spawned = self.fake_spawn()
+        code, _ = self.run_cli("hook")
+        self.assertEqual(code, 0)
+        # Handed off: the work does not happen inside this call.
+        self.assertEqual(len(sent), 0)
+        self.assertEqual(len(spawned), 1)
+        self.assertEqual(spawned[0][0][-1], "auto")
+        # Detached, or a slow collector would hold the editor open.
+        self.assertTrue(spawned[0][1].get("start_new_session"))
+
+    def test_a_second_hook_inside_the_debounce_does_nothing(self):
+        # Otherwise one Copilot session spawns a collector per tool call.
+        self.init()
+        self.fake_spawn()
+        self.run_cli("hook")
+        first = os.path.getmtime(self.insight.HOOK_STAMP)
+        self.run_cli("hook")
+        self.assertEqual(os.path.getmtime(self.insight.HOOK_STAMP), first)
+
+    def test_the_stamp_is_written_before_the_run_not_after(self):
+        # If collection hangs or dies, the next tool call must not immediately
+        # start another one.
+        self.init()
+        self.fake_spawn()
+        self.run_cli("hook")
+        self.assertTrue(os.path.exists(self.insight.HOOK_STAMP))
+
+    def test_an_uninitialised_machine_is_silent(self):
+        # Someone may install the hook and never run setup. That must cost
+        # nothing and say nothing.
+        code, out = self.run_cli("hook")
+        self.assertEqual(code, 0)
+        self.assertEqual(out.strip(), "")
+
+    def test_now_collects_in_the_foreground(self):
+        self.init()
+        self.seed()
+        sent = self.fake_ship({})
+        self.run_cli("hook", "--now")
+        self.assertEqual(len(sent), 1)
+
+    def test_installing_the_hook_keeps_somebody_elses(self):
+        # Both pilot machines already carry `rtk-rewrite.json`. Copilot reads
+        # the directory, so ours is its own file and theirs is untouched.
+        hooks = os.path.join(self.insight.COPILOT_ROOT, "hooks")
+        os.makedirs(hooks, exist_ok=True)
+        theirs = os.path.join(hooks, "rtk-rewrite.json")
+        with open(theirs, "w", encoding="utf-8") as handle:
+            handle.write('{"version": 1}')
+        self.insight.install_copilot_hook()
+        self.assertTrue(os.path.exists(theirs))
+        self.assertTrue(os.path.exists(self.insight.COPILOT_HOOK_PATH))
+
+    def test_the_hook_is_registered_in_both_spellings(self):
+        # `rtk`, demonstrably accepted in the field, registers `PreToolUse` and
+        # `preToolUse`. Matching that shape beats a cleaner one that might be
+        # ignored in silence.
+        self.insight.install_copilot_hook()
+        with open(self.insight.COPILOT_HOOK_PATH, encoding="utf-8") as handle:
+            body = json.load(handle)
+        self.assertIn("PreToolUse", body["hooks"])
+        self.assertIn("preToolUse", body["hooks"])
+
+    def test_installing_twice_is_a_no_op(self):
+        self.insight.install_copilot_hook()
+        self.assertEqual(self.insight.install_copilot_hook()["status"],
+                         "already installed")

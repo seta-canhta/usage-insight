@@ -33,7 +33,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (os.path.join(_ROOT, "pollers"), os.path.join(_ROOT, "collector")):
+for _p in (_ROOT, os.path.join(_ROOT, "collector")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -70,10 +70,18 @@ def parse_bundle(path: str) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     if manifest.get("format") != BUNDLE_FORMAT:
         raise BundleError(
             "unknown bundle format {!r}".format(manifest.get("format")))
-    if manifest.get("schema_version") != common.SCHEMA_VERSION:
+    # Major-compatible, not exact. Engineers upgrade the client when they get
+    # round to it, so at any moment the inbox holds bundles packed by several
+    # versions at once. An exact match would reject a whole week of somebody's
+    # work for a minor bump that only ever *added* optional attributes -- and
+    # `pull.py` would then name them as a machine that reported nothing, which
+    # is the one thing this pipeline must never confuse with a quiet week.
+    packed = str(manifest.get("schema_version") or "")
+    if packed.split(".")[0] != common.SCHEMA_VERSION.split(".")[0]:
         raise BundleError(
-            "schema {} does not match this pipeline's {}".format(
-                manifest.get("schema_version"), common.SCHEMA_VERSION))
+            "schema {} is not major-compatible with this pipeline's {}".format(
+                manifest.get("schema_version") or "(absent)",
+                common.SCHEMA_VERSION))
 
     digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
     if digest != manifest.get("sha256"):
@@ -167,8 +175,10 @@ def measured(manifest: Dict[str, Any]) -> bool:
     sources = manifest.get("sources")
     if not isinstance(sources, dict):
         return True                     # older bundle; not ours to reinterpret
-    return bool(sources.get("repos") or sources.get("otel")
-                or sources.get("agent"))
+    # The surfaces a machine can read. `vscode` matters as much as `copilot`:
+    # on the pilot machines it is the only one with anything on it.
+    return any(sources.get(k) for k in
+               ("repos", "copilot", "vscode", "rtk", "agent"))
 
 
 def import_inbox(inbox: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:

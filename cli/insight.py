@@ -2,14 +2,14 @@
 """``insight`` -- the local collector that runs on an engineer's own machine.
 
 Three signals never leave a developer's laptop, and no amount of API polling
-recovers them: Copilot's token usage (its OTel exporter writes locally), which
-platform agent ran (``emit.py`` writes a local NDJSON buffer), and the
-``AI-Run-Id`` trailer written at commit time. This reads those and packs them
-into one bundle to hand over.
+recovers them: what Copilot actually spent (it journals every session under
+``~/.copilot``), which platform agent ran, and the ``AI-Run-Id`` trailer written
+at commit time. This reads those and packs them into one bundle to hand over.
 
-**There is no daemon.** Copilot's exporter has a ``file`` mode, so it writes its
-own spans to disk and this reads them when asked. ``pack`` is a batch read of
-local files, run once a week. See ``docs/ARCHITECTURE.md``.
+**There is no daemon.** Copilot CLI writes its own session journal whether or
+not anything is watching -- no exporter, no setting, nothing listening -- and
+this reads it when asked. ``pack`` is a batch read of local files, run once a
+week. See ``docs/ARCHITECTURE.md``.
 
 Standard library only, Python 3.9+. No virtualenv, nothing to install, nothing
 to resolve on someone else's machine.
@@ -17,6 +17,7 @@ to resolve on someone else's machine.
     ./insight init         consent, machine id, salt
     ./insight install-hook write AI-Run-Id trailers at commit time
     ./insight scan         read git history in a repository
+    ./insight copilot   read Copilot's own session journals
     ./insight collect   read the emit.py buffer
     ./insight pack      seal a bundle to hand over
     ./insight ship      send a sealed bundle to the collection endpoint
@@ -43,6 +44,7 @@ import io
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -52,12 +54,99 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _ROOT = os.path.dirname(_HERE)
-for _p in (os.path.join(_ROOT, "pollers"), os.path.join(_ROOT, "collector")):
+for _p in (_ROOT, os.path.join(_ROOT, "collector")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
 import common  # noqa: E402  (path set above)
 import main as collector_main  # noqa: E402
+import version as version_mod  # noqa: E402
+
+
+def _archive() -> Optional[str]:
+    """The ``.pyz`` this is running from, or None in a checkout.
+
+    ``_ROOT`` is whatever sits above ``cli/``. In a checkout that is the
+    repository and it is a directory; inside a zipapp it is the archive file
+    itself, because ``zipimport`` lets a ``sys.path`` entry run straight through
+    a file into it. So one ``os.path.isfile`` answers "am I packaged", with no
+    build-time flag that could fall out of step with reality.
+    """
+    return _ROOT if os.path.isfile(_ROOT) else None
+
+
+def _read_bundled(path: str) -> str:
+    """Read a file that ships beside this module -- checkout or zipapp.
+
+    In a checkout ``path`` is a real file. Inside ``insight.pyz`` it is not:
+    the name looks like a path, but there is no directory called
+    ``insight-0.3.0.pyz`` and ``open()`` raises ``NotADirectoryError``.
+    ``zipimport`` hands the bytes over through the loader that imported this
+    module, keyed by that same name, so one extra call covers both.
+
+    Not ``importlib.resources``: ``read_text`` was removed in 3.13 and
+    ``files()`` needs a package anchor. ``cli/`` is a directory on ``sys.path``,
+    not a package, and making it one would break every ``import insight`` in
+    the test suite.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+    except OSError:
+        get_data = getattr(globals().get("__loader__"), "get_data", None)
+        if get_data is None:
+            raise
+        return get_data(path).decode("utf-8")
+
+
+def _executable() -> str:
+    """The absolute path a scheduler should invoke to run ``auto`` hourly.
+
+    Three answers, in the order they can be trusted:
+
+    ``$INSIGHT_EXE`` -- exported by the launcher ``install.sh`` writes. That
+    launcher is the only thing that knows both where it put itself and which
+    interpreter it validated.
+
+    ``<checkout>/insight`` -- the bash wrapper, when this is a git clone. Still
+    correct there, and it is what the plists already in the field carry.
+
+    ``sys.argv[0]``, made absolute. Last, and absolute for a reason: a launchd
+    agent runs with ``PATH=/usr/bin:/bin:/usr/sbin:/sbin``, so a bare name here
+    would resolve to something else or to nothing.
+
+    Getting this wrong fails in the worst available way -- ``schedule --hourly``
+    reports success, launchd accepts the plist, and the job then fires every
+    hour forever against a path that does not exist, with nobody watching.
+    """
+    exe = os.environ.get("INSIGHT_EXE")
+    if exe:
+        return os.path.abspath(exe)
+    checkout = os.path.join(_ROOT, "insight")
+    if _archive() is None and os.path.isfile(checkout):
+        return checkout
+    return os.path.abspath(sys.argv[0])
+
+
+def version_line() -> str:
+    """Everything a support question needs, in one pasteable line.
+
+    The digest is of the file actually running, not of a build recorded
+    somewhere else. ``0.3.0`` answers *which release*; the digest answers
+    *whether this laptop has that release's bytes*, and those two come apart
+    exactly when it matters -- a half-finished upgrade, a copy taken from a
+    colleague, an archive edited to see what would happen.
+    """
+    path = _archive() or os.path.abspath(__file__)
+    try:
+        with open(path, "rb") as handle:
+            digest = hashlib.sha256(handle.read()).hexdigest()[:12]
+    except OSError:
+        digest = "unreadable"
+    return "insight {} (schema {}, python {}.{}.{}, {} sha256:{})".format(
+        version_mod.VERSION, common.SCHEMA_VERSION,
+        sys.version_info[0], sys.version_info[1], sys.version_info[2],
+        path, digest)
 
 HOME = os.environ.get("SETA_INSIGHT_HOME") or os.path.join(
     os.path.expanduser("~"), ".seta-insight"
@@ -83,15 +172,34 @@ BUNDLE_FORMAT = "seta-insight-bundle/1"
 SETA_ENDPOINT = "https://aeris-insight.seta-international.com"
 DEFAULT_ENDPOINT = os.environ.get("SETA_INSIGHT_ENDPOINT") or SETA_ENDPOINT
 
+#: What this machine collects, in the words of somebody being asked to agree to
+#: it. Kept honest deliberately and at some cost: it named "latency" for a
+#: fortnight after the source stopped carrying it, and a consent record that
+#: describes the wrong thing is not a weaker consent record, it is a false one.
+#: Anything added to what `copilot`, `scan` or `collect` read has to appear
+#: here in the same commit.
 CONSENT_TEXT = """
 This collects, from this machine:
 
-  - which platform agent ran, on which ticket, and how long it took
-  - Copilot token counts, model ids and latency
+  - which agent ran, on which ticket, and how long it took
+  - how much Copilot spent: token counts, model ids, premium requests
+  - which tools and quality gates ran, and whether they passed
+  - files an agent changed, by path and line count -- never their contents
   - commit hashes, line counts, and AI provenance markers
 
+It reads Copilot's own session journal in ~/.copilot, which it never alters or
+deletes, and takes named fields out of it. Everything else in that file --
+prompts, replies, source code, command output -- is dropped without being
+stored, and a second check refuses the whole batch if anything unnamed slips
+through.
+
 It never collects prompts, responses, source code, diffs, file contents, or
-secrets. Counts, hashes and fixed categories only.
+secrets. Counts, hashes and fixed categories only. File paths are recorded
+relative to the repository, so your home directory and username are not.
+
+It does not see everything. Copilot Chat in the VS Code panel, and inline
+completions, write nothing to that journal and are not collected. Every upload
+says so, so that work nobody measured is never read as work nobody did.
 
 {transport}
 
@@ -134,6 +242,19 @@ returns this to upload-only-when-you-say-so, and `purge` deletes everything
 held here. A bundle already sent is already sent -- removing that is a request
 to whoever runs the pipeline."""
 
+#: Appended to the hourly text when this machine may also replace its own
+#: binary. Separate constant, and only added when the answer was yes, because a
+#: consent record that describes self-updating on a machine that does not do it
+#: is as wrong as one that omits it on a machine that does.
+TRANSPORT_AUTO_UPDATE = """
+Once a day it will also ask {endpoint} whether a newer version of this tool
+exists, and install it if there is one. Every download is checked against a
+sha256 published by the endpoint over TLS and refused if it does not match, and
+a major version is never installed on its own -- that one waits for you.
+
+`insight update --off` stops it, `insight update --status` shows what happened,
+and every change is written to the log with both version numbers."""
+
 
 # --------------------------------------------------------------------------
 # config
@@ -170,6 +291,59 @@ def require_config() -> Dict[str, Any]:
     return config
 
 
+class NoTerminal(SystemExit):
+    """Raised when a prompt is reached with nothing to read from.
+
+    ``input()`` on a closed stdin raises ``EOFError``, which nothing used to
+    catch, so piping anything into `setup` produced a traceback. That was
+    unreachable while flags were the normal path; with a wizard as the normal
+    path it is one ``insight setup < /dev/null`` away -- and the installer
+    documentation now tells people to run `setup` right after a `curl | sh`,
+    which is exactly the moment someone tries to chain the two.
+    """
+
+    def __init__(self) -> None:
+        super().__init__(
+            "`insight setup` asks questions and needs a terminal.\n"
+            "Run it directly, or non-interactively with "
+            "`insight setup --email you@seta-international.vn --yes`.")
+
+
+def ask(prompt: str, default: str = "") -> str:
+    """One wizard question. Refuses to guess when there is nobody to ask."""
+    if not sys.stdin.isatty():
+        raise NoTerminal()
+    try:
+        answer = input(prompt).strip()
+    except EOFError:
+        raise NoTerminal()
+    return answer or default
+
+
+def ask_yes(prompt: str, default: bool = False) -> bool:
+    answer = ask(prompt, "y" if default else "n").lower()
+    return answer in ("y", "yes")
+
+
+def ask_email() -> str:
+    """Ask until the address parses.
+
+    A typo costs a retry, not a restart. `normalise_email` raising
+    ``SystemExit`` mid-wizard would discard every answer already given.
+    """
+    import identity
+
+    while True:
+        raw = ask("Your work email: ")
+        if not raw:
+            print("  An address is needed -- `ship` uploads under it.")
+            continue
+        try:
+            return identity.normalise_email(raw)
+        except identity.IdentityError as exc:
+            print("  {}".format(exc))
+
+
 def cmd_init(args: argparse.Namespace) -> int:
     existing = load_config()
     if existing and not args.force:
@@ -189,8 +363,6 @@ def cmd_init(args: argparse.Namespace) -> int:
             email = identity.normalise_email(email)
         except identity.IdentityError as exc:
             raise SystemExit(str(exc))
-    issued = (getattr(args, "token", None) or "").strip() or None
-
     if endpoint and getattr(args, "hourly", False):
         transport = TRANSPORT_HOURLY.format(home=HOME, endpoint=endpoint)
     elif endpoint:
@@ -227,20 +399,17 @@ def cmd_init(args: argparse.Namespace) -> int:
         # collected data, and nothing writes this into a bundle -- it travels
         # in the Authorization header and nowhere else.
         "email": email,
-        # Minted here, kept here. The server is given sha256 of it and never
-        # the value, so its whitelist is not a credential store.
+        # Minted here, kept here, and only here. The server is given sha256 of
+        # it and never the value, so its whitelist is not a credential store.
         #
-        # ``--token`` adopts one issued by the server admin instead. That is
-        # the onboarding case: somebody is added to the whitelist before their
-        # laptop has been touched, so the secret has to exist before this file
-        # does. It travelled over some channel to get here, which the minted
-        # one never does -- so `rotate-token` afterwards is the point at which
-        # this machine holds a secret nobody else has ever seen.
-        # An issued secret needs no address alongside it. The server resolves
-        # the fingerprint to a person itself -- that is the whole mechanism --
-        # and `ship` has never sent an email address in any header. Asking for
-        # one here would be asking twice for the same fact.
-        "endpoint_token": issued or (existing or {}).get("endpoint_token") or (
+        # There used to be a ``--token`` that adopted a secret issued by the
+        # server admin, for onboarding somebody before their laptop had been
+        # touched. It is gone. That path put the live secret through Slack --
+        # `cli/identity.py` argues the point and calls it an exception granted
+        # only for pre-provisioning. Removing the exception means every secret
+        # on every machine is one that has never travelled, which is a
+        # stronger property than the convenience was worth.
+        "endpoint_token": (existing or {}).get("endpoint_token") or (
             identity.mint_secret() if email else None),
         "endpoint_token_previous": (existing or {}).get("endpoint_token_previous"),
     }
@@ -253,46 +422,32 @@ def cmd_init(args: argparse.Namespace) -> int:
         # somebody has already scrolled past is one they stop reading.
         if not getattr(args, "quiet_whitelist", False):
             print()
-            print_whitelist_line(config, adopted=bool(issued))
+            print_whitelist_line(config)
     elif endpoint:
         # Warned, not refused. Collecting without being able to upload is still
         # a useful state -- the bundles are on disk and can be handed over by
         # hand -- and refusing here would block anyone not yet enrolled.
         print()
         print("No work email recorded, so `ship` has nothing to upload under.")
-        print("Run `./insight setup --email you@seta-international.vn` when you "
-              "have one.")
+        print("Run `insight setup` when you have one.")
     return 0
 
 
-def print_whitelist_line(config: Dict[str, Any], adopted: bool = False) -> None:
+def print_whitelist_line(config: Dict[str, Any]) -> None:
     """The one thing setup cannot do for the engineer, said plainly.
 
     Uploading fails until someone adds this line to the server, and the failure
     is a 401 that looks like a bug rather than a missing step. Printing it here,
     in full, is what keeps that from becoming a support conversation.
 
-    ``adopted`` is the opposite situation: the secret came *from* the server, so
-    the line is already there. Telling someone to send a line that is already in
-    place trains them to ignore this paragraph, and the thing they actually have
-    to do -- rotate, so the machine holds a secret that never travelled -- gets
-    lost underneath it.
+    This is now the only direction a secret ever travels: minted on the machine,
+    fingerprint sent out. The `--token` path that went the other way is gone.
     """
     import identity
 
     email = config.get("email")
     line = (identity.whitelist_line(email, config["endpoint_token"]) if email
             else identity.fingerprint(config["endpoint_token"]))
-    if adopted:
-        print("You are already on the server whitelist. Your fingerprint:")
-        print()
-        print("    " + line)
-        print()
-        print("That secret was issued to you, so it has travelled over some")
-        print("channel to get here. Once an upload has worked, run")
-        print("`./insight rotate-token` and send the new fingerprint back --")
-        print("uploads keep working on this one until the server catches up.")
-        return
     print("Send this line to whoever maintains the collection server, so they")
     print("can add you to INSIGHT_ALLOWED in its .env:")
     print()
@@ -324,9 +479,11 @@ def write_json(path: str, payload: Dict[str, Any]) -> None:
         handle.write("\n")
 
 
-#: Where Copilot's file exporter writes, per otel.outfile. It appends and never
-#: rotates, so something has to. See cmd_otel.
-COPILOT_SPANS = os.path.join(HOME, "copilot-spans.jsonl")
+#: Copilot CLI's own home. It keeps one journal per session under
+#: ``session-state/<id>/events.jsonl``, written with no exporter, no setting and
+#: nothing listening. See cmd_copilot.
+COPILOT_ROOT = os.environ.get("COPILOT_HOME") or os.path.join(
+    os.path.expanduser("~"), ".copilot")
 
 
 def buffer_path(day: Optional[str] = None) -> str:
@@ -433,14 +590,41 @@ def check_allowed(event: Dict[str, Any]) -> List[str]:
 # --------------------------------------------------------------------------
 
 def cmd_setup(args: argparse.Namespace) -> int:
+    """Set this machine up, by asking.
+
+    It used to be one command carrying flags: ``--email``, ``--token``, and a
+    repeated ``--repo``. Two of those are gone and the third is optional, so
+    what is left is a short conversation -- which is also what makes it
+    survivable at the end of a ``curl | sh``: the installer puts the tool on
+    the machine and stops, and this is the step where a person is present.
+
+    That order matters and is not incidental. Consent obtained by a flag on a
+    pipe is consent nobody was shown, and the whitelist line printed at the end
+    is the one thing here somebody has to actually read and act on. Text at the
+    tail of a piped installer is text people scroll past.
+
+    The flags still work (``--email``, ``--yes``) so this is scriptable and so
+    the test suite does not need a terminal.
+    """
     import vscode_setup
 
     steps: List[Dict[str, Any]] = []
-    #: An upload secret issued by the server admin, rather than minted here.
-    issued = (getattr(args, "token", None) or "").strip() or None
+    wizard = not (args.yes or args.email or args.dry_run)
 
-    aiep = args.aiep or os.path.join(_ROOT, "..", "ai-engineering-platform")
-    aiep = os.path.abspath(aiep) if os.path.isdir(
+    if wizard:
+        print()
+        print("This sets up collection on this machine. Four questions.")
+        print()
+
+    # Beside the repo is only a meaningful default when there is a repo. From
+    # a zipapp, `_ROOT/..` is whatever directory the archive was installed
+    # into, and probing it is how this ends up registering nothing while
+    # reporting success -- `desired()` returns {} for aiep=None, `apply()`
+    # writes no keys, and the step still prints [ ok ] vscode.
+    aiep = args.aiep or os.environ.get("INSIGHT_AIEP")
+    if not aiep and _archive() is None:
+        aiep = os.path.join(_ROOT, "..", "ai-engineering-platform")
+    aiep = os.path.abspath(aiep) if aiep and os.path.isdir(
         os.path.join(os.path.abspath(aiep), "agents")) else None
 
     # Skills must be a flat directory of skill folders; the platform's own
@@ -458,55 +642,64 @@ def cmd_setup(args: argparse.Namespace) -> int:
 
     path = vscode_setup.settings_path()
     if not path:
-        steps.append({"step": "vscode", "ok": False,
-                      "detail": "no VS Code settings directory found"})
+        # Not a failure, and it used to be. Nothing about collection depends on
+        # VS Code any more: usage comes from Copilot CLI's own journal, which is
+        # written whether or not an editor is involved. This step registers the
+        # platform's agents and skills for people who use the chat panel, and
+        # its absence on a terminal-only machine is a fact about that machine.
+        # Left as a failure it would make `setup` exit non-zero on every such
+        # machine, which teaches people that a red line at the end is normal.
+        steps.append({"step": "vscode", "ok": True,
+                      "detail": "not installed -- nothing to configure"})
     else:
         changed, detail, keys = vscode_setup.apply(
             path, vscode_setup.desired(HOME, aiep), args.dry_run)
         steps.append({"step": "vscode", "ok": True, "changed": changed,
-                      "detail": detail, "settings": path,
+                      # Said out loud rather than left to `agents_registered`
+                      # in a dict nobody prints. Half of what this step exists
+                      # to do did not happen, and "ok" alone would hide that.
+                      "detail": detail if aiep else detail +
+                      " (no ai-engineering-platform found, so no agent or "
+                      "skill locations were registered -- pass --aiep <path> "
+                      "or set INSIGHT_AIEP)",
+                      "settings": path,
                       "keys": sorted(keys), "agents_registered": bool(aiep)})
 
     if not args.dry_run:
+        email = args.email
         if load_config() is None:
-            cmd_init(argparse.Namespace(yes=args.yes, force=False,
-                                        endpoint=args.endpoint,
-                                        no_endpoint=args.no_endpoint,
-                                        email=args.email,
-                                        token=getattr(args, "token", None),
-                                        quiet_whitelist=True,
-                                        hourly=not args.no_schedule))
+            # `init` prints the consent text and asks; the wizard's own email
+            # question comes after it, because agreeing to collection is the
+            # decision and an address is only bookkeeping once it is made.
+            if cmd_init(argparse.Namespace(
+                    yes=args.yes, force=False, endpoint=args.endpoint,
+                    no_endpoint=args.no_endpoint, email=email,
+                    quiet_whitelist=True,
+                    hourly=not args.no_schedule)) != 0:
+                return 1
         steps.append({"step": "consent", "ok": True,
                       "detail": "recorded" if load_config() else "declined"})
+
+        if wizard and not (load_config() or {}).get("email"):
+            print()
+            email = ask_email()
 
         # Also settable on a machine set up before there was an endpoint, so
         # turning transport on later is one command rather than a re-init.
         config = load_config()
-        if config is not None and (args.endpoint or args.email or issued
-                                   or args.no_endpoint
+        if config is not None and (args.endpoint or email or args.no_endpoint
                                    or not config.get("endpoint")):
             import identity
             if args.no_endpoint:
                 config["endpoint"] = None
             elif args.endpoint or not config.get("endpoint"):
                 config["endpoint"] = args.endpoint or DEFAULT_ENDPOINT
-            if args.email:
+            if email:
                 try:
-                    config["email"] = identity.normalise_email(args.email)
+                    config["email"] = identity.normalise_email(email)
                 except identity.IdentityError as exc:
                     raise SystemExit(str(exc))
-            if issued and config.get("endpoint_token") != issued:
-                # An address was added to the server whitelist before this
-                # machine was configured, which is what onboarding several
-                # people at once looks like. Without this, `setup` would mint
-                # a secret whose fingerprint is on nobody's list and the first
-                # upload would 401 for a reason nothing on this machine shows.
-                # The old one is kept valid, so a machine that was already
-                # uploading does not stop while the server catches up.
-                if config.get("endpoint_token"):
-                    config["endpoint_token_previous"] = config["endpoint_token"]
-                config["endpoint_token"] = issued
-            elif config.get("email") and not config.get("endpoint_token"):
+            if config.get("email") and not config.get("endpoint_token"):
                 config["endpoint_token"] = identity.mint_secret()
             write_json(CONFIG_PATH, config)
             os.chmod(CONFIG_PATH, 0o600)
@@ -522,11 +715,66 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # is an engineer whose quiet weeks are indistinguishable from their
         # busy ones, and `pull` cannot tell those apart from the outside.
         # `--no-schedule` opts out; `schedule --off` reverses it later.
-        if not args.no_schedule and config is not None:
+        hourly = not args.no_schedule
+        if wizard and config is not None:
+            print()
+            hourly = ask_yes(
+                "Collect and upload once an hour, automatically? [Y/n] ",
+                default=True)
+        # Asked, not assumed, and only where hourly was taken -- the check
+        # lives inside `auto`, so on a machine that runs things by hand there
+        # is nothing to switch on. Default yes, on the same reasoning that
+        # makes hourly default yes: a fleet on fourteen versions is a fleet
+        # nobody can support, and staying current is what the person answering
+        # would want if they thought about it. It is still a question, and the
+        # consent text records the answer.
+        if hourly and config is not None:
+            import update as update_mod
+            auto_update = not args.no_auto_update
+            if wizard and update_mod.installation(_archive()):
+                print()
+                print("Install its own updates when a new version is released?")
+                print("Checked once a day, verified against a checksum from")
+                print("{}, and a major version always waits".format(
+                    config.get("endpoint") or "the endpoint"))
+                print("for you. `insight update --off` reverses it.")
+                auto_update = ask_yes("Keep this tool up to date? [Y/n] ",
+                                      default=True)
+            fresh = load_config() or {}
+            fresh["auto_update"] = bool(auto_update)
+            write_json(CONFIG_PATH, fresh)
+            steps.append({"step": "updates", "ok": True,
+                          "detail": "automatic" if auto_update else "manual "
+                                    "-- re-run the installer to upgrade"})
+
+        # The Copilot hook, always, and without asking. It is not a separate
+        # decision from "collect automatically": it is *how* that is done now,
+        # and a question whose only sensible answer is yes is a question that
+        # wastes somebody's attention. `insight schedule --off` removes both.
+        #
+        # Collection fires on Copilot activity rather than on a clock, because
+        # the evidence perishes -- measured 2026-08-26, 24 of 27 VS Code
+        # workspace folders and 6 of 7 Copilot `gitRoot`s were already deleted
+        # by the time anything read them. Uploads stay batched on their own
+        # interval so a busy day sends a handful of full bundles, not a stream
+        # of nearly-empty ones.
+        if hourly and config is not None:
+            try:
+                detail = install_copilot_hook()
+                steps.append({"step": "hook", "ok": True,
+                              "detail": "collection runs on Copilot activity "
+                                        "({})".format(detail["status"])})
+            except OSError as exc:
+                # Not fatal: the hourly timer below is the fallback, and a
+                # machine with one of the two still reports.
+                steps.append({"step": "hook", "ok": False,
+                              "detail": "{} -- the hourly run still "
+                                        "collects".format(exc)})
+
+        if hourly and config is not None:
             import schedule as schedule_mod
             try:
-                detail = schedule_mod.install(
-                    os.path.join(_ROOT, "insight"), LOG_PATH)
+                detail = schedule_mod.install(_executable(), LOG_PATH)
                 steps.append({"step": "schedule", "ok": True,
                               "detail": "hourly via {}".format(detail["kind"])})
             except schedule_mod.ScheduleError as exc:
@@ -537,30 +785,61 @@ def cmd_setup(args: argparse.Namespace) -> int:
                                         "`./insight pack && ./insight ship`"
                                         .format(exc)})
 
-        for repo in args.repo or []:
+        # The span file the retired exporter wrote. Nothing reads it now, and
+        # it is not somebody's own file -- it exists only because this tool
+        # asked Copilot to write it, so this tool cleans it up. Removing the
+        # settings without removing what they produced would leave a document
+        # of somebody's work sitting in a directory nobody looks at, for the
+        # rest of the machine's life. Measured on the first machine migrated:
+        # 135 KB still there, and still growing until VS Code was restarted.
+        legacy_spans = os.path.join(HOME, "copilot-spans.jsonl")
+        if os.path.exists(legacy_spans):
+            size = os.path.getsize(legacy_spans)
             try:
-                cmd_install_hook(argparse.Namespace(repo=repo, force=args.force))
-                steps.append({"step": "hook", "ok": True, "repo": repo})
-            except SystemExit as exc:
-                steps.append({"step": "hook", "ok": False, "repo": repo,
-                              "detail": str(exc)})
+                os.remove(legacy_spans)
+                steps.append({"step": "cleanup", "ok": True,
+                              "detail": "removed the retired span file "
+                                        "({:,} bytes)".format(size)})
+            except OSError as exc:
+                steps.append({"step": "cleanup", "ok": True,
+                              "detail": "could not remove {} ({})".format(
+                                  legacy_spans, exc)})
 
-        # A machine with no repository registered collects nothing from git and
-        # uploads a bundle a day saying so. That bundle is well formed: it
-        # declares its window and reports zero events, which is exactly what a
-        # genuinely quiet day looks like. Nothing downstream can tell the two
-        # apart, so a setup that went wrong here reads as a person who did no
-        # work -- a wrong answer, not a missing one, and the one failure mode
-        # this whole design exists to avoid.
-        #
-        # Said here because here is the only place anyone is looking.
-        config = load_config() or {}
-        if not config.get("repos"):
-            steps.append({
-                "step": "repos", "ok": False,
-                "detail": "none registered -- nothing will be collected from "
-                          "git. Run `./insight setup --repo <path>` for each "
-                          "repository you work in"})
+        # Repositories are no longer asked for. Copilot's journals record
+        # `context.gitRoot` for every session, so `scan` discovers the trees an
+        # agent actually worked in -- see `copilot_read.discover_repos`. The
+        # old `--repo` flag existed because the repository somebody forgot to
+        # name was the one that silently reported nothing; not having to ask
+        # removes the failure rather than warning about it.
+        import copilot_read
+        discovered = copilot_read.discover_repos(COPILOT_ROOT)
+        steps.append({
+            "step": "repos", "ok": True,
+            "detail": "{} found in Copilot's session history".format(
+                len(discovered)) if discovered else
+            "none yet -- they are discovered as Copilot is used"})
+
+        # The commit hook is the one thing discovery cannot replace. It writes
+        # an `AI-Run-Id` trailer at commit time, and that trailer is the only
+        # evidence that earns `link.method = 'explicit'` (CONTRACT.md §2.4) --
+        # which is in turn the only thing admitted to cost-per-output. Without
+        # it every link stays heuristic and that metric stays empty. So it is
+        # offered, once, with what it buys said plainly.
+        if wizard and discovered:
+            print()
+            print("Copilot has worked in {} repositor{} on this machine."
+                  .format(len(discovered), "y" if len(discovered) == 1 else "ies"))
+            print("A commit hook can stamp which agent run produced each commit.")
+            print("Without it, cost per accepted output cannot be computed.")
+            if ask_yes("Install it? [y/N] "):
+                for repo in discovered:
+                    try:
+                        cmd_install_hook(argparse.Namespace(
+                            repo=repo, force=False))
+                        steps.append({"step": "hook", "ok": True, "repo": repo})
+                    except SystemExit as exc:
+                        steps.append({"step": "hook", "ok": False,
+                                      "repo": repo, "detail": str(exc)})
 
     print()
     for step in steps:
@@ -575,32 +854,172 @@ def cmd_setup(args: argparse.Namespace) -> int:
         print("Restart VS Code (quit fully, not Reload Window) so the settings "
               "take effect.")
         final = load_config() or {}
-        if not final.get("repos"):
-            # Ahead of the reassuring line below, which would otherwise be the
-            # last thing read and is not true yet.
-            print("No repository is registered, so there is nothing to collect "
-                  "from git yet.")
-            print("Run `./insight setup --repo <path>` for each repository you "
-                  "work in.")
-            print()
-        if not args.no_schedule and any(
-                s["step"] == "schedule" and s["ok"] for s in steps):
+        if any(s["step"] == "schedule" and s["ok"] for s in steps):
             print("Collection runs hourly from now on. Nothing else to remember.")
-            print("`./insight schedule --status` shows the last run, `--off` stops it.")
+            print("`insight schedule --status` shows the last run, `--off` stops it.")
         else:
-            tail = " && ./insight ship" if final.get("endpoint") else ""
-            print("Then: ./insight otel && ./insight collect && ./insight pack" + tail)
+            tail = " && insight ship" if final.get("endpoint") else ""
+            print("Then: insight copilot && insight scan && insight pack" + tail)
         if final.get("endpoint_token"):
             print()
-            print_whitelist_line(
-                final, adopted=final.get("endpoint_token") == issued)
+            print_whitelist_line(final)
     return 0 if all(s.get("ok") for s in steps) else 1
+
+
+# --------------------------------------------------------------------------
+# copilot hook -- collection triggered by activity, not by a clock
+# --------------------------------------------------------------------------
+
+#: Where Copilot CLI reads hook definitions.
+COPILOT_HOOKS = os.path.join(COPILOT_ROOT, "hooks")
+COPILOT_HOOK_PATH = os.path.join(COPILOT_HOOKS, "seta-insight.json")
+
+#: Do not collect more than once in this window.
+#:
+#: `PreToolUse` fires before **every** tool call -- 2,062 of them in 22 sessions
+#: on the machine this was measured on. Without a debounce, one Copilot session
+#: would spawn a thousand collectors. With it, a busy hour costs one run and a
+#: quiet hour costs nothing at all, which is the whole reason to prefer a hook
+#: over a timer.
+HOOK_DEBOUNCE_S = 10 * 60
+HOOK_STAMP = os.path.join(HOME, "hook.stamp")
+
+#: Collection and upload run on **different clocks**, and this is the point of
+#: the split.
+#:
+#: Evidence perishes: measured 2026-08-26, 24 of 27 VS Code workspace folders
+#: and 6 of 7 Copilot `gitRoot`s were already deleted when read after the fact.
+#: So collection has to be frequent -- it is local, cheap, and idempotent.
+#:
+#: Upload has the opposite constraint. Shipping on every trigger would put
+#: dozens of objects a day per machine on the endpoint, most of them a few
+#: events apart. Batched to this interval instead, a busy day sends a handful
+#: of full bundles rather than a stream of nearly-empty ones.
+#:
+#: Nothing is lost by waiting: `pack` is idempotent over the day, and a bundle
+#: that misses one window is picked up whole by the next.
+SHIP_MIN_INTERVAL_S = 60 * 60
+SHIP_STAMP = os.path.join(HOME, "ship.stamp")
+
+
+def ship_due(now_s: Optional[float] = None) -> bool:
+    """Has enough time passed to justify another upload?
+
+    A first run, or a missing stamp, is always due -- a machine that has never
+    reported must not stay silent for an hour after being set up.
+    """
+    try:
+        return (now_s or time.time()) - os.path.getmtime(SHIP_STAMP) \
+            >= SHIP_MIN_INTERVAL_S
+    except OSError:
+        return True
+
+
+def copilot_hook_body(command: str) -> Dict[str, Any]:
+    """The hook definition, in both spellings Copilot has been seen to accept.
+
+    `rtk` -- found already installed on both pilot machines -- registers
+    `PreToolUse` and `preToolUse` with differently-named timeout fields. That
+    is a tool hedging across two Copilot versions, and since those files are
+    demonstrably accepted in the field, this matches their shape rather than
+    inventing a cleaner one that might be ignored in silence.
+    """
+    return {
+        "version": 1,
+        "hooks": {
+            "PreToolUse": [
+                {"type": "command", "command": command, "cwd": ".",
+                 "timeout": 5},
+            ],
+            "preToolUse": [
+                {"type": "command", "bash": command, "powershell": command,
+                 "cwd": ".", "timeoutSec": 5},
+            ],
+        },
+    }
+
+
+def cmd_hook(args: argparse.Namespace) -> int:
+    """Called by Copilot before a tool runs. Must return immediately.
+
+    This sits in the latency path of somebody's editor. It does no collection
+    of its own: it decides whether a run is due and, if so, detaches one. The
+    budget is milliseconds, and the rule is that **nothing here may fail
+    loudly** -- a collector that breaks a tool call would deserve to be
+    uninstalled within the hour.
+    """
+    try:
+        if load_config() is None:
+            return 0                       # not set up; silently do nothing
+
+        os.makedirs(HOME, exist_ok=True)
+        now_s = time.time()
+        try:
+            if now_s - os.path.getmtime(HOOK_STAMP) < HOOK_DEBOUNCE_S:
+                return 0
+        except OSError:
+            pass                           # no stamp yet: this is the first run
+
+        # Written *before* the run, not after. If collection is slow or dies,
+        # the next tool call must not immediately start another one.
+        with open(HOOK_STAMP, "w", encoding="utf-8") as handle:
+            handle.write(str(int(now_s)))
+
+        if args.now:
+            return cmd_auto(argparse.Namespace())
+
+        # Detached, output discarded, no wait. `insight auto` already holds its
+        # own lock, so a second trigger during a long run is a no-op there too.
+        with open(os.devnull, "wb") as devnull:
+            subprocess.Popen(
+                [_executable(), "auto"],
+                stdout=devnull, stderr=devnull, stdin=devnull,
+                start_new_session=True,
+            )
+    except Exception:  # noqa: BLE001 -- see the docstring; never break a tool call
+        return 0
+    return 0
+
+
+def install_copilot_hook(force: bool = False) -> Dict[str, Any]:
+    """Register the hook with Copilot, keeping anybody else's.
+
+    Written as its own file rather than merged into an existing one: both pilot
+    machines already carry `rtk-rewrite.json`, and Copilot reads the directory,
+    so two files coexist where two edits to one file would eventually clobber
+    each other.
+    """
+    command = "{} hook".format(_executable())
+    if os.path.exists(COPILOT_HOOK_PATH) and not force:
+        try:
+            with open(COPILOT_HOOK_PATH, "r", encoding="utf-8") as handle:
+                if json.load(handle) == copilot_hook_body(command):
+                    return {"status": "already installed",
+                            "path": COPILOT_HOOK_PATH}
+        except (OSError, ValueError):
+            pass
+    os.makedirs(COPILOT_HOOKS, exist_ok=True)
+    with open(COPILOT_HOOK_PATH, "w", encoding="utf-8") as handle:
+        json.dump(copilot_hook_body(command), handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    return {"status": "installed", "path": COPILOT_HOOK_PATH,
+            "command": command}
+
+
+def remove_copilot_hook() -> Dict[str, Any]:
+    try:
+        os.remove(COPILOT_HOOK_PATH)
+        return {"status": "removed", "path": COPILOT_HOOK_PATH}
+    except OSError:
+        return {"status": "not installed", "path": COPILOT_HOOK_PATH}
 
 
 # --------------------------------------------------------------------------
 # install-hook
 # --------------------------------------------------------------------------
 
+#: The hook's bytes, addressed the same way in a checkout and in the archive.
+#: `_read_bundled` is what makes the second case work -- see there.
 HOOK_SOURCE = os.path.join(_HERE, "hooks", "prepare-commit-msg")
 HOOK_MARKER = "AI-Run-Id"
 
@@ -626,8 +1045,7 @@ def cmd_install_hook(args: argparse.Namespace) -> int:
             "{} already has a prepare-commit-msg hook that is not ours. "
             "Merge them by hand, or re-run with --force to replace it.".format(target))
 
-    with open(HOOK_SOURCE, "r", encoding="utf-8") as handle:
-        body = handle.read()
+    body = _read_bundled(HOOK_SOURCE)
     with open(target, "w", encoding="utf-8") as handle:
         handle.write(body)
     os.chmod(target, 0o755)
@@ -769,7 +1187,8 @@ def scan_commits(repo: str, since_days: int, config: Dict[str, Any]) -> List[Dic
         subject = message.splitlines()[0] if message else ""
         trailers = common.parse_ai_trailers(message)
         run_id = trailers.get("ai-run-id")
-        jira_key = common.extract_jira_key(subject, branch)
+        jira_key = common.extract_jira_key(
+            subject, branch, projects=config.get("jira_projects") or None)
         marker = common.has_ai_commit_marker(subject)
 
         # Artifacts only for commits AI had a hand in. Emitting them for every
@@ -814,12 +1233,25 @@ def cmd_scan(args: argparse.Namespace) -> int:
         targets = [os.path.abspath(os.path.expanduser(args.repo))]
         remember_repo(targets[0])
     else:
-        targets = known_repos()
+        # Registered first, then whatever Copilot's journals name. Nothing has
+        # to be registered any more: `session.start` records `context.gitRoot`,
+        # so the trees an agent actually worked in are already written down.
+        # Asking somebody to list them was never the point -- and the one they
+        # forgot was the one that silently reported nothing.
+        targets = list(known_repos())
+        try:
+            import copilot_read
+            for path in copilot_read.discover_repos(COPILOT_ROOT):
+                if path not in targets:
+                    targets.append(path)
+        except (ImportError, OSError):
+            pass
         if not targets:
-            raise SystemExit(
-                "no repositories registered. Run `insight scan --repo <path>` "
-                "or `insight install-hook --repo <path>` once per repository "
-                "and they will be remembered.")
+            # Not an error. A machine where Copilot has not run in a git tree
+            # has nothing to scan, and saying so beats failing hourly.
+            print(json.dumps({"repos": 0, "discovered": 0, "events": 0},
+                             sort_keys=True))
+            return 0
 
     results = []
     failed = False
@@ -924,45 +1356,135 @@ def cmd_collect(args: argparse.Namespace) -> int:
 
 
 # --------------------------------------------------------------------------
-# otel -- read Copilot's own file, then rotate it
+# copilot -- read Copilot's own session journals
 # --------------------------------------------------------------------------
 
-def cmd_otel(args: argparse.Namespace) -> int:
-    require_config()
-    source = args.source or COPILOT_SPANS
-    if not os.path.exists(source):
-        # Not an error: the exporter has not written yet, or is not configured.
-        # Reporting it as a fact beats failing on a machine that is fine.
-        print(json.dumps({"source": source, "present": False, "events": 0}))
+def cmd_copilot(args: argparse.Namespace) -> int:
+    """Read ``~/.copilot`` and buffer what the contract permits.
+
+    **Nothing is deleted.** The command this replaced truncated Copilot's span
+    file after every read, and that was right: the file existed only because we
+    asked for it, and it held prompts. A session journal is different in kind --
+    it is Copilot's own history of the user's work, it is what ``/resume`` reads,
+    and it is not ours to clear. Re-reading is safe instead: every ``event_id``
+    is derived from the journal record's own uuid, so a session that stays open
+    for a week is read hourly and buffered once.
+    """
+    config = require_config()
+    root = args.root or COPILOT_ROOT
+    if not os.path.isdir(os.path.join(root, "session-state")):
+        # Not an error. Copilot CLI may not be installed, or may not have run
+        # yet. Reporting it as a fact beats failing on a machine that is fine.
+        print(json.dumps({"root": root, "present": False, "events": 0},
+                         sort_keys=True))
         return 0
 
-    import otel_read  # local: keeps `insight` importable without it
+    import copilot_read  # local: keeps `insight` importable without it
 
-    result = otel_read.to_events(source)
-    problems = otel_read.verify_no_content(result["events"])
+    # The journal names no author -- it is one machine's own history, so the
+    # person is whoever this install belongs to. `scan` reads an address per
+    # commit because a repository holds several people's work; this does not.
+    email = config.get("email")
+    actor = common.make_actor(
+        person_id=None,
+        person_email_hash=common.hash_email(email, config.get("salt")),
+    ) if email else None
+
+    result = copilot_read.to_events(
+        root, since=args.since, actor=actor,
+        jira_projects=tuple(config.get("jira_projects") or ()) or None)
+    problems = copilot_read.verify_no_content(result["events"])
     if problems:
         for problem in problems[:5]:
             print("REJECTED " + problem, file=sys.stderr)
-        raise SystemExit("attributes outside the allow-list; nothing written "
-                         "and the source left untouched")
+        raise SystemExit("attributes outside the allow-list; nothing written")
 
     written, duplicates = append_events(result["events"])
 
-    rotated = False
-    if not args.keep_raw:
-        # Truncated, not archived. The raw file can hold prompts, system
-        # instructions and command output -- microsoft/vscode#326254 -- and
-        # keeping copies multiplies that exposure on someone's laptop for no
-        # gain, since the events carry everything we are allowed to keep.
-        with open(source, "w", encoding="utf-8"):
-            pass
-        rotated = True
-
     print(json.dumps({
-        "source": source, "present": True,
-        "spans_read": result["spans_read"], "events": len(result["events"]),
+        "root": root, "present": True,
+        "sessions_read": result["sessions_read"],
+        "sessions_skipped": result["sessions_skipped"],
+        "events": len(result["events"]),
         "written": written, "already_buffered": duplicates,
-        "source_truncated": rotated,
+        # Carried into the output every time, not only when it looks bad. A
+        # reader who cannot see the denominator reads a small total as light
+        # usage rather than as partial measurement.
+        "coverage": result["coverage"],
+    }, sort_keys=True))
+    return 0
+
+
+def cmd_vscode(args: argparse.Namespace) -> int:
+    """Read VS Code's Copilot Chat store.
+
+    The surface the CLI journal cannot see. On both pilot machines it is the
+    **only** surface with anything on it: neither has ever created a Copilot
+    CLI session, so `insight copilot` returns zero there for ever.
+    """
+    config = require_config()
+    import vscode_read
+
+    email = config.get("email")
+    actor = common.make_actor(
+        person_id=None,
+        person_email_hash=common.hash_email(email, config.get("salt")),
+    ) if email else None
+
+    result = vscode_read.to_events(
+        args.root, actor=actor,
+        jira_projects=tuple(config.get("jira_projects") or ()) or None)
+    if not result["present"]:
+        print(json.dumps({"present": False, "events": 0}, sort_keys=True))
+        return 0
+
+    problems = vscode_read.verify_no_content(result["events"])
+    if problems:
+        for problem in problems[:5]:
+            print("REJECTED " + problem, file=sys.stderr)
+        raise SystemExit("attributes outside the allow-list; nothing written")
+
+    written, duplicates = append_events(result["events"])
+    print(json.dumps({
+        "present": True, "sessions": result["sessions"],
+        "requests": result["requests"], "events": len(result["events"]),
+        "written": written, "already_buffered": duplicates,
+        "coverage": result["coverage"],
+    }, sort_keys=True))
+    return 0
+
+
+def cmd_rtk(args: argparse.Namespace) -> int:
+    """Read rtk's history, if this machine has one.
+
+    A second, independent token source. Absent on most machines and present on
+    the pilot ones -- which is why it is read rather than assumed either way.
+    """
+    config = require_config()
+    import rtk_read
+
+    if args.probe:
+        print(json.dumps(rtk_read.probe(), indent=2, sort_keys=True))
+        return 0
+
+    email = config.get("email")
+    actor = common.make_actor(
+        person_id=None,
+        person_email_hash=common.hash_email(email, config.get("salt")),
+    ) if email else None
+
+    result = rtk_read.to_events(actor=actor)
+    if not result["present"]:
+        print(json.dumps({"present": False, "events": 0}, sort_keys=True))
+        return 0
+
+    written, duplicates = append_events(result["events"])
+    print(json.dumps({
+        "present": True, "records": result["records"],
+        "unparsed": result["unparsed"], "source": result["source"],
+        "events": len(result["events"]),
+        "written": written, "already_buffered": duplicates,
+        "coverage": result["coverage"],
     }, sort_keys=True))
     return 0
 
@@ -970,6 +1492,14 @@ def cmd_otel(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 # pack
 # --------------------------------------------------------------------------
+
+def _vscode_present() -> bool:
+    try:
+        import vscode_read
+        return bool(vscode_read.default_root())
+    except Exception:  # noqa: BLE001 -- a status line may not crash
+        return False
+
 
 def sources_of(config: Dict[str, Any]) -> Dict[str, Any]:
     """Which local sources this machine is set up to read.
@@ -983,10 +1513,19 @@ def sources_of(config: Dict[str, Any]) -> Dict[str, Any]:
         # Registered repositories. Zero means `scan` has nothing to walk, and
         # every bundle from this machine will be empty until one is added.
         "repos": len(config.get("repos") or []),
-        # Copilot's exporter has written here at least once. `otel` truncates
-        # the file after reading it, so the file outliving its contents is the
-        # point: it says the exporter is wired up.
-        "otel": os.path.exists(COPILOT_SPANS),
+        # Copilot CLI has run on this machine at least once. Nothing had to be
+        # configured for this to be true -- which is the point, and the reason
+        # it replaced a span exporter that had to be switched on per machine
+        # and silently collected nothing when it was not.
+        "copilot": os.path.isdir(os.path.join(COPILOT_ROOT, "session-state")),
+        # VS Code's own chat store. Independent of `copilot` above: a machine
+        # that has never run a CLI session still has this, and on the pilot
+        # machines it is the only surface with anything on it.
+        "vscode": bool(_vscode_present()),
+        # A second token source, present on some machines only.
+        "rtk": bool(shutil.which("rtk")),
+        # Collection now fires on Copilot activity rather than on a clock.
+        "hook": os.path.exists(COPILOT_HOOK_PATH),
         # The platform emitter's buffer directory, created on its first run.
         "agent": os.path.isdir(EMIT_BUFFER),
     }
@@ -1257,8 +1796,34 @@ def cmd_auto(args: argparse.Namespace) -> int:
         os.write(lock, str(os.getpid()).encode())
         os.close(lock)
 
+        # First, and before any collection. Not because it is important -- it
+        # is the least important thing in this function -- but because every
+        # path below can return early on a quiet machine, and an update check
+        # that only runs on busy days is one that never runs on the laptops
+        # most likely to be behind.
+        #
+        # It cannot affect this run. The archive it swaps is resolved through
+        # `current.pyz` at exec time, so a new version takes effect on the next
+        # invocation; and `update.check` is written never to raise, so an
+        # endpoint that is down or a manifest that is nonsense is a line in the
+        # log and nothing else. The laptop on the plane still collects.
+        try:
+            import update as update_mod
+            outcome = update_mod.check(
+                HOME, config.get("endpoint"), version_mod.VERSION,
+                _archive(), enabled=bool(config.get("auto_update")))
+            if outcome.get("action") not in ("off", "not_due", "current"):
+                _log(outcome)
+        except Exception as exc:  # noqa: BLE001 -- an hourly job may not crash
+            _log({"event": "update_check", "action": "failed",
+                  "detail": "{}: {}".format(type(exc).__name__, exc)})
+
         for step, fn, ns in (
-            ("otel", cmd_otel, argparse.Namespace(source=None, keep_raw=False)),
+            ("copilot", cmd_copilot, argparse.Namespace(root=None, since=None)),
+            # The surface the pilot machines actually use. Ordered after
+            # `copilot` only because that one is cheaper when it finds nothing.
+            ("vscode", cmd_vscode, argparse.Namespace(root=None)),
+            ("rtk", cmd_rtk, argparse.Namespace(probe=False)),
             ("collect", cmd_collect, argparse.Namespace(source=None)),
             ("scan", cmd_scan, argparse.Namespace(repo=None, since_days=7)),
         ):
@@ -1306,6 +1871,17 @@ def cmd_auto(args: argparse.Namespace) -> int:
                   "reason": "no endpoint or no upload secret", "problems": problems})
             return 0
 
+        # Collected, sealed, and deliberately held. The bundle stays on disk and
+        # the next due run ships the day whole -- `pack` re-seals the same day,
+        # so waiting costs nothing but the wait.
+        if not (getattr(args, "force_ship", False) or ship_due()):
+            _log({"event": "batched", "bundle": os.path.basename(newest),
+                  "reason": "within the upload interval",
+                  "next_due_s": int(SHIP_MIN_INTERVAL_S -
+                                    (time.time() - os.path.getmtime(SHIP_STAMP))),
+                  "problems": problems})
+            return 0
+
         try:
             receipt = ship_mod.ship_bundle(
                 newest, config["endpoint"],
@@ -1320,6 +1896,10 @@ def cmd_auto(args: argparse.Namespace) -> int:
 
         receipts[os.path.basename(newest)] = receipt
         ship_mod.save_receipts(RECEIPTS_PATH, receipts)
+        # Only on success. A failed upload must leave the next run due, not
+        # push it an hour away.
+        with open(SHIP_STAMP, "w", encoding="utf-8") as handle:
+            handle.write(str(int(time.time())))
         dropped = _prune_buffer(receipts)
         _log({"event": "shipped", "bundle": os.path.basename(newest),
               "status": receipt["status"], "key": receipt.get("key"),
@@ -1357,7 +1937,7 @@ def cmd_schedule(args: argparse.Namespace) -> int:
         return 0
 
     config = require_config()
-    insight = os.path.join(_ROOT, "insight")
+    insight = _executable()
 
     if not args.yes:
         # Said before it is switched on, not in a file someone may never open.
@@ -1470,6 +2050,53 @@ def cmd_rotate_token(args: argparse.Namespace) -> int:
 # status / purge
 # --------------------------------------------------------------------------
 
+def cmd_update(args: argparse.Namespace) -> int:
+    """Look at, change, or explain this machine's update setting.
+
+    Deliberately its own command rather than a flag on `schedule`. Replacing
+    the binary and uploading on a timer are two different promises, and someone
+    switching one off should not have to discover that it was spelled as an
+    option to the other.
+    """
+    import update as update_mod
+    config = require_config()
+
+    if args.on or args.off:
+        config["auto_update"] = bool(args.on)
+        write_json(CONFIG_PATH, config)
+        print(json.dumps({"auto_update": bool(args.on)}))
+        if args.on and not update_mod.installation(_archive()):
+            print("Recorded -- but this is a checkout, not an installed "
+                  "archive, so nothing will actually update. Use `git pull`.",
+                  file=sys.stderr)
+        return 0
+
+    state = update_mod.load_state(HOME)
+    if args.pin or args.unpin:
+        pin = None if args.unpin else args.pin
+        if pin and not update_mod.parse_version(pin):
+            raise SystemExit("{!r} is not a version like 0.3.0".format(pin))
+        state["pinned"] = pin
+        update_mod.save_state(HOME, state)
+        print(json.dumps({"pinned": pin}))
+        return 0
+
+    if args.check or args.now:
+        outcome = update_mod.check(
+            HOME, config.get("endpoint"), version_mod.VERSION, _archive(),
+            enabled=True, apply_it=bool(args.now), force=True)
+        print(json.dumps(outcome, indent=2, sort_keys=True))
+        # Non-zero only when the check itself failed. "held", "pinned" and
+        # "refused" are this working as designed, and a scripted caller should
+        # not have to special-case them.
+        return 1 if outcome.get("action") == "failed" else 0
+
+    print(json.dumps(update_mod.status(
+        HOME, version_mod.VERSION, _archive(),
+        bool(config.get("auto_update"))), indent=2, sort_keys=True))
+    return 0
+
+
 def cmd_status(args: argparse.Namespace) -> int:
     config = load_config()
     if config is None:
@@ -1486,6 +2113,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     import identity
     import schedule as schedule_mod
     import ship as ship_mod
+    import update as update_mod
     receipts = ship_mod.load_receipts(RECEIPTS_PATH)
     print(json.dumps({
         "initialised": True,
@@ -1510,6 +2138,11 @@ def cmd_status(args: argparse.Namespace) -> int:
         "shipped": len(receipts),
         # Named, not counted. "3 bundles waiting" is a number to ignore; the
         # file names are what someone acts on.
+        # Which version this is, whether it replaces itself, and when it last
+        # looked. Folded in here rather than left to `update --status` because
+        # "what is this machine doing on its own" is one question.
+        "update": update_mod.status(HOME, version_mod.VERSION, _archive(),
+                                    bool(config.get("auto_update"))),
         "unshipped": [os.path.basename(p)
                       for p in ship_mod.unshipped(REPORTS_DIR, receipts)],
         "last_shipped_at": max(
@@ -1539,7 +2172,8 @@ def cmd_purge(args: argparse.Namespace) -> int:
     if os.path.exists(RECEIPTS_PATH):
         os.remove(RECEIPTS_PATH)
         removed += 1
-    for path in (LOCK_PATH, LOG_PATH):
+    import update as update_mod
+    for path in (LOCK_PATH, LOG_PATH, update_mod.state_path(HOME)):
         if os.path.exists(path):
             os.remove(path)
             removed += 1
@@ -1563,11 +2197,26 @@ def cmd_purge(args: argparse.Namespace) -> int:
 
 # --------------------------------------------------------------------------
 
+class _VersionAction(argparse.Action):
+    def __init__(self, option_strings, dest, **kwargs):
+        super().__init__(option_strings, dest, nargs=0, default=argparse.SUPPRESS,
+                         **kwargs)
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        print(version_line())
+        parser.exit()
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="insight",
         description="Collect AI-effectiveness telemetry from this machine.",
     )
+    # `action="version"` would build the line -- and hash the archive -- on
+    # every single invocation, including the hourly `auto` run. This defers it
+    # to the one call that asks.
+    parser.add_argument("--version", action=_VersionAction,
+                        help="version, schema, interpreter and this file's digest")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("init", help="record consent and create the local store")
@@ -1580,15 +2229,12 @@ def build_parser() -> argparse.ArgumentParser:
                                    "server whitelist, never stored in a bundle")
     p.add_argument("--no-endpoint", action="store_true",
                    help="do not upload; bundles are handed over by hand")
-    p.add_argument("--token", help="adopt an upload secret issued by whoever "
-                                   "runs the server, instead of minting one "
-                                   "here. Rotate it once you are uploading")
     p.set_defaults(func=cmd_init)
 
     p = sub.add_parser(
-        "setup", help="configure VS Code, record consent, install hooks")
-    p.add_argument("--repo", action="append",
-                   help="repository to install the commit hook into (repeatable)")
+        "setup", help="set this machine up, by asking (the usual first command)")
+    # No --repo. Copilot's journals name every git tree it has worked in, so
+    # `scan` discovers them -- see copilot_read.discover_repos.
     p.add_argument("--aiep", help="path to ai-engineering-platform "
                                   "(default: beside this repo)")
     p.add_argument("--endpoint",
@@ -1596,14 +2242,14 @@ def build_parser() -> argparse.ArgumentParser:
                        DEFAULT_ENDPOINT))
     p.add_argument("--email", help="your work email -- identifies you to the "
                                    "server whitelist, never stored in a bundle")
-    p.add_argument("--token", help="adopt an upload secret issued by whoever "
-                                   "runs the server, instead of minting one "
-                                   "here. Rotate it once you are uploading")
     p.add_argument("--no-endpoint", action="store_true",
                    help="do not upload; bundles are handed over by hand")
     p.add_argument("--no-schedule", action="store_true",
                    help="do not collect hourly; run the commands by hand")
-    p.add_argument("--yes", action="store_true", help="skip the consent prompt")
+    p.add_argument("--no-auto-update", action="store_true",
+                   help="do not install new versions automatically")
+    p.add_argument("--yes", action="store_true",
+                   help="skip the questions and accept the defaults")
     p.add_argument("--force", action="store_true",
                    help="replace an existing prepare-commit-msg hook")
     p.add_argument("--dry-run", action="store_true",
@@ -1626,12 +2272,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_scan)
 
     p = sub.add_parser(
-        "otel", help="read Copilot's span file, then truncate it")
-    p.add_argument("--source", help="override otel.outfile")
-    p.add_argument("--keep-raw", action="store_true",
-                   help="do not truncate afterwards. The raw file can hold "
-                        "prompts; keeping it is a deliberate choice")
-    p.set_defaults(func=cmd_otel)
+        "copilot", help="read Copilot's session journals (~/.copilot)")
+    p.add_argument("--root", help="override Copilot's home (default ~/.copilot)")
+    p.add_argument("--since", help="skip journals untouched since YYYY-MM-DD. "
+                                   "An optimisation only -- event ids are "
+                                   "deterministic, so a wrongly skipped journal "
+                                   "costs a re-read and never a duplicate")
+    p.set_defaults(func=cmd_copilot)
 
     p = sub.add_parser("collect", help="read the emit.py buffer")
     p.add_argument("--source", help="override the emit.py buffer path")
@@ -1671,6 +2318,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     p = sub.add_parser(
         "auto", help="one unattended collection run (what the scheduler calls)")
+    p.add_argument("--force-ship", action="store_true",
+                   help="upload now, ignoring the batching interval")
     p.set_defaults(func=cmd_auto)
 
     p = sub.add_parser(
@@ -1681,6 +2330,38 @@ def build_parser() -> argparse.ArgumentParser:
                    help="is it on, and when did it last run")
     p.add_argument("--yes", action="store_true", help="skip the prompt")
     p.set_defaults(func=cmd_schedule)
+
+    p = sub.add_parser(
+        "update", help="what version this is, and whether it updates itself")
+    p.add_argument("--status", action="store_true",
+                   help="version, setting, and when it last looked (default)")
+    p.add_argument("--check", action="store_true",
+                   help="look now and report; install nothing")
+    p.add_argument("--now", action="store_true",
+                   help="look now and install if there is something newer")
+    p.add_argument("--on", action="store_true", help="check daily from now on")
+    p.add_argument("--off", action="store_true", help="stop checking")
+    p.add_argument("--pin", metavar="VERSION",
+                   help="stay on this version until --unpin")
+    p.add_argument("--unpin", action="store_true")
+    p.set_defaults(func=cmd_update)
+
+    p = sub.add_parser(
+        "vscode", help="read VS Code's Copilot Chat store")
+    p.add_argument("--root", help="override the VS Code User directory")
+    p.set_defaults(func=cmd_vscode)
+
+    p = sub.add_parser(
+        "rtk", help="read rtk's per-command history, if installed")
+    p.add_argument("--probe", action="store_true",
+                   help="report what rtk is on this machine and exit")
+    p.set_defaults(func=cmd_rtk)
+
+    p = sub.add_parser(
+        "hook", help="called by Copilot before a tool runs; returns immediately")
+    p.add_argument("--now", action="store_true",
+                   help="collect in the foreground instead of detaching")
+    p.set_defaults(func=cmd_hook)
 
     p = sub.add_parser("status", help="what is buffered and what was packed")
     p.set_defaults(func=cmd_status)

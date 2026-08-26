@@ -13,7 +13,7 @@ arrive is a server nobody has tested.
 
 **Write-once is the contract, not a convention.** ``put`` refuses to overwrite,
 and both backends enforce it: S3 with a conditional write, the filesystem with
-``O_EXCL``. Object keys are content digests (``docs/TRANSPORT.md``), so a
+``O_EXCL``. Object keys are content digests (``server/README.md``), so a
 refusal means "this exact bundle is already here" -- which is the answer the
 client wants and reports as *already handed over*. Nothing in this module can
 delete; retention is a lifecycle rule and deletion is not a code path.

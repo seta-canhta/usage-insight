@@ -1,5 +1,5 @@
 -- =====================================================================================
--- 07_dq_checks.sql — dq.dq_findings + DQ-1 … DQ-16 (plus four invariant guards)
+-- 07_dq_checks.sql — dq.dq_findings + DQ-1 … DQ-16 (plus fourteen invariant guards)
 -- =====================================================================================
 -- Contract:  schema/CONTRACT.md §4 (unpriced model), §6 (AR-1),
 --            §7 (dq.dq_findings partition/cluster)
@@ -20,6 +20,18 @@
 -- run here on a schedule as a safety net even where the collector already enforces
 -- them; DQ-2 and DQ-7 hourly; the rest nightly. Running them all together is safe.
 --
+-- Ten further guards were added with contract 1.1.0 (2026-08-26), at the end of this
+-- file: DQ-SESSION, DQ-GATE, DQ-COV, DQ-GRAIN, DQ-ATTR, DQ-TOOL, DQ-BILL, DQ-MODEL,
+-- DQ-PATH, DQ-LINK. They exist because the switch from OTel spans to the Copilot
+-- session journal created several ways for a number to be wrong while looking right —
+-- an unmeasured surface reading as an unused one, a session total charged to one run,
+-- a structural zero read as a measurement. Cadence: DQ-SESSION, DQ-ATTR, DQ-MODEL and
+-- DQ-PATH hourly with the transform; the rest nightly.
+--
+-- ⚠ DQ-COV emits an `info` finding EVERY DAY whether or not anything is wrong. That is
+-- deliberate and it is the only check here that does so: a check which only speaks up
+-- on failure cannot tell you that a whole surface has been unmeasured all along.
+--
 -- Substitute ${PROJECT_ID}. Run after 04, 05, 06.
 -- =====================================================================================
 
@@ -31,7 +43,7 @@ OPTIONS (
 
 CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.dq.dq_findings`
 (
-  check_id     STRING    NOT NULL OPTIONS (description = 'Bounded enum: DQ-1 … DQ-16 from design §9.4, plus the invariant guards DQ-6b, DQ-6c, DQ-17 and DQ-RET defined in this file. CLUSTER KEY (CONTRACT §7).'),
+  check_id     STRING    NOT NULL OPTIONS (description = 'Bounded enum: DQ-1 … DQ-16 from design §9.4, plus the invariant guards defined in this file — DQ-6b, DQ-6c, DQ-17, DQ-RET, and the contract-1.1.0 set DQ-SESSION, DQ-GATE, DQ-COV, DQ-GRAIN, DQ-ATTR, DQ-TOOL, DQ-BILL, DQ-MODEL, DQ-PATH and DQ-LINK. CLUSTER KEY (CONTRACT §7).'),
   severity     STRING    NOT NULL OPTIONS (description = 'Bounded: critical | high | medium | low | info. critical blocks publication of the affected metric; high alerts the owner; the rest accumulate for trend analysis.'),
   entity_type  STRING    NOT NULL OPTIONS (description = 'Bounded: run | output | commit | pull_request | jira_issue | person | model | ci_run | event | dimension | dataset. What the entity_id refers to.'),
   entity_id    STRING             OPTIONS (description = 'Identifier of the offending entity. NULL for dataset-wide findings. Never contains content, an email address, or a secret.'),
@@ -395,23 +407,68 @@ WHERE r.ended_at IS NOT NULL
 
 
 -- =====================================================================================
--- DQ-11 — DUPLICATE EVENT (on ingest / hourly)
+-- DQ-11 — DUPLICATE EVENT (on ingest / hourly)   ⚠ RETUNED 2026-08-26
 -- =====================================================================================
 -- "Repeated event_id." Action: idempotent drop.
 -- The transforms already dedup (CONTRACT §1.3). This check exists to measure HOW MUCH
 -- duplication the pipeline is absorbing — a sudden rise means the collector's ack path
 -- is failing and delivery volume, hence cost, is being wasted.
+--
+-- ⚠⚠ WHY THIS IS NO LONGER ONE FINDING PER DUPLICATED EVENT.
+--
+-- Contract 1.1.0 made duplicates the EXPECTED STEADY STATE rather than a fault.
+-- cli/copilot_read.py derives every `event_id` from the journal record's own id, so
+-- re-reading a journal is byte-identical by design — that determinism is what makes an
+-- hourly unattended read safe over a session that stays open for days. An open session
+-- therefore re-emits every event it has ever written, every hour, until it closes.
+-- Measured on the reference machine: a second read of the same tree re-delivered 2,614
+-- of 2,935 events.
+--
+-- Left as it was, this check wrote thousands of `low` findings a day, all of them
+-- correct and none of them actionable, and the predictable result is that people stop
+-- reading dq_findings at all — which is a worse outcome than the check not existing.
+--
+-- Retuned to report the RATE, once, as a single dataset-level row, and to escalate
+-- only when the rate exceeds what re-reading open journals can explain. A per-event
+-- finding is kept for one case only: an event_id duplicated with DIFFERENT payloads,
+-- which is a genuine collision and means the natural key is not unique.
 -- =====================================================================================
 INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+-- (a) the aggregate rate — one row, always emitted, so the trend is visible
+WITH dup AS (
+  SELECT
+    e.event_id,
+    COUNT(*)                              AS deliveries,
+    COUNT(DISTINCT TO_JSON_STRING(e.attributes)) AS distinct_payloads
+  FROM `${PROJECT_ID}.raw.ai_run_event` AS e
+  WHERE DATE(e.event_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+  GROUP BY e.event_id
+)
 SELECT
-  'DQ-11', 'low', 'event', e.event_id,
-  FORMAT('Duplicate event_id delivered %d times (event_type=%s). Dropped idempotently by the transform dedup. A rising rate indicates the collector ack path is failing.',
-         COUNT(*), ANY_VALUE(e.event_type)),
+  'DQ-11',
+  -- 70% is not a measurement, it is a threshold chosen above the observed re-read rate
+  -- (2,614/2,935 = 89% on a tree of mostly-open sessions is normal; a steady state far
+  -- above that would mean something other than re-reading).
+  IF(SAFE_DIVIDE(SUM(deliveries) - COUNT(*), NULLIF(SUM(deliveries), 0)) > 0.95,
+     'medium', 'info'),
+  'dataset', 'raw.ai_run_event',
+  FORMAT('Duplicate delivery rate over 2 days: %d deliveries for %d distinct event_id (%.1f%% redundant). EXPECTED, not a fault: journal event_ids are deterministic and an open Copilot session re-emits every event on each hourly read. Investigate only on a sustained step change, or if DQ-11(b) fires.',
+         SUM(deliveries), COUNT(*),
+         SAFE_DIVIDE(SUM(deliveries) - COUNT(*), NULLIF(SUM(deliveries), 0)) * 100),
   CURRENT_TIMESTAMP()
-FROM `${PROJECT_ID}.raw.ai_run_event` AS e
-WHERE DATE(e.event_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
-GROUP BY e.event_id
-HAVING COUNT(*) > 1;
+FROM dup
+
+UNION ALL
+
+-- (b) the real fault: one event_id, two different payloads. Not a re-delivery — a
+-- natural-key collision, which means two distinct facts are overwriting each other.
+SELECT
+  'DQ-11', 'critical', 'event', d.event_id,
+  FORMAT('event_id delivered %d times with %d DIFFERENT attribute payloads. This is a natural-key collision, not a re-delivery: the dedup keeps one arbitrary row and silently discards a distinct fact. Fix the id derivation at the producer.',
+         d.deliveries, d.distinct_payloads),
+  CURRENT_TIMESTAMP()
+FROM dup AS d
+WHERE d.distinct_payloads > 1;
 
 
 -- =====================================================================================
@@ -482,7 +539,15 @@ SELECT
 FROM `${PROJECT_ID}.raw.ai_run_event` AS e
 WHERE e.ingested_at IS NOT NULL
   AND DATE(e.ingested_at) >= DATE_SUB(CURRENT_DATE(), INTERVAL 1 DAY)
-  AND TIMESTAMP_DIFF(e.ingested_at, e.event_time, DAY) > 7;
+  AND TIMESTAMP_DIFF(e.ingested_at, e.event_time, DAY) > 7
+  -- ⚠ model.call IS EXCLUDED, 2026-08-26. Since 1.1.0 that event is written at
+  -- `session.shutdown` and covers the whole session, so its event_time is the moment
+  -- the session ended — which for a session an engineer left open over a weekend is
+  -- legitimately days after the run it belongs to. That is a GRAIN, not a late
+  -- arrival, and reporting it as one buries the genuine late arrivals in noise. The
+  -- honest check for it is DQ-SESSION(b), which asks whether the shutdown landed
+  -- outside the transform's rebuild window — the thing that actually costs data.
+  AND e.event_type <> 'model.call';
 
 
 -- =====================================================================================
@@ -544,7 +609,7 @@ WHERE cs.prev_coverage_pct IS NOT NULL
 -- Implemented as a UNION ALL over each column that is legitimately used as a metric
 -- dimension anywhere in 06_marts.sql or 08_metrics.sql. Columns deliberately NOT
 -- listed here — branch_name, file_path, commit_sha, output_id, run_id, trace_id,
--- conversation_id — are payload/identifier columns and are never grouped on.
+-- copilot_session_id — are payload/identifier columns and are never grouped on.
 -- =====================================================================================
 INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
 WITH dimension_cardinality AS (
@@ -566,8 +631,20 @@ WITH dimension_cardinality AS (
   UNION ALL SELECT 'fct_ai_output.acceptance_state_reason', COUNT(DISTINCT acceptance_state_reason) FROM `${PROJECT_ID}.core.fct_ai_output` WHERE generated_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
   UNION ALL SELECT 'fct_jira_issue.issue_type',  COUNT(DISTINCT issue_type)            FROM `${PROJECT_ID}.core.fct_jira_issue` WHERE created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
   UNION ALL SELECT 'fct_jira_issue.status_category', COUNT(DISTINCT status_category)   FROM `${PROJECT_ID}.core.fct_jira_issue` WHERE created_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
-  UNION ALL SELECT 'otel_span.gen_ai_tool_name', COUNT(DISTINCT gen_ai_tool_name)      FROM `${PROJECT_ID}.raw.otel_span` WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
-  UNION ALL SELECT 'otel_span.gen_ai_operation_name', COUNT(DISTINCT gen_ai_operation_name) FROM `${PROJECT_ID}.raw.otel_span` WHERE start_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  -- ⚠ THE TWO otel_span PROBES THAT USED TO SIT HERE WERE VACUOUS FROM 2026-08-26.
+  -- raw.otel_span is frozen (01_raw.sql), so a 30-day window over it returns no rows
+  -- and COUNT(DISTINCT ...) returns 0 — a cardinality guard that can never fire is
+  -- worse than no guard, because the dashboard it protects still says "checked".
+  -- The tool-name dimension did not go away; it moved to tool.call on the correlation
+  -- stream, and it is MORE dangerous there because journal tool names include MCP
+  -- server tools, which are named by whoever wrote the server. Probed at the source.
+  UNION ALL SELECT 'ai_run_event.tool.call.tool_name', COUNT(DISTINCT JSON_VALUE(attributes, '$.tool_name')) FROM `${PROJECT_ID}.raw.ai_run_event` WHERE event_type = 'tool.call'      AND event_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  UNION ALL SELECT 'ai_run_event.tool.call.tool_kind', COUNT(DISTINCT JSON_VALUE(attributes, '$.tool_kind')) FROM `${PROJECT_ID}.raw.ai_run_event` WHERE event_type = 'tool.call'      AND event_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  UNION ALL SELECT 'ai_run_event.gate.evaluated.gate_name', COUNT(DISTINCT JSON_VALUE(attributes, '$.gate_name')) FROM `${PROJECT_ID}.raw.ai_run_event` WHERE event_type = 'gate.evaluated' AND event_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  UNION ALL SELECT 'ai_run_event.model.call.model_id',  COUNT(DISTINCT JSON_VALUE(attributes, '$.model_id'))  FROM `${PROJECT_ID}.raw.ai_run_event` WHERE event_type = 'model.call'      AND event_time >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  UNION ALL SELECT 'fct_ai_run.usage_grain',      COUNT(DISTINCT usage_grain)           FROM `${PROJECT_ID}.core.fct_ai_run` WHERE started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  UNION ALL SELECT 'fct_ai_run.usage_source',     COUNT(DISTINCT usage_source)          FROM `${PROJECT_ID}.core.fct_ai_run` WHERE started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  UNION ALL SELECT 'fct_ai_run.trace_id_namespace', COUNT(DISTINCT trace_id_namespace)  FROM `${PROJECT_ID}.core.fct_ai_run` WHERE started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
 )
 SELECT
   'DQ-15',
@@ -612,62 +689,489 @@ HAVING COUNT(DISTINCT c.run_id) > 1;
 
 
 -- =====================================================================================
--- DQ-17 — OTEL BIND FAILURE (daily)  [invariant guard, not in the §9.4 catalogue]
+-- DQ-17 — USAGE BIND FAILURE (daily)  [invariant guard, not in the §9.4 catalogue]
 -- =====================================================================================
 -- Added because the run.bound bridge in 04_transform_run.sql is the single point of
 -- failure for the entire cost side of this system, and design §9.4 has no check for
--- it. Three distinct failure modes, which look identical on a dashboard (cost = NULL)
--- and have completely different fixes:
+-- it. Distinct failure modes which look identical on a dashboard (cost = NULL) and
+-- have completely different fixes:
 --
---   (a) NO BIND      — the run never emitted run.bound. emit.py could not capture the
---                      conversation id. Fix: the emitter.
---   (b) BOUND, EMPTY — a conversation id exists but zero OTel spans matched. Fix: the
---                      Copilot OTLP exporter is off, or the collector is not receiving.
---   (c) SHARED       — one conversation id claimed by an implausible number of runs,
---                      which means the time-window disambiguation is doing heavy
---                      lifting and the token split should be spot-checked.
+--   (a) NO BIND      — the run has no session id at all: no run.bound, and its
+--                      trace_id is an emitter trace rather than a session. Fix: the
+--                      emitter's session-id capture on this surface.
+--   (b) BOUND, EMPTY — a session id exists but the session recorded no usage. Since
+--                      1.1.0 that means `session.shutdown` never arrived — the CLI
+--                      crashed, was killed, or the session is still open — so the
+--                      tokens are UNKNOWABLE, not zero. DQ-SESSION owns that case in
+--                      detail; this row is the run-level view of it.
+--   (c) SHARED       — one session id claimed by many runs. Before the cutover this
+--                      was a warning that the time-window disambiguation was doing
+--                      heavy lifting. It is no longer a warning at all: at
+--                      session-model grain a shared session makes attribution
+--                      IMPOSSIBLE rather than merely delicate, the transform sets
+--                      cost_attributable = FALSE, and the reported severity drops to
+--                      info because the correct behaviour is already happening.
 --
--- Runs on a non-exporting surface (surface='headless') legitimately have no spans and
--- are excluded from (a) and (b).
+-- ⚠ REWRITTEN 2026-08-26. The old (b) named `github.copilot.chat.otel.enabled` /
+-- `COPILOT_OTEL_ENABLED` as the remediation. That setting is now actively REMOVED by
+-- cli/vscode_setup.py, so the advice would have sent someone to switch an exporter
+-- back on — re-enabling a known content leak (microsoft/vscode#326254) to fix a
+-- problem it cannot fix. A stale remediation is worse than none.
+--
+-- Runs on a non-exporting surface (surface='headless') legitimately have no usage and
+-- are excluded from (a).
 -- =====================================================================================
 INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
 -- (a) no bind at all
 SELECT
   'DQ-17', 'high', 'run', r.run_id,
-  FORMAT('No run.bound event: otel_conversation_id is NULL (agent=%s, surface=%s). This run can NEVER be priced — the correlation stream and the OTel stream are unjoinable for it. Check emit.py conversation-id capture on this surface.',
+  FORMAT('No session bind: copilot_session_id is NULL (agent=%s, surface=%s). This run can NEVER be priced — nothing joins it to the usage stream. Fix: emit.py must emit run.bound carrying copilot_session_id (CONTRACT §3 row 2). For a run read from a journal this should be impossible: cli/copilot_read.py writes the session id into trace_id.',
          COALESCE(r.agent_name, 'unknown'), COALESCE(r.surface, 'unknown')),
   CURRENT_TIMESTAMP()
 FROM `${PROJECT_ID}.core.fct_ai_run` AS r
 WHERE r.started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 DAY)
-  AND r.otel_conversation_id IS NULL
+  AND r.copilot_session_id IS NULL
   AND COALESCE(r.surface, 'unknown') IN ('vscode-copilot-chat', 'copilot-cli')
 
 UNION ALL
 
--- (b) bound but no spans matched
+-- (b) bound but the session recorded no usage
 SELECT
   'DQ-17', 'high', 'run', r.run_id,
-  FORMAT('Bound to conversation %s but ZERO OTel spans matched the run window (agent=%s, surface=%s). The bind resolved; the exporter sent nothing. Check github.copilot.chat.otel.enabled / COPILOT_OTEL_ENABLED and the collector endpoint.',
-         r.otel_conversation_id, COALESCE(r.agent_name, 'unknown'), COALESCE(r.surface, 'unknown')),
+  FORMAT('Bound to session %s but the session recorded NO usage (agent=%s, surface=%s). The bind resolved; nothing measured. Post-cutover this means session.shutdown never arrived, so the tokens are unknowable rather than zero — see DQ-SESSION. Do NOT re-enable the OTel exporter to "fix" it; that path is closed and leaked content.',
+         r.copilot_session_id, COALESCE(r.agent_name, 'unknown'), COALESCE(r.surface, 'unknown')),
   CURRENT_TIMESTAMP()
 FROM `${PROJECT_ID}.core.fct_ai_run` AS r
 WHERE r.started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 DAY)
-  AND r.otel_conversation_id IS NOT NULL
-  AND COALESCE(r.otel_span_count, 0) = 0
+  AND r.copilot_session_id IS NOT NULL
+  AND COALESCE(r.token_source, 'none') = 'none'
 
 UNION ALL
 
--- (c) heavily shared conversation id
+-- (c) heavily shared session id — informational since 1.1.0, see the header
 SELECT
-  'DQ-17', 'medium', 'dimension', FORMAT('conversation:%s', r.otel_conversation_id),
-  FORMAT('Conversation id shared by %d runs in one day. The span->run assignment relies entirely on the time-window disambiguation in 04_transform_run.sql; spot-check the token split before trusting per-run cost for these runs.',
-         COUNT(*)),
+  'DQ-17', 'info', 'dimension', FORMAT('session:%s', r.copilot_session_id),
+  FORMAT('Session id shared by %d runs in one day. Expected on the CLI surface: /resume opens a new run in the same session and every sub-agent shares it. All %d runs correctly report cost_usd = NULL (CONTRACT §3); their usage total is in marts.v_session_usage at session grain.',
+         COUNT(*), COUNT(*)),
   CURRENT_TIMESTAMP()
 FROM `${PROJECT_ID}.core.fct_ai_run` AS r
 WHERE r.started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 2 DAY)
-  AND r.otel_conversation_id IS NOT NULL
-GROUP BY r.otel_conversation_id, DATE(r.started_at)
+  AND r.copilot_session_id IS NOT NULL
+GROUP BY r.copilot_session_id, DATE(r.started_at)
 HAVING COUNT(*) > 20;
+
+
+-- =====================================================================================
+-- CONTRACT 1.1.0 GUARDS — added 2026-08-26 with the source switch
+-- =====================================================================================
+-- Ten checks, all of them written because the switch from OTel spans to the Copilot
+-- session journal created a way for a number to be wrong while looking right. None of
+-- them is in the design §9.4 catalogue, because the catalogue predates the source.
+-- =====================================================================================
+
+
+-- =====================================================================================
+-- DQ-SESSION — SESSION WITHOUT USAGE (hourly)
+-- =====================================================================================
+-- A Copilot session records its usage totals in `session.shutdown`. A session that
+-- crashed, was killed, or is still open never writes one, so it carries NO
+-- modelMetrics at all — and its tokens are UNKNOWABLE, not zero. Measured on the
+-- reference machine 2026-08-26: 2 of 22 sessions.
+--
+-- This is the check that stops "usage fell this week" being read off a collection gap.
+-- The denominator matters and is easy to get wrong: that same tree held 28 session
+-- DIRECTORIES, six of them containing no events.jsonl at all. An empty directory
+-- recorded nothing; it is not a session whose usage went missing, and counting it here
+-- would report a gap that does not exist. This check therefore counts only sessions
+-- that produced at least one run.
+--
+-- (b) is the other half of the same fact: usage that arrived, but too late for the
+-- transform to attach it. 04_transform_run.sql rebuilds a 21-day trailing window, and
+-- 21 is a policy choice rather than a measurement — this is what makes it falsifiable.
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+WITH session_span AS (
+  SELECT
+    e.trace_id                                                   AS session_id,
+    MIN(e.event_time)                                            AS first_event_at,
+    MAX(e.event_time)                                            AS last_event_at,
+    COUNTIF(e.event_type = 'run.started')                        AS run_count,
+    COUNTIF(e.event_type = 'model.call')                         AS usage_event_count,
+    MIN(IF(e.event_type = 'model.call', e.event_time, NULL))     AS usage_at
+  FROM `${PROJECT_ID}.raw.ai_run_event` AS e
+  WHERE DATE(e.event_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 14 DAY)
+    AND e.trace_id IS NOT NULL
+    -- Session ids only. The emitter's trc_ namespace is a different thing and has no
+    -- shutdown event to be missing.
+    AND NOT STARTS_WITH(e.trace_id, 'trc_')
+  GROUP BY e.trace_id
+)
+-- (a) ran, but never reported usage
+SELECT
+  'DQ-SESSION', 'medium', 'dimension', FORMAT('session:%s', s.session_id),
+  FORMAT('Session hosted %d run(s) over %d hour(s) but emitted NO model.call: session.shutdown never arrived (crashed, killed, or still open). Its tokens and premium requests are UNKNOWABLE, not zero — every run in it reports token_source = none. Do not read a fall in measured usage as a fall in usage until this count is stable.',
+         s.run_count,
+         TIMESTAMP_DIFF(s.last_event_at, s.first_event_at, HOUR)),
+  CURRENT_TIMESTAMP()
+FROM session_span AS s
+WHERE s.run_count > 0
+  AND s.usage_event_count = 0
+  -- Still-open sessions are the normal case within the last day; only report one that
+  -- has gone quiet, or the check fires on every session anybody is currently using.
+  AND s.last_event_at < TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 24 HOUR)
+
+UNION ALL
+
+-- (b) usage arrived, but outside the transform's rebuild window
+SELECT
+  'DQ-SESSION', 'high', 'dimension', FORMAT('session:%s', s.session_id),
+  FORMAT('Session usage arrived %d days after the session first appeared, which exceeds the 21-day rebuild window in 04_transform_run.sql. The run rows had already left the window, so these tokens were merged onto nothing. Widen window_days, or accept the loss knowingly — this is the check that makes that a decision rather than a discovery.',
+         TIMESTAMP_DIFF(s.usage_at, s.first_event_at, DAY)),
+  CURRENT_TIMESTAMP()
+FROM session_span AS s
+WHERE s.usage_at IS NOT NULL
+  AND TIMESTAMP_DIFF(s.usage_at, s.first_event_at, DAY) > 21;
+
+
+-- =====================================================================================
+-- DQ-GATE — GATE VERDICT ABSENT (daily)
+-- =====================================================================================
+-- CONTRACT §3 row 9: a gate verdict comes from the `<exited with exit code N>` trailer
+-- Copilot's bash tool appends, and it is absent on roughly 12% of calls — the command
+-- was still running, or its output was truncated past the trailer.
+--
+-- Absent means NULL. A gate with no verdict is excluded from the pass-rate denominator
+-- (04_transform_run.sql `gate_final`), which is correct and which also means it leaves
+-- no trace in the rate itself. This check is the trace. A pass rate quoted without its
+-- known-share is not a pass rate, and `gate_verdict_known_pct` in the mart exists so
+-- the share travels with the number.
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+SELECT
+  'DQ-GATE',
+  -- Above a third unknown the rate is being computed over a minority of the evidence.
+  IF(SAFE_DIVIDE(COUNTIF(JSON_VALUE(e.attributes, '$.status') IS NULL), COUNT(*)) > 0.33,
+     'high', 'info'),
+  'dimension', COALESCE(JSON_VALUE(e.attributes, '$.gate_name'), 'unknown'),
+  FORMAT('%d of %d %s-gate evaluations in the last 7 days carried NO verdict (%.1f%%). Those are excluded from gate_pass_rate_pct — a missing verdict is neither a pass nor a fail. Publish gate_verdict_known_pct beside the rate or the rate is unqualified. Expected steady state is ~12%%.',
+         COUNTIF(JSON_VALUE(e.attributes, '$.status') IS NULL),
+         COUNT(*),
+         COALESCE(JSON_VALUE(e.attributes, '$.gate_name'), 'unknown'),
+         SAFE_DIVIDE(COUNTIF(JSON_VALUE(e.attributes, '$.status') IS NULL), COUNT(*)) * 100),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.raw.ai_run_event` AS e
+WHERE e.event_type = 'gate.evaluated'
+  AND DATE(e.event_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+GROUP BY JSON_VALUE(e.attributes, '$.gate_name')
+HAVING COUNTIF(JSON_VALUE(e.attributes, '$.status') IS NULL) > 0;
+
+
+-- =====================================================================================
+-- DQ-COV — SURFACE COVERAGE (daily)  ⭐ the one that stops a coverage cut reading as a usage cut
+-- =====================================================================================
+-- The Copilot session journal covers the `copilot-cli` surface and NOTHING ELSE. VS
+-- Code's Copilot Chat panel and inline completions write nothing to it. That is a
+-- deliberate scope decision (TODO.md, 2026-08-26), not an oversight — and it is
+-- exactly the kind of decision that becomes invisible three months later, at which
+-- point a drop in measured tokens gets reported as a drop in AI usage.
+--
+-- So this check emits an `info` row EVERY DAY, unconditionally, naming the unmeasured
+-- surfaces. A check that only fires when something is wrong cannot tell you that
+-- something has been missing all along.
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+-- (a) the standing statement of scope — always emitted
+SELECT
+  'DQ-COV', 'info', 'dataset', 'surface_coverage',
+  FORMAT('Measured surfaces: copilot-cli only. UNMEASURED: vscode-copilot-chat, inline-completions — they write no session journal and no span stream (the exporter is removed). Last 7 days: %d run(s) on measured surfaces, %d on unmeasured ones. A fall in measured tokens is a fall in COVERAGE unless the unmeasured count also fell. Never present a token total as organisation-wide AI usage.',
+         COUNTIF(COALESCE(r.surface, 'unknown') IN ('copilot-cli', 'headless')),
+         COUNTIF(COALESCE(r.surface, 'unknown') NOT IN ('copilot-cli', 'headless'))),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.core.fct_ai_run` AS r
+WHERE r.started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+
+UNION ALL
+
+-- (b) an unmeasured surface that is actually being used, at volume
+SELECT
+  'DQ-COV', 'medium', 'dimension', COALESCE(r.surface, 'unknown'),
+  FORMAT('%d run(s) in the last 7 days on surface=%s, which emits NO usage data at all. Their tokens are unmeasured, not zero: token_source = none on every one. Any per-surface cost comparison that includes this surface is comparing a measurement against a blank.',
+         COUNT(*), COALESCE(r.surface, 'unknown')),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.core.fct_ai_run` AS r
+WHERE r.started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+  AND COALESCE(r.surface, 'unknown') NOT IN ('copilot-cli', 'headless')
+GROUP BY r.surface
+HAVING COUNT(*) > 0;
+
+
+-- =====================================================================================
+-- DQ-GRAIN — GRAIN MIX (daily)  ⭐ the trend-honesty guard
+-- =====================================================================================
+-- Three invariants, all about the same thing: a chart must never add a per-call
+-- measurement to a per-session measurement without saying so.
+--
+--   (a) a fact row whose usage_source contradicts the cutover date — the hard guard in
+--       04_transform_run.sql should make this impossible, which is exactly why it is
+--       worth checking: an impossible thing that happens is a broken assumption.
+--   (b) a mart row aggregating both grains outside the cutover day itself.
+--   (c) marts.dim_grain_cutover disagreeing with the data. A dashboard annotating the
+--       wrong day is worse than one annotating nothing.
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+-- (a) a run processed by the wrong branch
+SELECT
+  'DQ-GRAIN', 'critical', 'run', r.run_id,
+  FORMAT('Run started %s carries usage_source=%s / usage_grain=%s, which contradicts the cutover boundary in marts.dim_grain_cutover (%s). 04_transform_run.sql gates the two branches on started_at, so this should be structurally impossible — the guard has been removed, the cutover date has moved without a rebuild, or a row predates the migration and was never backfilled.',
+         FORMAT_TIMESTAMP('%Y-%m-%d', r.started_at),
+         COALESCE(r.usage_source, 'NULL'), COALESCE(r.usage_grain, 'NULL'),
+         FORMAT_DATE('%Y-%m-%d', c.cutover_date)),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.core.fct_ai_run` AS r
+CROSS JOIN `${PROJECT_ID}.marts.dim_grain_cutover` AS c
+WHERE r.started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 30 DAY)
+  AND (   (DATE(r.started_at) >= c.cutover_date AND r.usage_source = 'otel_span')
+       OR (DATE(r.started_at) <  c.cutover_date AND r.usage_source = 'copilot_journal'))
+
+UNION ALL
+
+-- (b) a mart row that mixes grains away from the boundary
+SELECT
+  'DQ-GRAIN', 'high', 'dataset',
+  FORMAT('agg_daily_person_agent:%s', FORMAT_DATE('%Y-%m-%d', a.day)),
+  FORMAT('%d mart row(s) on %s aggregate BOTH usage grains (per_call and per_session_model) into one row. Every token total and every rate on those rows adds two different measurements together. Only the cutover day itself (%s) may legitimately do this.',
+         COUNT(*), FORMAT_DATE('%Y-%m-%d', a.day),
+         FORMAT_DATE('%Y-%m-%d', ANY_VALUE(c.cutover_date))),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.marts.agg_daily_person_agent` AS a
+CROSS JOIN `${PROJECT_ID}.marts.dim_grain_cutover` AS c
+WHERE a.day >= DATE_SUB(CURRENT_DATE(), INTERVAL 45 DAY)
+  AND COALESCE(a.usage_grain_mixed, FALSE)
+  AND a.day <> c.cutover_date
+GROUP BY a.day
+
+UNION ALL
+
+-- (c) the published boundary does not match the data
+SELECT
+  'DQ-GRAIN', 'high', 'dimension', 'marts.dim_grain_cutover',
+  FORMAT('dim_grain_cutover.cutover_date is %s but the earliest run measured at per_session_model grain started %s. Every dashboard annotation drawn from this table is on the wrong day. Reconcile it with the cutover_date DECLARE in 04_transform_run.sql.',
+         FORMAT_DATE('%Y-%m-%d', ANY_VALUE(c.cutover_date)),
+         FORMAT_DATE('%Y-%m-%d', MIN(DATE(r.started_at)))),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.core.fct_ai_run` AS r
+CROSS JOIN `${PROJECT_ID}.marts.dim_grain_cutover` AS c
+WHERE r.usage_grain = 'per_session_model'
+HAVING MIN(DATE(r.started_at)) IS DISTINCT FROM ANY_VALUE(c.cutover_date);
+
+
+-- =====================================================================================
+-- DQ-ATTR — MULTI-RUN SESSION PRICED (hourly)
+-- =====================================================================================
+-- A direct CONTRACT §3 breach: "A session that hosted more than one run must report
+-- cost_usd = NULL for its constituent runs rather than a share of the total."
+--
+-- 04_transform_run.sql enforces it structurally, so this check should never fire. That
+-- is the reason to run it. The failure it guards against is the most seductive one in
+-- the whole system — somebody, reasonably, wanting the cost column filled in, and
+-- splitting a session total by run count or by elapsed time. Both look like arithmetic
+-- and are both §2.4's forbidden synthesised join key.
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+SELECT
+  'DQ-ATTR', 'critical', 'run', r.run_id,
+  FORMAT('Run carries a non-NULL cost_usd while sharing session %s with %d other run(s). CONTRACT §3 forbids this: a per-session usage total cannot be apportioned across the runs in the session by any rule. Somebody has added an apportionment. Remove it; the session total belongs in marts.v_session_usage, at the grain where it is true.',
+         r.copilot_session_id, r.session_run_count - 1),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.core.fct_ai_run` AS r
+WHERE r.started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+  AND r.usage_grain = 'per_session_model'
+  AND COALESCE(r.session_run_count, 1) > 1
+  AND r.cost_usd IS NOT NULL;
+
+
+-- =====================================================================================
+-- DQ-TOOL — TOOL STATUS COVERAGE (daily)
+-- =====================================================================================
+-- CONTRACT §3 row 6: `status` is `ok` | `error`, and it was structurally NULL under the
+-- span source. 04_transform_run.sql compounded that by counting errors as
+-- `status = 'failed'` — a value the enum has never contained — so tool_error_count was
+-- 0 by construction from the day it was written and "zero tool failures" was published
+-- as a measurement for the life of the pipeline.
+--
+-- Both are fixed. This check exists so the same silence cannot come back: it reports
+-- how much of the tool traffic actually carries a verdict, and fires loudly if the
+-- share collapses (a producer regression) or if a value outside the enum appears (a
+-- producer drifting away from the contract, which is how the last one started).
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+-- (a) coverage
+SELECT
+  'DQ-TOOL',
+  IF(SAFE_DIVIDE(COUNTIF(JSON_VALUE(e.attributes, '$.status') IS NULL), COUNT(*)) > 0.5,
+     'high', 'info'),
+  'dataset', 'tool.call.status',
+  FORMAT('%d of %d tool.call events in the last 7 days carry a status (%.1f%% coverage); %d report error. A zero error count is only meaningful at high coverage — at low coverage it means nothing was watching.',
+         COUNTIF(JSON_VALUE(e.attributes, '$.status') IS NOT NULL), COUNT(*),
+         SAFE_DIVIDE(COUNTIF(JSON_VALUE(e.attributes, '$.status') IS NOT NULL), COUNT(*)) * 100,
+         COUNTIF(JSON_VALUE(e.attributes, '$.status') = 'error')),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.raw.ai_run_event` AS e
+WHERE e.event_type = 'tool.call'
+  AND DATE(e.event_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+HAVING COUNT(*) > 0
+
+UNION ALL
+
+-- (b) a value outside the CONTRACT §3 row 6 enum
+SELECT
+  'DQ-TOOL', 'high', 'dimension',
+  FORMAT('tool.call.status:%s', JSON_VALUE(e.attributes, '$.status')),
+  FORMAT('tool.call status value %s is outside the CONTRACT §3 row 6 enum (ok | error), seen %d times in 7 days. Every COUNTIF in the transform tests the enum exactly, so an out-of-enum value is counted as NEITHER ok nor error and disappears — which is precisely how tool_error_count came to be permanently zero.',
+         JSON_VALUE(e.attributes, '$.status'), COUNT(*)),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.raw.ai_run_event` AS e
+WHERE e.event_type = 'tool.call'
+  AND DATE(e.event_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+  AND JSON_VALUE(e.attributes, '$.status') IS NOT NULL
+  AND JSON_VALUE(e.attributes, '$.status') NOT IN ('ok', 'error')
+GROUP BY JSON_VALUE(e.attributes, '$.status');
+
+
+-- =====================================================================================
+-- DQ-BILL — BILLING SEPARATION (daily)
+-- =====================================================================================
+-- CONTRACT §4.1: `premium_requests` is the measured count of the unit Copilot actually
+-- bills; `cost_usd` is a modelled economic weight in dollars. "Report them alongside
+-- cost_usd, never blended into it: one is measured and dimensionless, the other is
+-- modelled and in dollars, and a single number carrying both would be defensible as
+-- neither."
+--
+-- The rule is easy to state and easy to break by accident, because both columns sit
+-- next to each other on every cost row and both look like "how much did this cost".
+-- This check reads the actual view definitions out of INFORMATION_SCHEMA and looks for
+-- one appearing in an arithmetic expression with the other.
+--
+-- It is a HEURISTIC — a regex over SQL text, not a parse — and it is deliberately
+-- biased towards false positives. A spurious finding costs somebody two minutes; a
+-- missed one puts a number in front of finance that is neither a count nor a currency.
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+SELECT
+  'DQ-BILL', 'critical', 'dataset',
+  FORMAT('marts.%s', v.table_name),
+  FORMAT('View marts.%s appears to combine premium_requests with a dollar column in one expression. CONTRACT §4.1 forbids it: premium_requests is a measured, dimensionless billing count and cost_usd is a modelled dollar figure. Carry them side by side. (Heuristic text match — verify, then either fix the view or narrow the pattern.)',
+         v.table_name),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.marts.INFORMATION_SCHEMA.VIEWS` AS v
+WHERE REGEXP_CONTAINS(v.view_definition, r'premium_requests')
+  AND REGEXP_CONTAINS(v.view_definition, r'_usd')
+  AND REGEXP_CONTAINS(
+        v.view_definition,
+        r'(?i)(premium_requests\s*[\+\-\*/]|[\+\-\*/]\s*premium_requests|[a-z_]*_usd\s*[\+\-\*/]\s*[a-z_.]*premium_requests|premium_requests[a-z_.]*\s*[\+\-\*/]\s*[a-z_.]*_usd)');
+
+
+-- =====================================================================================
+-- DQ-MODEL — MODEL ID UNKNOWN TO THE PRICE BOOK (hourly)
+-- =====================================================================================
+-- The pricing join in 04_transform_run.sql is EXACT on model_id, so a one-character
+-- drift between what the source calls a model and what core.dim_model_pricing calls it
+-- prices EVERYTHING to NULL. DQ-6 catches this at run grain, after the damage; this
+-- catches it at the source, where the fix is a single row in the price book.
+--
+-- It matters more than it did. Under the span source the id came from
+-- gen_ai.response.model; since 1.1.0 it is the MAP KEY of
+-- session.shutdown.modelMetrics — a different field from a different producer, which
+-- can rename or restyle without any notice reaching this warehouse.
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+SELECT
+  'DQ-MODEL', 'high', 'model',
+  JSON_VALUE(e.attributes, '$.model_id'),
+  FORMAT('model_id %s appeared on %d model.call event(s) in the last 7 days and has NO row in core.dim_model_pricing valid on those dates. Every one of those sessions prices to cost_usd = NULL (CONTRACT §4, never 0). Add the id with sql/09_set_model_price.sql — and check it against the journal key, not against the agent frontmatter spelling.',
+         JSON_VALUE(e.attributes, '$.model_id'), COUNT(*)),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.raw.ai_run_event` AS e
+WHERE e.event_type = 'model.call'
+  AND DATE(e.event_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 7 DAY)
+  AND JSON_VALUE(e.attributes, '$.model_id') IS NOT NULL
+  AND NOT EXISTS (
+    SELECT 1 FROM `${PROJECT_ID}.core.dim_model_pricing` AS p
+    WHERE p.model_id = JSON_VALUE(e.attributes, '$.model_id')
+      AND DATE(e.event_time) BETWEEN p.effective_from
+                                 AND COALESCE(p.effective_to, DATE '9999-12-31')
+  )
+GROUP BY JSON_VALUE(e.attributes, '$.model_id');
+
+
+-- =====================================================================================
+-- DQ-PATH — ABSOLUTE FILE PATH (hourly)
+-- =====================================================================================
+-- CONTRACT §1.1 and design §11.3: no raw identifiers. Journal file paths are absolute
+-- and begin `/Users/<name>/`, which is somebody's name. cli/copilot_read.py makes them
+-- repo-relative and DROPS a path that sits under no known root rather than truncating
+-- it — a half-path is not worth a guess about which prefix was safe to remove.
+--
+-- The client guards it. This checks it. The two are not the same thing: the guard runs
+-- on a laptop that may be running last month's build, and "the client handles it" is
+-- how a leak reaches a warehouse table with 396-day retention.
+--
+-- ⚠ THIS FINDING MUST NOT QUOTE THE PATH. Doing so would copy the identifier into
+-- dq_findings, which is the leak this check exists to detect. Only the shape is
+-- reported.
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+SELECT
+  'DQ-PATH', 'critical', 'run', e.run_id,
+  FORMAT('%d output.generated event(s) on this run carry an ABSOLUTE file_path (shape: %s). CONTRACT §1.1 / design §11.3 — an absolute path begins with somebody home directory and is a raw identifier. The client makes paths repo-relative; this one did not, so a client is out of date or a new producer skipped the rule. The path itself is deliberately NOT quoted here: repeating it would copy the identifier into dq_findings.',
+         COUNT(*),
+         ANY_VALUE(CASE
+           WHEN STARTS_WITH(JSON_VALUE(e.attributes, '$.file_path'), '/Users/')  THEN 'posix-home-macos'
+           WHEN STARTS_WITH(JSON_VALUE(e.attributes, '$.file_path'), '/home/')   THEN 'posix-home-linux'
+           WHEN STARTS_WITH(JSON_VALUE(e.attributes, '$.file_path'), '/')        THEN 'posix-absolute'
+           ELSE 'windows-drive-absolute'
+         END)),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.raw.ai_run_event` AS e
+WHERE e.event_type = 'output.generated'
+  AND DATE(e.event_time) >= DATE_SUB(CURRENT_DATE(), INTERVAL 2 DAY)
+  AND JSON_VALUE(e.attributes, '$.file_path') IS NOT NULL
+  AND (   STARTS_WITH(JSON_VALUE(e.attributes, '$.file_path'), '/')
+       OR REGEXP_CONTAINS(JSON_VALUE(e.attributes, '$.file_path'), r'^[A-Za-z]:[\\/]'))
+GROUP BY e.run_id;
+
+
+-- =====================================================================================
+-- DQ-LINK — MEASURED USAGE EXCLUDED BY THE EXPLICIT-LINK GATE (daily)
+-- =====================================================================================
+-- CONTRACT §2.4: only `link_method = 'explicit'` rows may feed cost-per-output
+-- metrics, and marts.v_cost_per_accepted_output / marts.v_config_comparison apply that
+-- filter. The rule is correct and this check does NOT propose widening it: a heuristic
+-- link cannot reliably attribute an output to a run, and cli/link_runs.py says so in
+-- its own docstring.
+--
+-- What the rule does NOT do is explain itself. Journal-derived runs carry
+-- `heuristic`, so on a CLI-only estate those two views can be entirely EMPTY while
+-- tokens are flowing — and an empty view reads as "no cost" rather than "cost
+-- excluded by design". This check turns a mysterious blank into a stated exclusion,
+-- and names the one thing that changes it: emit.py emitting run.bound with
+-- copilot_session_id, which is what earns `explicit`.
+-- =====================================================================================
+INSERT INTO `${PROJECT_ID}.dq.dq_findings` (check_id, severity, entity_type, entity_id, detail, detected_at)
+SELECT
+  'DQ-LINK',
+  IF(SAFE_DIVIDE(SUM(IF(r.link_method = 'explicit', r.total_tokens, 0)),
+                 NULLIF(SUM(r.total_tokens), 0)) < 0.05, 'high', 'info'),
+  'dataset', 'v_cost_per_accepted_output',
+  FORMAT('Of %d measured tokens in the last 7 days, %.1f%% sit on runs with link_method = explicit and are therefore the ONLY tokens visible to v_cost_per_accepted_output and v_config_comparison (CONTRACT §2.4). The rest are excluded BY DESIGN, not lost: they remain in marts.v_session_usage and in every session/person/repo/week aggregate. If those two views look empty, this is why. The unlock is emit.py emitting run.bound with copilot_session_id — that, and only that, earns explicit.',
+         SUM(r.total_tokens),
+         SAFE_DIVIDE(SUM(IF(r.link_method = 'explicit', r.total_tokens, 0)),
+                     NULLIF(SUM(r.total_tokens), 0)) * 100),
+  CURRENT_TIMESTAMP()
+FROM `${PROJECT_ID}.core.fct_ai_run` AS r
+WHERE r.started_at >= TIMESTAMP_SUB(CURRENT_TIMESTAMP(), INTERVAL 7 DAY)
+  AND r.total_tokens IS NOT NULL
+HAVING SUM(r.total_tokens) > 0;
 
 
 -- =====================================================================================

@@ -21,25 +21,59 @@
 -- core.fct_ai_run — one row per agent invocation
 -- =====================================================================================
 -- The atom of AI measurement. Built by 04_transform_run.sql from the correlation
--- stream JOINED to the OTel stream via the run.bound bridge.
+-- stream, which since contract 1.1.0 carries the usage events too.
 --
 -- Grain: run_id. A supervisor and each of its sub-agents are SEPARATE rows sharing one
 -- trace_id (AR-4: the supervisor's totals are computed by rolling up trace_id, never
 -- by re-counting sub-agent outputs onto the supervisor row).
+--
+-- ┌───────────────────────────────────────────────────────────────────────────────────┐
+-- │ ⚠ 1.1.0 — USAGE IS NO LONGER MEASURED AT THIS GRAIN, AND MOST ROWS SAY SO         │
+-- │                                                                                   │
+-- │ The OTel span source emitted one usage record per API call, individually           │
+-- │ timestamped, so tokens could be placed on the run that made the call. Copilot     │
+-- │ CLI's session journal does not: it totals usage per session in                    │
+-- │ `session.shutdown`, so one `model.call` event now covers every call to one model  │
+-- │ in one WHOLE SESSION, stamped at shutdown.                                        │
+-- │                                                                                   │
+-- │ A session hosts several runs — sequential invocations, resumes, and every         │
+-- │ sub-agent. CONTRACT §3 is explicit: a session that hosted more than one run must  │
+-- │ report `cost_usd = NULL` for its constituent runs rather than a share of the      │
+-- │ total. Apportioning a measured total by time or by call count is synthesising a   │
+-- │ join key with arithmetic on top.                                                  │
+-- │                                                                                   │
+-- │ So: `session_run_count` and `cost_attributable` below say whether this row's      │
+-- │ usage could be attributed at all, and `usage_grain` / `usage_source` say how it   │
+-- │ was measured. Session-grain totals — which ARE valid, and are what the §6 cost    │
+-- │ figures are built from — live in marts.v_session_usage (08_metrics.sql).          │
+-- │                                                                                   │
+-- │ Expect run-level cost coverage to fall sharply at the cutover. That fall is the   │
+-- │ truth becoming visible, not a regression; marts.dim_grain_cutover exists so a     │
+-- │ dashboard can draw the line rather than a reader inventing an explanation.        │
+-- └───────────────────────────────────────────────────────────────────────────────────┘
 -- =====================================================================================
 CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.core.fct_ai_run`
 (
   -- ---- identity ----
   run_id                 STRING    NOT NULL OPTIONS (description = 'PRIMARY KEY. run_<uuid4hex>. One agent invocation.'),
-  trace_id               STRING    NOT NULL OPTIONS (description = 'One user-initiated workflow. Supervisor + sub-agents share it. AR-4 rolls up on this column.'),
+  -- NULLABLE since 1.1.0 for the same reason as raw.ai_run_event.trace_id: a producer
+  -- that has no trace id must yield NULL, not fail the load.
+  trace_id               STRING             OPTIONS (description = 'One user-initiated workflow. Supervisor + sub-agents share it. AR-4 rolls up on this column. TWO NAMESPACES since 1.1.0 — see trace_id_namespace.'),
+  trace_id_namespace     STRING             OPTIONS (description = 'Bounded: emitter_trace (trc_<uuid4hex>, minted by emit.py) | copilot_session (a Copilot CLI session-state directory name, written by cli/copilot_read.py) | unknown. The two are disjoint by construction, so grouping on trace_id is safe; this column exists so the overload is visible in the data rather than only in a comment, and so a rollup can state which stream it describes.'),
   parent_run_id          STRING             OPTIONS (description = 'Sub-agent -> supervisor edge. NULL for a root run. is_root_run below is the convenience flag.'),
   is_root_run            BOOL               OPTIONS (description = 'parent_run_id IS NULL. Denormalised because almost every aggregate needs to avoid double-counting nested runs.'),
   workflow_id            STRING             OPTIONS (description = 'Legacy human-readable bridge, wf-{JIRA}-{YYYYMMDD}.'),
 
-  -- ---- ⭐ the OTel bridge ----
-  otel_conversation_id   STRING             OPTIONS (description = '⭐ gen_ai.conversation.id, taken from the run.bound event attributes. THE key that binds the correlation stream to the OTel stream. NULL means this run has no token data at all — see token_source.'),
-  otel_trace_id          STRING             OPTIONS (description = 'The OTel-side trace id observed for this conversation. Diagnostic only: NOT the same namespace as trace_id above. Never join the two.'),
-  otel_span_count        INT64              OPTIONS (description = 'Number of OTel spans bound to this run. 0 with a non-NULL conversation id means the bind resolved but the exporter sent nothing — a distinct failure mode from an unbound run, and DQ-17 separates them.'),
+  -- ---- ⭐ the usage bridge ----
+  -- RENAMED in 1.1.0 from otel_conversation_id. Same role, different thing: a Copilot
+  -- CLI session id, not a chat conversation id. Sourced from run.bound
+  -- attributes.copilot_session_id (falling back to the old attribute name so a client
+  -- that has not upgraded still binds), or from trace_id where the journal wrote it.
+  copilot_session_id     STRING             OPTIONS (description = '⭐ The ~/.copilot/session-state/<id> directory name. THE key that binds a run to the usage stream. NULL means this run has no usage data at all — see token_source. ⚠ NOT a join key on its own (CONTRACT §3): one session hosts many runs.'),
+  session_run_count      INT64              OPTIONS (description = 'How many runs share this copilot_session_id inside the transform window. > 1 means the session hosted several runs, so its per-session usage total CANNOT be attributed to this row (CONTRACT §3) — cost_attributable is FALSE and cost_usd is NULL. NULL when the run has no session id.'),
+  cost_attributable      BOOL               OPTIONS (description = 'TRUE when usage measured at session grain belongs unambiguously to this run (session_run_count = 1), or when usage was measured per call (pre-cutover span source). FALSE when a multi-run session made attribution impossible. Distinguishes "this run was free" from "this run cannot be costed" — the two look identical on a dashboard and are opposite facts.'),
+  otel_trace_id          STRING             OPTIONS (description = '⚠ LEGACY, pre-cutover rows only. The OTel-side trace id observed for this conversation. Diagnostic only: NOT the same namespace as trace_id above. Never join the two.'),
+  otel_span_count        INT64              OPTIONS (description = '⚠ LEGACY, pre-cutover rows only. Number of OTel spans bound to this run. 0 with a non-NULL session id means the bind resolved but the exporter sent nothing. Always 0 post-cutover: nothing writes raw.otel_span any more, and DQ-17 no longer reads it as a failure.'),
 
   -- ---- time ----
   started_at             TIMESTAMP NOT NULL OPTIONS (description = 'event_time of run.started. PARTITION KEY (CONTRACT §7).'),
@@ -80,8 +114,28 @@ CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.core.fct_ai_run`
   output_tokens          INT64              OPTIONS (description = 'SUM(gen_ai.usage.output_tokens).'),
   cached_input_tokens    INT64              OPTIONS (description = 'SUM of cached-input tokens. A SUBSET of input_tokens, billed at the cheaper cached rate (CONTRACT §4).'),
   reasoning_tokens       INT64              OPTIONS (description = 'SUM of reasoning tokens. A SUBSET of output_tokens. Reported for visibility; NOT added into total_tokens.'),
-  total_tokens           INT64              OPTIONS (description = 'DERIVED as input + output. Copilot does NOT emit gen_ai.usage.total_tokens (design §4.4a), so this is computed, never read. Cached and reasoning are subsets and are not added.'),
-  token_source           STRING             OPTIONS (description = 'measured_otel | modelled_estimate | none. Explains WHY tokens are NULL, which matters more than the NULL itself.'),
+  cache_write_tokens     INT64              OPTIONS (description = 'Added 1.1.0 (journal: usage.cacheWriteTokens). Tokens written INTO the prompt cache. ⚠ NOT part of the CONTRACT §4 three-term cost formula and deliberately NOT added into total_tokens: it is neither an input nor an output term, and folding it in would inflate every token figure across the cutover by an amount nobody could reconstruct. NULL pre-cutover — the span source never reported it.'),
+  total_tokens           INT64              OPTIONS (description = 'DERIVED as input + output ONLY. Cached-input, reasoning and cache-write are excluded: the first two are subsets of the terms already counted, the third is not a §4 term at all. Neither source emits a total (design §4.4a), so this is computed, never read.'),
+  token_source           STRING             OPTIONS (description = 'Bounded: measured_journal (1.1.0, per session×model) | session_not_attributable | measured_otel (LEGACY, per call) | modelled_estimate | none. Explains WHY tokens are NULL, which matters more than the NULL itself. session_not_attributable is the 1.1.0 case that has no precedent: usage for this session EXISTS and was measured, but the session hosted several runs so CONTRACT §3 forbids giving any of them a share — the total is in marts.v_session_usage. It is a different fact from `none` (nothing was ever measured) and only one of the two is fixable by turning telemetry on. Read together with usage_grain: the two measured values are not the same measurement.'),
+
+  -- ---- usage provenance and grain (1.1.0) ----
+  -- A date alone cannot mark this boundary: 04_transform_run.sql rebuilds a trailing
+  -- window and 06_marts.sql rebuilds 45 days, so a row's grain depends on which
+  -- source produced it, not on when the job ran. Carrying it as data makes the
+  -- boundary joinable (marts.dim_grain_cutover) and the mix detectable (DQ-GRAIN).
+  usage_grain            STRING             OPTIONS (description = 'Bounded: per_call | per_session_model | none. HOW the usage on this row was measured. per_call = one record per API call (span source, or emitter estimate). per_session_model = one record covering every call to one model in one whole session (Copilot journal, 1.1.0). A trend that crosses a change in this column is comparing two different measurements — join marts.dim_grain_cutover and annotate the chart.'),
+  usage_source           STRING             OPTIONS (description = 'Bounded: otel_span | copilot_journal | emitter_estimate | none. WHICH producer supplied the usage. Never both: 04_transform_run.sql gates the span branch on started_at < cutover_date so no row is ever processed by two branches, and DQ-GRAIN reports it if one ever is.'),
+
+  -- ---- billing units (1.1.0) — measured, dimensionless, and NEVER blended with dollars ----
+  -- CONTRACT §4.1: Copilot charges per seat plus premium requests, never per token.
+  -- cost_usd is therefore an economic WEIGHT, modelled from list prices; these are the
+  -- measured billing counts. "one is measured and dimensionless, the other is modelled
+  -- and in dollars, and a single number carrying both would be defensible as neither."
+  -- They are carried BESIDE cost_usd, never inside it, and never inside total_cost_usd.
+  -- DQ-BILL scans view definitions for any expression that mixes the two.
+  premium_requests       NUMERIC            OPTIONS (description = 'Added 1.1.0 (journal: modelMetrics.<model>.requests.cost). THE BILLING UNIT — the count of premium requests Copilot actually charges for. NUMERIC, not INT64, and that is not cosmetic: the per-request cost is fractional by model tier (0.33, 1.0, ...) and an INT64 column truncates 0.33 to 0, standing a measured zero in for real billed usage. Never add this to a dollar figure. NULL pre-cutover.'),
+  request_count          INT64              OPTIONS (description = 'Added 1.1.0 (journal: modelMetrics.<model>.requests.count). THE REAL NUMBER OF API CALLS. model_call_count no longer means this — see its description. NULL pre-cutover.'),
+  nano_aiu               INT64              OPTIONS (description = 'Added 1.1.0 (journal: totalNanoAiu). Copilot own usage quantum. Measured, not a price; report beside cost_usd, never inside it. NULL pre-cutover.'),
 
   -- ---- cost (CONTRACT §4) ----
   cost_usd               NUMERIC            OPTIONS (description = 'Token cost per CONTRACT §4, priced through the effective-dated dim_model_pricing join. NULL for an unpriced model — NEVER 0 (CONTRACT §4). Excludes seat and infra, which are allocated per person-month under AR-8; see 06_marts.sql.'),
@@ -90,10 +144,11 @@ CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.core.fct_ai_run`
   pricing_effective_from DATE               OPTIONS (description = 'effective_from of the price row actually used. Makes a historical cost figure auditable and reproducible.'),
 
   -- ---- activity counters ----
-  tool_call_count        INT64              OPTIONS (description = 'COUNT of execute_tool spans bound to this run.'),
-  tool_error_count       INT64              OPTIONS (description = 'execute_tool spans with status_code = ERROR. Feeds the §7.8 per-integration error rate.'),
-  model_call_count       INT64              OPTIONS (description = 'COUNT of chat spans bound to this run.'),
-  retry_count            INT64              OPTIONS (description = 'SUM of retries across model and tool calls. Feeds the §7.8 retry rate.'),
+  tool_call_count        INT64              OPTIONS (description = 'COUNT of tool calls attributed to this run — tool.call events since 1.1.0, execute_tool spans before the cutover.'),
+  tool_error_count       INT64              OPTIONS (description = 'Tool calls whose status is `error` (CONTRACT §3 row 6 enum: ok | error). ⚠ NULL, not 0, when the run made tool calls and NONE of them reported a status: a zero is only a zero if something was watching. Read with tool_status_unknown_count. FIXED 2026-08-26 — see that column.'),
+  tool_status_unknown_count INT64           OPTIONS (description = 'Added 1.1.0. Tool calls carrying no status. WHY THIS EXISTS: 04_transform_run.sql counted errors as `status = ''failed''`, a value the CONTRACT §3 enum has never contained — it is ok | error — so the count was 0 from the day it was written, and the weekly report published "zero tool failures" as a measurement. It was a schema artefact. Fixing it turned a structural zero into a real number (measured 2026-08-26: 62 errors in 2,062 journal tool calls). Unknown and ok must not share a row, or the same silence comes back wearing a different name.'),
+  model_call_count       INT64              OPTIONS (description = '⚠ MEANING CHANGED IN 1.1.0. COUNT of model.call EVENTS, which is no longer the number of API calls: the journal emits ONE event per (session, model), so this counts (session, model) tuples. The real call count is request_count. Pre-cutover rows counted chat spans, i.e. calls. Do not build a per-call rate on this column across the cutover.'),
+  retry_count            INT64              OPTIONS (description = '⚠ RETIRED IN 1.1.0. SUM of retries across model and tool calls. The session journal does not record retries, so this is permanently NULL post-cutover — NULL, never 0. It used to be COALESCE''d to 0 here and in 06_marts.sql, which made §7.8 retry_rate_pct read exactly 0.0% and publish it as a measurement. Every consumer now divides by a known-retry denominator instead, so an unmeasured retry rate renders as NULL.'),
   phases_completed       INT64              OPTIONS (description = 'From the terminal event attributes.'),
   phase_failed_count     INT64              OPTIONS (description = 'run.phase.completed events with status = failed.'),
 
@@ -119,8 +174,9 @@ CREATE TABLE IF NOT EXISTS `${PROJECT_ID}.core.fct_ai_run`
     coverage_pct         FLOAT64,
     attempt_index        INT64
   >>                                        OPTIONS (description = 'One entry per gate.evaluated event: build | test | lint | secrets | coverage, status pass | fail | skipped. attempt_index > 0 marks an auto-fix retry.'),
-  gate_pass_count        INT64              OPTIONS (description = 'Gates whose FINAL attempt passed.'),
-  gate_fail_count        INT64              OPTIONS (description = 'Gates whose FINAL attempt failed.'),
+  gate_pass_count        INT64              OPTIONS (description = 'Gates whose FINAL attempt passed. 0 = gates ran and none passed; NULL = gates ran and NONE carried a verdict. The distinction is new in 1.1.0 and it matters: under the span source `status` was structurally NULL, so pass and fail were both 0 for every run and the gate pass rate was undefined-looking-like-zero.'),
+  gate_fail_count        INT64              OPTIONS (description = 'Gates whose FINAL attempt failed. Same NULL rule as gate_pass_count.'),
+  gate_unknown_count     INT64              OPTIONS (description = 'Added 1.1.0. Gates whose FINAL attempt carried no verdict (~12% of journal gate evaluations: the command was still running, or its output was truncated past the exit-code trailer). These are EXCLUDED from the pass-rate denominator — a missing verdict is not a pass and not a fail — and published here so the exclusion is visible. Without this column a gate whose final attempt was unknown vanished from numerator and denominator alike, leaving no trace that it had been dropped.'),
   gate_auto_fix_attempts INT64              OPTIONS (description = 'Gate evaluations with attempt_index > 0 — the agent fixing itself. COUNTS toward manual_intervention_rate per the §8.11 formula, but is NOT rework (§8.9 attribution boundary): it happens before any human looked at the work.'),
   max_coverage_pct       FLOAT64            OPTIONS (description = 'Highest coverage_pct reported by any gate in this run. DQ-14 watches for >30pp jumps between consecutive runs on one repo.'),
 
@@ -142,7 +198,7 @@ PARTITION BY DATE(started_at)
 CLUSTER BY agent_name, model_id
 OPTIONS (
   partition_expiration_days = 396,
-  description = 'One row per AI run. Correlation stream JOINED to the OTel stream via the run.bound conversation id. Partition DATE(started_at), cluster agent_name, model_id (CONTRACT §7). 13-month retention (design §11.2). cost_usd is NULL for unpriced models, never 0 (CONTRACT §4).',
+  description = 'One row per AI run, built from the correlation stream and bound to usage via run.bound copilot_session_id. Partition DATE(started_at), cluster agent_name, model_id (CONTRACT §7). 13-month retention (design §11.2) — long enough that three years of trend on the mart cross the 1.1.0 grain cutover, so read usage_grain/usage_source before comparing across it. cost_usd is NULL for unpriced models AND for runs in a multi-run session, never 0 (CONTRACT §3, §4). premium_requests is measured and dimensionless and must never be blended into a dollar figure (CONTRACT §4.1).',
   labels = [('layer', 'core'), ('domain', 'ai-telemetry')]
 );
 
@@ -407,3 +463,65 @@ OPTIONS (
   description = 'One row per Jira issue with lifecycle timings. Partition DATE(created_at), cluster jira_project_key (CONTRACT §7). 13-month retention. Holds NO issue text or AC content (design §11.3) — keys, bounded enums, counts and timestamps only.',
   labels = [('layer', 'core'), ('domain', 'ai-telemetry')]
 );
+
+
+-- =====================================================================================
+-- MIGRATION — for a project where core.fct_ai_run ALREADY EXISTS (contract 1.1.0)
+-- =====================================================================================
+-- Every statement above is CREATE TABLE IF NOT EXISTS, so it is a no-op against an
+-- existing table and none of the 1.1.0 columns would appear. Run this once, by hand,
+-- BEFORE the first 1.1.0 run of 04_transform_run.sql — the MERGE names these columns
+-- and will fail loudly rather than silently if they are absent, which is the right
+-- failure but still a failure.
+--
+-- ALTER TABLE ... ADD COLUMN is metadata-only in BigQuery: no rewrite, no backfill
+-- cost. Existing rows read NULL for every new column, which is correct — they were
+-- measured by the span source and none of these facts was available then. The
+-- backfill below sets only what IS knowable about those rows: they were measured per
+-- call, from spans, and their usage was attributable because the span source placed
+-- every call on its own run.
+--
+--   ALTER TABLE `${PROJECT_ID}.core.fct_ai_run`
+--     ADD COLUMN IF NOT EXISTS trace_id_namespace        STRING,
+--     ADD COLUMN IF NOT EXISTS copilot_session_id        STRING,
+--     ADD COLUMN IF NOT EXISTS session_run_count         INT64,
+--     ADD COLUMN IF NOT EXISTS cost_attributable         BOOL,
+--     ADD COLUMN IF NOT EXISTS cache_write_tokens        INT64,
+--     ADD COLUMN IF NOT EXISTS usage_grain               STRING,
+--     ADD COLUMN IF NOT EXISTS usage_source              STRING,
+--     ADD COLUMN IF NOT EXISTS premium_requests          NUMERIC,
+--     ADD COLUMN IF NOT EXISTS request_count             INT64,
+--     ADD COLUMN IF NOT EXISTS nano_aiu                  INT64,
+--     ADD COLUMN IF NOT EXISTS tool_status_unknown_count INT64,
+--     ADD COLUMN IF NOT EXISTS gate_unknown_count        INT64;
+--
+--   ALTER TABLE `${PROJECT_ID}.core.fct_ai_run` ALTER COLUMN trace_id DROP NOT NULL;
+--
+--   -- Rename, not add-and-copy: the column holds exactly what the new name describes.
+--   ALTER TABLE `${PROJECT_ID}.core.fct_ai_run`
+--     RENAME COLUMN otel_conversation_id TO copilot_session_id;
+--   -- (If you ran the ADD COLUMN list above verbatim, drop the added
+--   --  copilot_session_id first — the rename needs the name free.)
+--
+--   -- Backfill the grain columns on every pre-cutover row, so that "NULL grain" means
+--   -- "row predates the migration" and nothing else, and so DQ-GRAIN can tell a
+--   -- genuine mix from an unmigrated table.
+--   UPDATE `${PROJECT_ID}.core.fct_ai_run`
+--   SET usage_grain  = IF(token_source = 'none', 'none', 'per_call'),
+--       usage_source = CASE token_source
+--                        WHEN 'measured_otel'     THEN 'otel_span'
+--                        WHEN 'modelled_estimate' THEN 'emitter_estimate'
+--                        ELSE 'none' END,
+--       -- The span source timestamped every call, so the window join placed each one
+--       -- on the run that made it. Attribution was sound; only the grain has changed.
+--       cost_attributable  = (token_source <> 'none'),
+--       trace_id_namespace = IF(STARTS_WITH(COALESCE(trace_id, ''), 'trc_'),
+--                               'emitter_trace', 'copilot_session')
+--   WHERE usage_grain IS NULL;
+--
+-- Do NOT backfill retry_count, tool_error_count or gate_pass/fail/unknown on historical
+-- rows. Under the span source `status` was structurally NULL on tool and gate events,
+-- so those historical zeros are artefacts — but they are the artefacts that were
+-- published, and rewriting them now would restate history invisibly (design §9.5).
+-- Leave them, and let usage_source explain the step change.
+-- =====================================================================================

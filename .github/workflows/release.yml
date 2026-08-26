@@ -1,0 +1,296 @@
+name: release
+
+# A tag is the only trigger. `cli/version.py` is the version, and the tag has to
+# agree with it -- checked below, before anything is built, because a release
+# whose tag and artifact disagree is one that cannot be reasoned about later.
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write        # only to create the release and attach three files
+
+jobs:
+  release:
+    # GitHub-hosted, and explicitly NOT the self-hosted runners.
+    #
+    # server/README.md records that the endpoint host runs two self-hosted
+    # Actions runners as the same user that owns the Docker socket, and refuses
+    # to put an S3 credential on that box for exactly that reason. Building the
+    # artifact that then installs itself on fourteen laptops is a strictly
+    # larger thing to put inside that blast radius than a bucket key. Pinned
+    # here with the reason attached, because the pressure to "fix the queue
+    # times" by moving this to the box that is already sitting there is real.
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Two interpreters, on purpose. Everything that builds or runs the client
+      # uses 3.9 -- the floor, exercised rather than asserted, because macOS
+      # ships 3.9 with the Xcode command line tools and install.sh accepts it.
+      # The import guard below needs `sys.stdlib_module_names`, which arrived in
+      # 3.10, so it gets its own interpreter and is invoked by path. Ordering
+      # matters: 3.9 is installed last, so it is what `python3` means.
+      - uses: actions/setup-python@v5
+        id: modern
+        with:
+          python-version: '3.12'
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.9'
+
+      - name: The tag and cli/version.py agree
+        run: |
+          set -eu
+          tag="${GITHUB_REF_NAME#v}"
+          version="$(python3 tools/build_pyz.py --print-version)"
+          if [ "$tag" != "$version" ]; then
+            echo "tag $GITHUB_REF_NAME says $tag, cli/version.py says $version"
+            echo "Bump cli/version.py and re-tag; the two are never allowed to differ."
+            exit 1
+          fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+
+      # The same two guards tests.yml runs, repeated here rather than assumed.
+      # A release can be tagged from a commit the test workflow never finished,
+      # and the constraint that actually binds -- the client importing nothing
+      # outside the standard library -- is the one that breaks a laptop rather
+      # than a build.
+      - name: The client imports nothing outside the standard library
+        run: |
+          "${{ steps.modern.outputs.python-path }}" - <<'PY'
+          import ast, pathlib, sys
+          # The same question tests.yml asks, asked again here because a tag can
+          # be pushed from a commit whose test run never finished -- and this is
+          # the constraint that breaks a laptop rather than a build.
+          stdlib = set(sys.stdlib_module_names)
+          local = set()
+          for d in ("cli", "pollers", "collector"):
+              local |= {p.stem for p in pathlib.Path(d).rglob("*.py")}
+          bad = []
+          for path in sorted(pathlib.Path("cli").rglob("*.py")):
+              tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
+              for node in ast.walk(tree):
+                  names = []
+                  if isinstance(node, ast.Import):
+                      names = [a.name.split(".")[0] for a in node.names]
+                  elif isinstance(node, ast.ImportFrom) and node.level == 0 and node.module:
+                      names = [node.module.split(".")[0]]
+                  bad += ["%s: %s" % (path, n) for n in names
+                          if n not in stdlib and n not in local]
+          if bad:
+              print("\n".join(sorted(set(bad))))
+              raise SystemExit("cli/ must stay standard library only")
+          print("cli/ is standard library only: confirmed")
+          PY
+
+      - name: The client parses on the 3.9 floor
+        run: |
+          python3 - <<'PY'
+          import ast, pathlib
+          for path in sorted(pathlib.Path("cli").rglob("*.py")):
+              ast.parse(path.read_text(encoding="utf-8"), str(path),
+                        feature_version=(3, 9))
+          print("cli/ parses under 3.9 syntax")
+          PY
+
+      - name: Optional extras for the suites that need them
+        run: python3 -m pip install --quiet openpyxl boto3
+
+      - name: Tests
+        run: |
+          set -e
+          for suite in pollers report collector cli importers server; do
+            echo "--- $suite"
+            python3 -m unittest discover -s "$suite/tests"
+          done
+
+      # Built twice into different paths and compared. The digest in install.sh
+      # is what every laptop verifies against, and a digest that changes when
+      # nothing changed is a digest nobody can check anything with -- it becomes
+      # a number to trust rather than a number to compare. This is the assertion
+      # that keeps tools/build_pyz.py honest about that.
+      - name: Build, twice, and prove it is reproducible
+        run: |
+          set -eu
+          mkdir -p dist
+          python3 tools/build_pyz.py --out "dist/insight-${VERSION}.pyz"
+          python3 tools/build_pyz.py --out "/tmp/again.pyz"
+          a="$(sha256sum "dist/insight-${VERSION}.pyz" | cut -d' ' -f1)"
+          b="$(sha256sum /tmp/again.pyz | cut -d' ' -f1)"
+          if [ "$a" != "$b" ]; then
+            echo "two builds of one tree differ: $a vs $b"
+            exit 1
+          fi
+          echo "SHA256=$a" >> "$GITHUB_ENV"
+          echo "reproducible: $a"
+
+      - name: It runs, and reports the version it was built as
+        run: |
+          set -eu
+          out="$(python3 "dist/insight-${VERSION}.pyz" --version)"
+          echo "$out"
+          case "$out" in
+            *"insight ${VERSION}"*) ;;
+            *) echo "the archive does not report ${VERSION}"; exit 1 ;;
+          esac
+
+      - name: It initialises into an empty home
+        run: |
+          set -eu
+          SETA_INSIGHT_HOME="$(mktemp -d)" \
+            python3 "dist/insight-${VERSION}.pyz" init --yes
+          echo "init: ok"
+
+      # The one genuinely zip-specific piece of code in the whole client.
+      #
+      # `cmd_install_hook` reads cli/hooks/prepare-commit-msg, which inside the
+      # archive is not a file any `open()` can reach -- it comes back through
+      # zipimport's `get_data`. A regression there is silent in every other
+      # test, so this installs the hook for real and diffs it byte for byte
+      # against the source. If those ever differ, commits stop carrying the
+      # AI-Run-Id trailer and nothing anywhere says so.
+      - name: The bundled commit hook survives the zip, byte for byte
+        run: |
+          set -eu
+          home="$(mktemp -d)"
+          repo="$(mktemp -d)"
+          git init -q "$repo"
+          export SETA_INSIGHT_HOME="$home"
+          python3 "dist/insight-${VERSION}.pyz" init --yes >/dev/null
+          python3 "dist/insight-${VERSION}.pyz" install-hook --repo "$repo"
+          diff "$repo/.git/hooks/prepare-commit-msg" cli/hooks/prepare-commit-msg
+          test -x "$repo/.git/hooks/prepare-commit-msg"
+          echo "hook: byte-identical and executable"
+
+      - name: SHA256SUMS
+        run: |
+          set -eu
+          cd dist
+          sha256sum "insight-${VERSION}.pyz" > SHA256SUMS
+          cat SHA256SUMS
+
+      # Rendered here, from the template in the repo, so the digest in the
+      # script is the digest of the artifact this same job just built. Any other
+      # arrangement -- rendering by hand, editing the served file in place --
+      # puts a human between the two numbers that have to match.
+      - name: Render install.sh
+        run: |
+          set -eu
+          python3 - <<'PY' > dist/install.sh
+          import ast, os, pathlib
+
+          def literal(path, name):
+              tree = ast.parse(pathlib.Path(path).read_text(encoding="utf-8"), path)
+              for node in tree.body:
+                  if isinstance(node, ast.Assign):
+                      for target in node.targets:
+                          if isinstance(target, ast.Name) and target.id == name:
+                              return ast.literal_eval(node.value)
+              raise SystemExit("%s does not define %s" % (path, name))
+
+          version = os.environ["VERSION"]
+          # The schema the client of THIS release emits. Read from the source it
+          # is read from at runtime, so a release can never advertise a schema
+          # its own archive does not speak.
+          schema = literal("common/__init__.py", "SCHEMA_VERSION")
+          # And the endpoint, from the same constant the client ships with --
+          # not typed again here, where it would drift.
+          endpoint = literal("cli/insight.py", "SETA_ENDPOINT")
+          url = "https://github.com/{}/releases/download/{}/insight-{}.pyz".format(
+              os.environ["GITHUB_REPOSITORY"], os.environ["GITHUB_REF_NAME"], version)
+
+          text = pathlib.Path("server/install.sh.in").read_text(encoding="utf-8")
+          for token, value in (("@VERSION@", version),
+                               ("@SHA256@", os.environ["SHA256"]),
+                               ("@URL@", url),
+                               ("@ENDPOINT@", endpoint),
+                               ("@SCHEMA@", schema)):
+              text = text.replace(token, value)
+          left = [t for t in ("@VERSION@", "@SHA256@", "@URL@", "@ENDPOINT@",
+                              "@SCHEMA@") if t in text]
+          if left:
+              raise SystemExit("unsubstituted placeholders: " + ", ".join(left))
+          print(text, end="")
+          PY
+          chmod +x dist/install.sh
+          head -5 dist/install.sh
+
+      - name: The rendered installer is valid POSIX sh
+        run: |
+          set -eu
+          sh -n dist/install.sh
+          sudo apt-get install -y --no-install-recommends shellcheck >/dev/null
+          # -s sh, not bash: this is piped into `sh`, which on Ubuntu is dash,
+          # and the bashisms shellcheck would let through under -s bash are
+          # exactly the ones that break there.
+          #
+          # -S warning rather than the default: errors and warnings are bugs and
+          # block the release; style and info notes are opinions, and a release
+          # that cannot be cut because a new shellcheck version added a
+          # preference is a release process people route around.
+          shellcheck -s sh -S warning dist/install.sh
+          echo "shellcheck: clean"
+
+      # The one thing shellcheck cannot tell us: that the endpoint will be able
+      # to read this file back. server/proxy.py derives GET /install.json from
+      # the four assignments at the top, and refuses to start if it cannot --
+      # far better to find that here than at deploy time.
+      - name: The endpoint can derive its manifest from it
+        run: |
+          set -eu
+          python3 - <<'PY'
+          import json, os, pathlib, sys
+          sys.path.insert(0, "server")
+          sys.path.insert(0, "cli")
+          import proxy
+          body = pathlib.Path("dist/install.sh").read_bytes()
+          manifest = json.loads(proxy.install_manifest(body))
+          print(json.dumps(manifest, indent=2, sort_keys=True))
+          # The three numbers a laptop will act on, checked against the ones
+          # this job actually built. `cli/update.py` refuses any archive whose
+          # digest is not this one, so a disagreement here is a fleet that
+          # cannot update -- silently, and only noticed weeks later.
+          assert manifest["version"] == os.environ["VERSION"], manifest
+          assert manifest["sha256"] == os.environ["SHA256"], manifest
+          assert manifest["client_schema"], manifest
+          assert manifest["schemas"], manifest
+          print("manifest agrees with the artifact")
+          PY
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh release create "${GITHUB_REF_NAME}" \
+            --title "insight ${VERSION}" \
+            --generate-notes \
+            "dist/insight-${VERSION}.pyz" \
+            "dist/SHA256SUMS" \
+            "dist/install.sh"
+
+      # For whoever updates the endpoint and the docs. The install.sh digest is
+      # the number to compare against what is actually being served at /install,
+      # which is the only way to tell a stale deployment from a current one.
+      - name: Summary
+        run: |
+          set -eu
+          {
+            echo "## insight ${VERSION}"
+            echo
+            echo '| what | sha256 |'
+            echo '| --- | --- |'
+            echo "| \`insight-${VERSION}.pyz\` | \`${SHA256}\` |"
+            echo "| \`install.sh\` | \`$(sha256sum dist/install.sh | cut -d' ' -f1)\` |"
+            echo
+            echo "Deploy: copy \`install.sh\` to \`\$INSIGHT_CONF/install.sh\` on the"
+            echo "endpoint host and restart the container. It is served at"
+            echo "\`/install\`, and \`/install.json\` is derived from it."
+            echo
+            echo '```'
+            echo "curl -fsSL https://aeris-insight.seta-international.com/install | sh"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

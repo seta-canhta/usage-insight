@@ -365,5 +365,39 @@ class ReceiptTests(unittest.TestCase):
         self.assertEqual(ship_mod.load_receipts(path), {})
 
 
+class TestSchemaAheadOfServer(unittest.TestCase):
+    """A client upgraded ahead of its server, which happened on the day the
+    contract went to 1.1.0 and cost an hour of uploads before anyone looked.
+
+    The bare 400 read as a corrupt bundle, so the reflex was to re-pack and
+    re-ship, which produced the same 400. What it actually means is that the
+    server has not been taught the version yet, and nothing on the machine can
+    fix it.
+    """
+
+    def _refusal(self):
+        tmp = tempfile.mkdtemp(prefix="insight-schema-")
+        self.addCleanup(shutil.rmtree, tmp, True)
+        path = os.path.join(tmp, "bundle.ndjson")
+        write_bundle(path)
+        # The refusal carries a JSON body, which is how `ship` tells the
+        # endpoint's own answer from a CDN's.
+        post = Recorder((400, {"error": "unknown schema_version '1.1.0'"}))
+        with self.assertRaises(ship_mod.ShipError) as caught:
+            ship_mod.ship_bundle(path, "https://x.test", token="t", post=post)
+        return str(caught.exception)
+
+    def test_it_says_the_server_is_behind_not_the_bundle_broken(self):
+        message = self._refusal()
+        self.assertIn("newer than the collection server", message)
+        self.assertIn("KNOWN_SCHEMAS", message)
+
+    def test_it_says_nothing_was_lost(self):
+        # The reflex on a 400 is to assume the bundle is bad and re-pack it.
+        message = self._refusal()
+        self.assertIn("nothing was lost", message)
+        self.assertIn("still on disk", message)
+
+
 if __name__ == "__main__":
     unittest.main()

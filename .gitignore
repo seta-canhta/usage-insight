@@ -36,3 +36,13 @@ cli/dist/
 # is still the list of everyone being measured and it belongs in /etc on the box.
 /server/allowed.env
 allowed.env
+
+# Built client archives. `tools/build_pyz.py` writes here and the release job
+# attaches what it finds; a .pyz in git history is a binary nobody can review
+# and a second source of truth for what "the current client" is.
+/dist/
+*.pyz
+
+
+# Sample data
+samples

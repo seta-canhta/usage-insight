@@ -37,7 +37,11 @@ import re
 import sys
 from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The shared library sits at the repository root, one level up: it is
+# depended on by `cli/`, `importers/` and `report/` too, so it cannot
+# live inside one of its consumers.
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common import (  # noqa: E402
     Config,
@@ -411,6 +415,18 @@ def summarise_pr_commits(commits: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "ai_run_ids": run_ids[:20],
         "ai_trace_ids": trace_ids[:20],
         "ai_model_ids": models[:20],
+        # The commit -> PR edge. `sql/05_transform_output.sql` unnests exactly
+        # this field to decide which PR an output was first reviewed in, and
+        # this function used to return counts only -- so that UNNEST ran over
+        # an absent array and the whole output -> PR -> ticket path resolved to
+        # nothing. A structural zero, not a sparse one: no PR has ever had a
+        # commit attached to it.
+        #
+        # Bounded like its neighbours. A PR with more than 200 commits is a
+        # branch someone forgot to rebase, and the tail carries no information
+        # the head does not; `commit_count` above stays exact either way.
+        "commit_shas": [c.get("hash") for c in (commits or [])
+                        if c.get("hash")][:200],
     }
 
 
@@ -630,7 +646,8 @@ class BitbucketPoller:
         branch = (
             ((pull_request.get("source") or {}).get("branch") or {}).get("name") or None
         )
-        jira_key = extract_jira_key(branch, pull_request.get("title"))
+        jira_key = extract_jira_key(branch, pull_request.get("title"),
+                                    projects=self.config.jira_project_keys)
         return (
             make_context(
                 jira_issue_key=jira_key,
@@ -715,6 +732,39 @@ class BitbucketPoller:
         }
 
         events: List[Dict[str, Any]] = []
+
+        # -- 15. scm.pr.created ---------------------------------------------
+        # The commit -> PR edge, and the reason this event exists at all.
+        # `sql/05_transform_output.sql` decides which PR an output was first
+        # reviewed in by unnesting `scm.pr.created.commit_shas`; the event type
+        # was in the collector's allow-list and in the SQL, and **no poller had
+        # ever emitted it**. The join has been resolving to nothing since the
+        # warehouse was written, silently -- an empty result and a
+        # never-populated one look identical downstream.
+        #
+        # Emitted for every PR, not only AI-marked ones: this is the edge the
+        # rest of the join stands on, and a PR that turns out to contain an
+        # AI-authored commit cannot be recognised as such after the fact if its
+        # commit list was never recorded.
+        if created_on:
+            events.append(
+                build_event(
+                    "scm.pr.created",
+                    created_on,
+                    (self.repo_full_name, pr_id, "created", created_on),
+                    {
+                        "pr_id": pr_id,
+                        "commit_shas": commit_summary["commit_shas"],
+                        "pr_title_has_ai_marker": title_marker,
+                    },
+                    actor=make_actor(person_id=author, role="dev"),
+                    context=context,
+                    agent=agent,
+                    link=link,
+                    trace_id=trace_id,
+                    run_id=run_id,
+                )
+            )
 
         # -- 16. scm.pr.reviewed, one per non-author reviewer ----------------
         for reviewer in timeline["reviewers"]:
@@ -825,7 +875,9 @@ class BitbucketPoller:
                 link = make_link("heuristic", 0.0)
 
             jira_key = extract_jira_key(
-                commit_subject(reverted) if reverted else None, commit_subject(revert)
+                commit_subject(reverted) if reverted else None,
+                commit_subject(revert),
+                projects=self.config.jira_project_keys,
             )
             author_user = (revert.get("author") or {}).get("user")
             events.append(

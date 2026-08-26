@@ -20,7 +20,8 @@ import tempfile
 import unittest
 
 POLLERS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, POLLERS_DIR)
+sys.path.insert(0, POLLERS_DIR)                      # poll_*
+sys.path.insert(0, os.path.dirname(POLLERS_DIR))     # common
 
 import common  # noqa: E402
 import poll_bitbucket  # noqa: E402
@@ -283,6 +284,85 @@ def make_bitbucket_poller(transport=None):
 # ---------------------------------------------------------------------------
 # 1. first_review_at -- the metric-critical derivation
 # ---------------------------------------------------------------------------
+
+
+class TestJiraKeyExtractionIsAllowListed(unittest.TestCase):
+    """A key-shaped string is not a key. AR-1.
+
+    Measured 2026-08-26 against `aeriscom/wt-playwrite-taf`, 12 live pull
+    requests: of seven distinct keys extracted from branch names and PR
+    titles, **three projects did not exist** among the 218 on the Jira site,
+    and the events they produced (14) outnumbered the real ones (5).
+    """
+
+    REAL = ("IML", "APR")
+
+    def test_a_date_is_not_a_ticket(self):
+        # `fix/AUG-25` is August 25. It is indistinguishable from a ticket by
+        # shape, which is exactly why shape cannot be the test.
+        self.assertEqual(common.extract_jira_key("fix/AUG-25"), "AUG-25")
+        self.assertIsNone(
+            common.extract_jira_key("fix/AUG-25", projects=self.REAL))
+
+    def test_real_keys_survive(self):
+        for candidate, expected in (("IML-6546/release/26.8", "IML-6546"),
+                                    ("APR-2016", "APR-2016")):
+            self.assertEqual(
+                common.extract_jira_key(candidate, projects=self.REAL),
+                expected)
+
+    def test_a_real_key_later_in_the_string_beats_a_fake_one_first(self):
+        # The first match used to win outright. With an allow-list the scan
+        # has to continue past a plausible-but-unknown prefix.
+        self.assertEqual(
+            common.extract_jira_key("fix/AUG-25 for IML-6500",
+                                    projects=self.REAL),
+            "IML-6500")
+
+    def test_no_allow_list_keeps_the_old_behaviour(self):
+        # Existing callers that cannot supply a list are not silently changed.
+        self.assertEqual(common.extract_jira_key("CY-199"), "CY-199")
+
+    def test_the_allow_list_is_case_insensitive(self):
+        self.assertEqual(common.extract_jira_key("IML-1", projects=("iml",)),
+                         "IML-1")
+
+
+class TestPrCreatedCarriesTheCommitEdge(unittest.TestCase):
+    """The commit -> PR edge, which nothing was producing.
+
+    `sql/05_transform_output.sql` unnests `scm.pr.created.commit_shas` to find
+    the PR an output was first reviewed in. The event type was in the
+    collector's allow-list and in the SQL, and no poller emitted it -- so that
+    join resolved to nothing, silently, for as long as the warehouse existed.
+    """
+
+    def setUp(self):
+        poller, _ = make_bitbucket_poller()
+        self.events = poller.build_pr_events(PR_MERGED)
+        self.created = [e for e in self.events
+                        if e["event_type"] == "scm.pr.created"]
+
+    def test_a_pr_produces_a_created_event(self):
+        self.assertEqual(len(self.created), 1)
+
+    def test_it_carries_the_shas_the_pr_contains(self):
+        shas = self.created[0]["attributes"]["commit_shas"]
+        self.assertIn(COMMIT_AI["hash"], shas)
+        self.assertIn(COMMIT_HUMAN["hash"], shas)
+
+    def test_summarise_returns_the_shas_not_only_a_count(self):
+        summary = poll_bitbucket.summarise_pr_commits([COMMIT_AI, COMMIT_HUMAN])
+        self.assertEqual(summary["commit_shas"],
+                         [COMMIT_AI["hash"], COMMIT_HUMAN["hash"]])
+        self.assertEqual(summary["commit_count"], 2)
+
+    def test_the_sha_list_is_bounded(self):
+        many = [{"hash": "{:040d}".format(i), "message": "x"} for i in range(300)]
+        summary = poll_bitbucket.summarise_pr_commits(many)
+        # Bounded like its neighbours; the exact count stays exact.
+        self.assertEqual(len(summary["commit_shas"]), 200)
+        self.assertEqual(summary["commit_count"], 300)
 
 
 class TestFirstReviewAt(unittest.TestCase):
@@ -710,7 +790,7 @@ class TestEnvelopeAndRedaction(unittest.TestCase):
     def test_envelope_matches_the_contract(self):
         event = build_event("scm.pr.merged", "2026-08-01T15:00:00Z", ("acme/watchtower", 101), {"pr_id": 101})
         self.assertEqual(set(event), set(common.ENVELOPE_KEYS))
-        self.assertEqual(event["schema_version"], "1.0.0")
+        self.assertEqual(event["schema_version"], "1.1.0")
         self.assertTrue(event["event_id"].startswith("evt_"))
         self.assertEqual(len(event["event_id"]), 4 + 32)
         self.assertIsNone(event["ingested_at"])  # collector's job, never the client's

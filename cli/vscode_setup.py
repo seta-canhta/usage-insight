@@ -10,6 +10,10 @@ every failure was silent.
 3. Absolute paths were used where only tilde-relative ones work; the rejection
    is a line in the renderer log and nothing else.
 
+Since 2026-08-26 this also **removes** the Copilot OTel exporter settings it
+used to write. Usage now comes from ``~/.copilot``, and an exporter left
+switched on would go on writing prompts to a file nobody reads.
+
 None of the three surfaced as an error. That is what makes this worth
 automating rather than documenting: a manual step whose failure is invisible
 gets done wrong and stays wrong.
@@ -108,21 +112,38 @@ def tilde(path: str) -> str:
     return absolute
 
 
+#: Whole setting namespaces this tool used to write and now removes. Copilot's
+#: OTel exporter was how token usage was collected until 2026-08-26; it is read
+#: from ``~/.copilot`` instead, which needs no setting at all.
+#:
+#: They are actively deleted rather than merely no longer written. Left behind,
+#: the exporter keeps appending prompts, system instructions and command output
+#: to a file nothing reads any more -- microsoft/vscode#326254 means
+#: ``captureContent: false`` does not stop it. Turning a collector off has to
+#: include turning off what it was collecting.
+#:
+#: By **prefix**, not by name. This started as a list of the five keys this
+#: tool wrote, and on the first real machine it ran against it left
+#: ``github.copilot.chat.otel.otlpEndpoint`` behind -- a key somebody had set
+#: by hand, pointing the exporter at a local collector, which would have gone
+#: on exporting. An enumerated list is only as good as today's knowledge of
+#: what is in somebody's settings file. The whole namespace is dead, so the
+#: whole namespace goes.
+OBSOLETE_PREFIXES = ("github.copilot.chat.otel.",)
+
+
+def obsolete(key: str) -> bool:
+    return any(key.startswith(prefix) for prefix in OBSOLETE_PREFIXES)
+
+
 def desired(insight_home: str, aiep: Optional[str]) -> Dict[str, Any]:
-    wanted: Dict[str, Any] = {
-        "github.copilot.chat.otel.enabled": True,
-        # exporterType, not protocol. The file exporter needs somewhere to
-        # write, and naming it means nothing has to listen on a port.
-        "github.copilot.chat.otel.exporterType": "file",
-        "github.copilot.chat.otel.outfile":
-            os.path.join(insight_home, "copilot-spans.jsonl"),
-        # Set, though it does not work on the span path -- see
-        # microsoft/vscode#326254. The log and metric paths do honour it.
-        "github.copilot.chat.otel.captureContent": False,
-        # Truncates long attributes. Content-bearing ones run to thousands of
-        # characters, so a small cap guts them and leaves ids and counts alone.
-        "github.copilot.chat.otel.maxAttributeSizeChars": 256,
-    }
+    """What this tool writes into VS Code settings.
+
+    Nothing is required for usage collection any more: Copilot CLI journals
+    every session under ``~/.copilot`` on its own. What remains here registers
+    the platform's agents and skills, which VS Code cannot discover by itself.
+    """
+    wanted: Dict[str, Any] = {}
     if aiep:
         wanted["chat.agentFilesLocations"] = {
             tilde(os.path.join(aiep, "agents", "development")): True,
@@ -168,12 +189,22 @@ def apply(path: str, wanted: Dict[str, Any], dry_run: bool = False
         # replacing it would destroy settings we cannot read.
         return False, f"settings.json does not parse ({exc}); fix it first", []
 
-    changed_keys = [k for k, v in wanted.items()
+    # Removal wins over writing. If a caller asks for a key that is on the
+    # obsolete list, the list is right and the caller is stale -- and `wanted`
+    # is filtered here rather than after the merge so the verification below
+    # never demands a key we just deleted.
+    wanted = {k: v for k, v in wanted.items() if not obsolete(k)}
+
+    stale = sorted(k for k in current if obsolete(k))
+    changed_keys = [k for k in wanted
                     if k not in current or current[k] != merge(current, wanted)[k]]
+    changed_keys += stale
     if not changed_keys:
         return False, "already configured", []
 
     merged = merge(current, wanted)
+    for key in stale:
+        merged.pop(key, None)
     if dry_run:
         return True, "would change: " + ", ".join(sorted(changed_keys)), changed_keys
 
@@ -195,6 +226,9 @@ def apply(path: str, wanted: Dict[str, Any], dry_run: bool = False
         missing = [k for k in wanted if k not in reparsed]
         if missing:
             raise ValueError("keys did not land: " + ", ".join(missing))
+        left = sorted(k for k in reparsed if obsolete(k))
+        if left:
+            raise ValueError("obsolete keys survived: " + ", ".join(left))
     except (ValueError, OSError) as exc:
         if backup:
             shutil.copy(backup, path)

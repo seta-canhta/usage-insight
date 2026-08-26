@@ -219,8 +219,8 @@ if __name__ == "__main__":
     unittest.main(verbosity=2)
 
 
-NOTHING = {"repos": 0, "otel": False, "agent": False}
-SOMETHING = {"repos": 2, "otel": False, "agent": False}
+NOTHING = {"repos": 0, "copilot": False, "vscode": False, "agent": False}
+SOMETHING = {"repos": 2, "copilot": False, "vscode": False, "agent": False}
 
 
 class MeasuredZeroTests(unittest.TestCase):
@@ -245,7 +245,7 @@ class MeasuredZeroTests(unittest.TestCase):
             {"event_count": 0, "sources": NOTHING}))
 
     def test_any_single_source_is_enough(self):
-        for key in ("repos", "otel", "agent"):
+        for key in ("repos", "copilot", "vscode", "agent"):
             sources = dict(NOTHING)
             sources[key] = 1 if key == "repos" else True
             self.assertTrue(bundle_mod.measured(

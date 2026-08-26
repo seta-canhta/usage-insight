@@ -20,6 +20,16 @@ http:
         maxRequestBodyBytes: 1048576
         memRequestBodyBytes: 1048576
 
+    # Uploading is hourly per laptop and installing is once per engineer, so
+    # anything above this is a loop or a scraper. `/install` is the one route
+    # here that an unauthenticated stranger can reach, and it is a fixed ~4 KB
+    # string -- worth not serving at whatever rate they ask for.
+    insight-rate:
+      rateLimit:
+        average: 30
+        period: 1m
+        burst: 10
+
     # The read routes, restricted by source address. Behind Cloudflare every
     # public request arrives from a Cloudflare address, so this admits the
     # office LAN, container networks, and loopback -- which is what an
@@ -37,11 +47,16 @@ http:
   routers:
     # Uploads, and the health check. Public. Higher priority than the read
     # router below, which would otherwise swallow these paths.
+    # `/install` and `/install.sh` join *this* router, not a new one at a lower
+    # priority. The read router below matches the whole host at 250 and would
+    # otherwise swallow them into insight-lan-only -- and an installer only the
+    # office LAN can fetch is an installer that fails for exactly the person
+    # setting up a new laptop from home.
     insight-upload:
-      rule: "Host(`aeris-insight.seta-international.com`) && (Path(`/v1/bundle`) || Path(`/healthz`))"
+      rule: "Host(`aeris-insight.seta-international.com`) && (Path(`/v1/bundle`) || Path(`/healthz`) || Path(`/install`) || Path(`/install.sh`))"
       entryPoints: [websecure]
       service: insight
-      middlewares: [insight-cap]
+      middlewares: [insight-cap, insight-rate]
       priority: 300
       tls: {}
 

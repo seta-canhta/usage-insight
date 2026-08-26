@@ -75,7 +75,7 @@ class TestPaths(unittest.TestCase):
 class TestApply(SettingsTestCase):
 
     def wanted(self):
-        return {"github.copilot.chat.otel.enabled": True,
+        return {"chat.useAgentSkills": True,
                 "chat.agentFilesLocations": {"~/a": True}}
 
     def test_existing_settings_survive(self):
@@ -121,8 +121,49 @@ class TestApply(SettingsTestCase):
 
     def test_a_new_file_is_created_when_none_exists(self):
         vscode_setup.apply(self.path, self.wanted())
-        self.assertTrue(
-            vscode_setup.parse_jsonc(self.read())["github.copilot.chat.otel.enabled"])
+        self.assertTrue(vscode_setup.parse_jsonc(self.read())["chat.useAgentSkills"])
+
+    def test_the_old_otel_exporter_settings_are_removed(self):
+        # Not merely no longer written. Left switched on, Copilot's exporter
+        # keeps appending prompts and command output to a file nothing reads
+        # any more -- microsoft/vscode#326254 means captureContent does not
+        # stop it. Turning a collector off includes turning off what it
+        # collected.
+        self.write(json.dumps({
+            "github.copilot.chat.otel.enabled": True,
+            "github.copilot.chat.otel.outfile": "~/.seta-insight/copilot-spans.jsonl",
+            "editor.fontSize": 14,
+        }))
+        changed, _, keys = vscode_setup.apply(self.path, self.wanted())
+        self.assertTrue(changed)
+        settings = vscode_setup.parse_jsonc(self.read())
+        self.assertEqual([k for k in settings if vscode_setup.obsolete(k)], [])
+        self.assertIn("github.copilot.chat.otel.enabled", keys)
+        # Everything that was not ours is still theirs.
+        self.assertEqual(settings["editor.fontSize"], 14)
+
+    def test_a_key_nobody_here_wrote_is_removed_too(self):
+        # Found on the first real machine this ran against: somebody had set
+        # `otlpEndpoint` by hand, pointing the exporter at a local collector.
+        # It was not on the list of five keys this tool writes, so it survived
+        # -- and an exporter with an endpoint is an exporter that still runs.
+        self.write(json.dumps({
+            "github.copilot.chat.otel.otlpEndpoint": "http://127.0.0.1:4418",
+            "github.copilot.chat.otel.somethingAddedNextYear": True,
+            "editor.fontSize": 14,
+        }))
+        vscode_setup.apply(self.path, self.wanted())
+        settings = vscode_setup.parse_jsonc(self.read())
+        self.assertEqual([k for k in settings if "otel" in k], [])
+        self.assertEqual(settings["editor.fontSize"], 14)
+
+    def test_a_caller_asking_for_an_obsolete_key_does_not_get_it(self):
+        self.write("{}")
+        vscode_setup.apply(self.path, {"github.copilot.chat.otel.enabled": True,
+                                       "chat.useAgentSkills": True})
+        settings = vscode_setup.parse_jsonc(self.read())
+        self.assertNotIn("github.copilot.chat.otel.enabled", settings)
+        self.assertTrue(settings["chat.useAgentSkills"])
 
 
 if __name__ == "__main__":

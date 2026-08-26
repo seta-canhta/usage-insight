@@ -53,9 +53,10 @@ import urllib.parse
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import (Any, Callable, Collection, Dict, Iterable, Iterator, List,
+                    Optional, Sequence, Tuple)
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "1.1.0"
 POLLER_VERSION = "0.1.0"
 USER_AGENT = f"aiep-ai-telemetry-poller/{POLLER_VERSION}"
 
@@ -137,7 +138,6 @@ ENVELOPE_KEYS = (
     "run_id",
     "parent_run_id",
     "span_id",
-    "workflow_id",
     "actor",
     "context",
     "agent",
@@ -341,14 +341,47 @@ def parse_ai_trailers(commit_message: Optional[str]) -> Dict[str, str]:
     return out
 
 
-def extract_jira_key(*candidates: Optional[str]) -> Optional[str]:
-    """First Jira issue key found across the candidate strings, else None."""
+def extract_jira_key(*candidates: Optional[str],
+                     projects: Optional[Collection[str]] = None) -> Optional[str]:
+    """First Jira issue key found across the candidate strings, else None.
+
+    ``projects`` is an allow-list of real project keys. **Pass it wherever one
+    can be had.** Without it this function will return anything shaped like a
+    key, and "shaped like a key" is not the same as "is a key".
+
+    Measured 2026-08-26 against a live repository, 12 pull requests: of the
+    seven distinct keys extracted from branch names and PR titles, **three did
+    not exist** in the 218 projects on the Jira site --
+
+        fix/AUG-25   -> "AUG-25"    a date. August 25.
+        fix/AUG-24   -> "AUG-24"    a date.
+        CY-199       -> "CY-199"    not a project.
+        TC-12018     -> "TC-12018"  not a project.
+
+    -- and they outnumbered the real ones (`IML-*`, `APR-*`) in the events
+    emitted. A branch called `fix/Aug-21` escaped only because of its
+    lowercase letters, which is luck, not a rule.
+
+    CONTRACT.md §2.4: *"Never synthesise a `run_id` to force a join -- that
+    manufactures a join key and breaches AR-1."* A fabricated `jira_issue_key`
+    is the same offence in a different column, and worse for being plausible:
+    `AUG-25` looks exactly like a ticket, so nothing downstream has any reason
+    to doubt it. It attributes real engineering work to a ticket that does not
+    exist.
+
+    An allow-list, not a list of things to reject. A deny-list here would have
+    to anticipate every month abbreviation, every `TC-`, every `CY-`, and every
+    convention a team invents next quarter; the allow-list only has to know
+    what Jira says exists, which Jira will tell you.
+    """
+    allowed = {p.upper() for p in projects} if projects is not None else None
     for candidate in candidates:
         if not candidate:
             continue
-        match = JIRA_KEY_RE.search(candidate)
-        if match:
-            return match.group(1)
+        for match in JIRA_KEY_RE.finditer(candidate):
+            key = match.group(1)
+            if allowed is None or key.split("-", 1)[0].upper() in allowed:
+                return key
     return None
 
 
@@ -515,8 +548,25 @@ def load_dotenv_values(path: str) -> Dict[str, str]:
 
 
 def _find_dotenv(start: Optional[str] = None) -> Optional[str]:
+    """Walk up from this module looking for a ``.env``. Bounded, deliberately.
+
+    Two bounds, and both became load-bearing when this module started shipping
+    inside ``insight.pyz`` on engineers' laptops.
+
+    *Not a directory* -- inside a zipapp ``os.path.dirname(__file__)`` is a path
+    running *through* an archive file, so there is nothing here to search and
+    everything above belongs to whoever installed it, not to us.
+
+    *Never ``$HOME`` or above* -- eight levels from an installed archive reaches
+    ``~``, ``/Users`` and ``/``. The home directory is shared with every other
+    tool that has ever dropped a ``.env`` there, and reading one of those as
+    poller configuration is a bug that reads like a credential leak.
+    """
     here = os.path.abspath(start or os.path.dirname(__file__))
+    stop = {os.path.abspath(os.path.expanduser("~")), os.path.abspath(os.sep)}
     for _ in range(8):
+        if here in stop or not os.path.isdir(here):
+            return None
         candidate = os.path.join(here, ".env")
         if os.path.isfile(candidate):
             return candidate
@@ -554,6 +604,13 @@ class Config:
     email_salt: Optional[str] = None
     state_path: str = DEFAULT_STATE_PATH
     bitbucket_api_base: str = "https://api.bitbucket.org"
+    #: Real Jira project keys, for `extract_jira_key`. Without it, anything
+    #: shaped like a key is accepted -- and measured 2026-08-26 against a live
+    #: repository, three of seven extracted keys did not exist (`AUG-25` and
+    #: `AUG-24` are dates; `CY-199` and `TC-12018` are not projects). See that
+    #: function. `JIRA_PROJECT_KEYS=IML,APR`, or let `poll_jira.py --dump-projects`
+    #: fetch the list from Jira, which knows the answer.
+    jira_project_keys: Optional[Tuple[str, ...]] = None
     timeout_seconds: float = 30.0
     max_retries: int = 5
 
@@ -577,6 +634,14 @@ class Config:
             except (TypeError, ValueError):
                 return default
 
+        def _keys(name: str) -> Optional[Tuple[str, ...]]:
+            raw = (env.get(name) or "").strip()
+            if not raw:
+                return None
+            return tuple(sorted({k.strip().upper()
+                                 for k in raw.replace(";", ",").split(",")
+                                 if k.strip()})) or None
+
         return cls(
             bitbucket_username=env.get("BITBUCKET_USERNAME") or None,
             bitbucket_token=env.get("BITBUCKET_ACCESS_TOKEN") or None,
@@ -592,6 +657,7 @@ class Config:
             bitbucket_api_base=(
                 env.get("BITBUCKET_API_BASE") or "https://api.bitbucket.org"
             ).rstrip("/"),
+            jira_project_keys=_keys("JIRA_PROJECT_KEYS") or _keys("JIRA_PROJECT_KEY"),
             timeout_seconds=_num("AIEP_HTTP_TIMEOUT", 30.0),
             max_retries=int(_num("AIEP_HTTP_MAX_RETRIES", 5)),
         )
@@ -1049,7 +1115,6 @@ def build_event(
     run_id: Optional[str] = None,
     parent_run_id: Optional[str] = None,
     span_id: Optional[str] = None,
-    workflow_id: Optional[str] = None,
 ) -> Dict[str, Any]:
     """Assemble one contract-conformant event envelope.
 
@@ -1074,7 +1139,6 @@ def build_event(
         "run_id": run_id,
         "parent_run_id": parent_run_id,
         "span_id": span_id,
-        "workflow_id": workflow_id,
         "actor": actor or make_actor(),
         "context": context or make_context(),
         "agent": agent or make_agent("poller"),

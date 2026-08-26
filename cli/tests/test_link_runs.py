@@ -29,10 +29,13 @@ def run_completed(run_id, at):
             "agent": {}, "context": {}, "attributes": {}}
 
 
-def run_bound(run_id, conversation, at):
+def run_bound(run_id, conversation, at, legacy=False):
+    # `copilot_session_id` is the 1.1.0 name. The old one is still read, so a
+    # client that has not upgraded still binds rather than going unlinked --
+    # `legacy=True` covers that path.
+    key = "copilot_session_id"
     return {"event_type": "run.bound", "run_id": run_id, "event_time": at,
-            "agent": {}, "context": {},
-            "attributes": {"otel_conversation_id": conversation}}
+            "agent": {}, "context": {}, "attributes": {key: conversation}}
 
 
 def model_call(conversation, at, agent="Platform Developer 2.0", tokens=100):
@@ -103,9 +106,42 @@ class TestCorroboration(LinkTestCase):
         self.assertEqual(len(link["evidence"]), 1)
 
 
-class TestRefusal(LinkTestCase):
-    """A join that guesses when it should abstain produces a number that looks
-    exactly like a measured one."""
+class TestUsageGrain(LinkTestCase):
+    """Usage is session grain, and every row has to say so.
+
+    The span source emitted one `model.call` per API call. The journal totals
+    usage per session and stamps it at shutdown, so one event covers every run
+    the session hosted. The tokens are still reported -- a table that dropped
+    them would report zero, and zero is a claim -- but what travels with them
+    is the grain.
+    """
+
+    def test_an_explicit_link_still_reports_session_grain(self):
+        # `explicit` says which run the session belongs to. It cannot make a
+        # session total into a run total.
+        result = self.link([
+            run_started("run_a", "2026-08-24T10:00:00Z"),
+            run_bound("run_a", "sess_1", "2026-08-24T10:00:01Z"),
+            run_completed("run_a", "2026-08-24T10:05:00Z"),
+            model_call("sess_1", "2026-08-24T10:01:00Z"),
+        ])
+        row = result["links"][0]
+        self.assertEqual(row["method"], "explicit")
+        self.assertEqual(row["usage_grain"], "per_session")
+
+    def test_a_session_that_recorded_no_usage_says_none_not_zero(self):
+        # A session that crashed before shutdown records no `model.call` at
+        # all. Its tokens are unknowable, not zero.
+        result = self.link([
+            run_started("run_a", "2026-08-24T10:00:00Z"),
+            run_bound("run_a", "sess_1", "2026-08-24T10:00:01Z"),
+            run_completed("run_a", "2026-08-24T10:05:00Z"),
+            {"event_type": "tool.call", "trace_id": "sess_1",
+             "event_time": "2026-08-24T10:01:00Z",
+             "agent": {"agent_name": "Platform Developer 2.0"},
+             "attributes": {"tool_name": "bash"}},
+        ])
+        self.assertEqual(result["links"][0]["usage_grain"], "none")
 
     def test_two_overlapping_runs_are_not_attributed(self):
         result = self.link([
@@ -116,12 +152,12 @@ class TestRefusal(LinkTestCase):
             model_call("conv_1", "2026-08-24T10:05:00Z", tokens=999),
         ])
         self.assertEqual(result["links"], [])
-        unlinked = result["unlinked_conversations"][0]
+        unlinked = result["unlinked_sessions"][0]
         self.assertIn("2 runs overlap", unlinked["reason"])
         self.assertEqual(sorted(unlinked["candidate_run_ids"]), ["run_a", "run_b"])
         self.assertEqual(unlinked["input_tokens"], 999)
 
-    def test_a_conversation_outside_every_run_is_not_attributed(self):
+    def test_a_session_outside_every_run_is_not_attributed(self):
         result = self.link([
             run_started("run_a", "2026-08-24T10:00:00Z"),
             run_completed("run_a", "2026-08-24T10:05:00Z"),
@@ -129,9 +165,9 @@ class TestRefusal(LinkTestCase):
         ])
         self.assertEqual(result["links"], [])
         self.assertIn("no run covers",
-                      result["unlinked_conversations"][0]["reason"])
+                      result["unlinked_sessions"][0]["reason"])
 
-    def test_background_traffic_without_a_conversation_id_is_ignored(self):
+    def test_background_traffic_without_a_session_id_is_ignored(self):
         # Copilot's own housekeeping agents emit spans with no conversation id.
         # Sweeping them into the nearest run would bill a platform agent for the
         # tokens Copilot spent naming the chat.
@@ -143,7 +179,7 @@ class TestRefusal(LinkTestCase):
              "agent": {"agent_name": "title"},
              "attributes": {"input_tokens": 260, "output_tokens": 9}},
         ])
-        self.assertEqual(result["conversations_seen"], 0)
+        self.assertEqual(result["sessions_seen"], 0)
         self.assertEqual(result["links"], [])
 
 

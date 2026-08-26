@@ -5,7 +5,7 @@
         --events exports/jira-PRJ.ndjson --events exports/aio-PRJ.ndjson \\
         --out mapping.json
 
-Column spec: ``docs/IMPORT-SPEC.md``.
+Column spec: ``importers/README.md``.
 
 **This importer emits no events, deliberately.** The daily report is
 self-reported, written after the fact, by the people being measured. Counting
@@ -42,8 +42,8 @@ from datetime import date as date_type, timedelta
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-if os.path.join(_ROOT, "pollers") not in sys.path:
-    sys.path.insert(0, os.path.join(_ROOT, "pollers"))
+if _ROOT not in sys.path:
+    sys.path.insert(0, _ROOT)
 
 import common  # noqa: E402
 

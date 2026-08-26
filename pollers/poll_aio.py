@@ -56,7 +56,11 @@ import sys
 import time
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The shared library sits at the repository root, one level up: it is
+# depended on by `cli/`, `importers/` and `report/` too, so it cannot
+# live inside one of its consumers.
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common import (  # noqa: E402
     Config,
@@ -274,6 +278,10 @@ class AioPoller:
         """
         yield from self._paginate(f"/project/{self.project}/testcase", max_cases)
 
+    #: Set when `max_cycles` cut a pass short. Read by the summary line so a
+    #: truncated run is never mistaken for a complete one.
+    truncated_cycles = False
+
     def cycle_case_keys(self, since: Optional[str], max_cycles: int = 0,
                         release_ids: Sequence[int] = (),
                         release_names: Sequence[str] = (),
@@ -297,7 +305,17 @@ class AioPoller:
         case_keys: Set[str] = set()
         matched: Dict[str, str] = {}
         scoped_to_release = bool(release_ids or release_names)
-        for cycle in self.iter_cycles(max_cycles):
+        # `max_cycles` bounds the cycles KEPT, not the cycles scanned.
+        #
+        # It used to bound the scan, and AIO returns cycles oldest-first: on
+        # this project `--max-cycles 40` read `IML-CY-Adhoc` through
+        # `IML-CY-13`, all created in 2025, and every one of them failed the
+        # window filter. The run reported `cycles_in_window: 0` out of
+        # `cycles_seen: 40` and emitted nothing -- which reads as "no test
+        # activity" when the truth is "the cap was spent before reaching the
+        # window". A bound meant to limit cost was silently deciding the
+        # answer.
+        for cycle in self.iter_cycles(0):
             key = cycle.get("key")
             if not key:
                 continue
@@ -310,6 +328,12 @@ class AioPoller:
                     continue
                 how = "window"
             matched[key] = how
+            if max_cycles and len(matched) > max_cycles:
+                # Report the truncation rather than letting the caller read a
+                # bounded pass as a complete one.
+                matched.pop(key, None)
+                self.truncated_cycles = True
+                break
             for entry in self.iter_cycle_cases(key):
                 case_key = (entry.get("testCase") or {}).get("key")
                 if case_key:

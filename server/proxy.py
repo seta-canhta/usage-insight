@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""The collection endpoint. Implements ``docs/TRANSPORT.md``.
+"""The collection endpoint. Implements ``server/README.md``.
 
     python3 server/proxy.py --store file:///tmp/insight --allowed-file allowed.env
     python3 server/proxy.py --store s3://aeris-insight
@@ -33,6 +33,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import sys
 import threading
 from datetime import date, datetime, timezone
@@ -53,9 +54,10 @@ import store as store_mod  # noqa: E402
 #: makes a 413 mean the same thing in both places.
 MAX_BYTES = 1 * 1024 * 1024
 
-#: A schema this pipeline has not been taught is refused rather than stored.
-#: Silently accepting the future is how you find out three months later.
-KNOWN_SCHEMAS = {"1.0.0"}
+#: The one schema on the wire. Nothing emits an older one: `common.SCHEMA_VERSION`
+#: is 1.1.0 and the client auto-updates, so a second entry here would be a
+#: door left open for a version that no longer exists.
+KNOWN_SCHEMAS = {"1.1.0"}
 
 BUNDLE_FORMAT = "seta-insight-bundle/1"
 
@@ -198,6 +200,103 @@ def load_allowed(raw: Optional[str], path: Optional[str]) -> Dict[str, List[str]
     return identity.parse_whitelist(text)
 
 
+#: The install script is small; this is a sanity bound, not a policy. A file
+#: that has grown past this is not the installer any more and serving it would
+#: be serving whatever it has become.
+MAX_INSTALL_SCRIPT = 64 * 1024
+
+
+#: The three values ``install.sh`` carries, plus the schema the client of that
+#: release emits. Read out of the script rather than out of a second file, and
+#: that is the point -- see ``install_manifest``.
+_INSTALL_FIELDS = {
+    "version": re.compile(r'^VERSION="([^"]*)"$', re.M),
+    "sha256": re.compile(r'^SHA256="([^"]*)"$', re.M),
+    "url": re.compile(r'^URL="([^"]*)"$', re.M),
+    "client_schema": re.compile(r'^SCHEMA="([^"]*)"$', re.M),
+}
+
+_SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
+_SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
+
+
+def install_manifest(script: Optional[bytes]) -> Optional[bytes]:
+    """``/install.json`` -- the same release facts, for a machine to read.
+
+    **Derived from ``install.sh``, never configured separately.** A second file
+    holding the version and digest is a second file that can disagree with the
+    first, and the day it does, one of two things is true: laptops update to a
+    version the installer does not serve, or they refuse an update that is
+    genuinely available. Neither is discoverable from the outside. Parsing the
+    script the endpoint is already serving costs a regex and removes the class.
+
+    The coupling that buys is real and worth naming: this function knows the
+    shape of four lines in ``server/install.sh.in``. It is checked once, at
+    startup, and an unparseable script stops the process -- so the failure is
+    an operator reading a log line at deploy time, not an engineer discovering
+    six weeks later that nothing has updated.
+
+    Refused rather than served on anything that does not look like a rendered
+    template, which is also how an un-substituted ``@VERSION@`` gets caught.
+    """
+    if not script:
+        return None
+    text = script.decode("utf-8", "replace")
+    found: Dict[str, str] = {}
+    for name, pattern in _INSTALL_FIELDS.items():
+        match = pattern.search(text)
+        if not match:
+            raise SystemExit(
+                "the install script defines no {} -- it is not a rendered "
+                "server/install.sh.in".format(name.upper()))
+        found[name] = match.group(1)
+
+    if not _SEMVER_RE.match(found["version"]):
+        raise SystemExit(
+            "the install script's VERSION is {!r}, which is not a version -- "
+            "an unrendered template was deployed".format(found["version"]))
+    if not _SHA256_RE.match(found["sha256"]):
+        raise SystemExit(
+            "the install script's SHA256 is not a sha256 -- an unrendered "
+            "template was deployed")
+    if not found["url"].lower().startswith("https://"):
+        raise SystemExit("the install script's URL is not https")
+
+    return json.dumps({
+        "version": found["version"],
+        "sha256": found["sha256"],
+        "url": found["url"],
+        "client_schema": found["client_schema"],
+        # What this endpoint will actually accept. A client checks its
+        # candidate against this and stays behind rather than upgrading itself
+        # into 400-ing every upload -- see cli/update.py, `plan`.
+        "schemas": sorted(KNOWN_SCHEMAS),
+    }, sort_keys=True).encode("utf-8")
+
+
+def load_install_script(path: Optional[str]) -> Optional[bytes]:
+    """Read ``install.sh`` once, at startup, or return None to serve 404.
+
+    Read once and held in memory, and that is the whole security property of
+    the route it feeds -- see ``Handler.do_GET``. This is also the only place
+    the file name is ever taken from anything but the command line.
+    """
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as handle:
+            body = handle.read(MAX_INSTALL_SCRIPT + 1)
+    except OSError as exc:
+        raise SystemExit("cannot read --install-script {}: {}".format(path, exc))
+    if not body.strip():
+        raise SystemExit("--install-script {} is empty".format(path))
+    if len(body) > MAX_INSTALL_SCRIPT:
+        raise SystemExit(
+            "--install-script {} is over {} bytes -- that is not the installer"
+            .format(path, MAX_INSTALL_SCRIPT))
+    return body
+
+
 # --------------------------------------------------------------------------
 # the server
 # --------------------------------------------------------------------------
@@ -213,6 +312,10 @@ class Handler(BaseHTTPRequestHandler):
     by_person_key: Dict[str, str] = {}
     #: False on a listener that faces the internet. See ``serve_upload_only``.
     read_routes: bool = True
+    #: ``install.sh``, read at startup. None means the route 404s.
+    install_script: Optional[bytes] = None
+    #: ``/install.json``, derived from it at startup. Same fixed-bytes rule.
+    install_manifest: Optional[bytes] = None
 
     # -- plumbing ---------------------------------------------------------
 
@@ -229,10 +332,16 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_bytes(self, body: bytes, content_type: str) -> None:
+    def _send_bytes(self, body: bytes, content_type: str,
+                    cache_control: Optional[str] = None) -> None:
         self.send_response(200)
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Length", str(len(body)))
+        if cache_control:
+            # Opt-in, never a default. The other caller here is a bundle: one
+            # engineer's telemetry, admin-authenticated, and the last thing
+            # that should acquire a cache header by inheritance.
+            self.send_header("Cache-Control", cache_control)
         self.end_headers()
         self.wfile.write(body)
 
@@ -334,7 +443,69 @@ class Handler(BaseHTTPRequestHandler):
         try:
             parsed = urlparse(self.path)
             if parsed.path == "/healthz":
-                self._send(200, {"ok": True, "people": len(self.allowed)})
+                # `schemas` is here because a client deciding whether to update
+                # itself needs to know what this endpoint accepts, and because
+                # "what versions of the contract does this speak" is a fact
+                # about a service that belongs in its health check. It is not a
+                # disclosure: KNOWN_SCHEMAS is protocol, published in
+                # server/README.md, and worth nothing to anyone who cannot
+                # already authenticate.
+                self._send(200, {"ok": True, "people": len(self.allowed),
+                                 "schemas": sorted(KNOWN_SCHEMAS)})
+                return
+
+            if parsed.path == "/install.json":
+                # The machine-readable half of the same fixed byte string, and
+                # subject to every word of the comment below: derived once at
+                # startup, no path parameter, no filesystem access per request.
+                # `cli/update.py` fetches this daily to decide whether to
+                # upgrade itself, so the digest it will insist on arrives here,
+                # from the endpoint over TLS, while the archive comes from
+                # GitHub -- the same two origins the installer relies on.
+                if not self.install_manifest:
+                    raise Rejected(404, "no such route")
+                self._send_bytes(self.install_manifest,
+                                 "application/json; charset=utf-8",
+                                 "public, max-age=300")
+                return
+
+            if parsed.path in ("/install", "/install.sh"):
+                # The first unauthenticated public route that returns anything
+                # an attacker might want, so it is worth writing down what they
+                # get and what stops them getting more.
+                #
+                # What they get: the script's text. The endpoint hostname --
+                # already public in DNS and hard-coded as SETA_ENDPOINT in
+                # cli/insight.py. The release version, the artifact URL, the
+                # expected sha256, and the paths under ~/.local this installs
+                # to. No secret, and nothing that is not on the tin.
+                #
+                # What makes that safe is one property: the response is a fixed
+                # byte string held in memory. There is no path parameter, no
+                # filesystem access per request, and therefore no input on this
+                # route that can influence which bytes come back. That is why
+                # the file is read at startup rather than per request -- the
+                # loading happens once, from a name given on the command line,
+                # and the request never touches a name at all.
+                #
+                # The hazard it is guarding is concrete, not theoretical. This
+                # container mounts /etc/insight read-only, and that directory
+                # holds allowed.env -- every engineer's work address and
+                # fingerprint -- next to admin.token. If this route ever grew a
+                # path parameter, one traversal bug would hand the admin token
+                # to the internet: exactly the outcome the loopback split and
+                # `read_routes=False` exist to prevent. So it does not get one.
+                #
+                # Unset means 404, the same shape as the read-routes guard
+                # below: a deployment that does not serve this does not admit
+                # the route exists.
+                if not self.install_script:
+                    raise Rejected(404, "no such route")
+                # Five minutes. Long enough that a team installing on the same
+                # afternoon does not each pull it, short enough that a release
+                # is live in the time it takes to walk to the next desk.
+                self._send_bytes(self.install_script, "text/plain; charset=utf-8",
+                                 "public, max-age=300")
                 return
 
             if not self.read_routes:
@@ -438,13 +609,18 @@ def _now() -> str:
 # --------------------------------------------------------------------------
 
 def build_handler(store: Any, allowed: Dict[str, List[str]],
-                  admin_token: str, read_routes: bool = True) -> type:
+                  admin_token: str, read_routes: bool = True,
+                  install_script: Optional[bytes] = None,
+                  manifest: Optional[bytes] = None) -> type:
     return type("BoundHandler", (Handler,), {
         "store": store,
         "allowed": allowed,
         "admin_token": admin_token,
         "by_person_key": {identity.person_key(e): e for e in allowed},
         "read_routes": read_routes,
+        "install_script": install_script,
+        "install_manifest": manifest if manifest is not None
+        else install_manifest(install_script),
     })
 
 
@@ -467,6 +643,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "on another machine and forwards every path")
     parser.add_argument("--allowed-file", default=os.environ.get("INSIGHT_ALLOWED_FILE"),
                         help="file of email:fingerprint lines")
+    parser.add_argument("--install-script",
+                        default=os.environ.get("INSIGHT_INSTALL_SCRIPT"),
+                        help="the install.sh served at GET /install. Read once "
+                             "at startup; unset means that route 404s")
     parser.add_argument("--admin-token-file",
                         default=os.environ.get("INSIGHT_ADMIN_TOKEN_FILE"),
                         help="file holding the admin token, instead of putting "
@@ -483,6 +663,9 @@ def main(argv: Optional[List[str]] = None) -> int:
     admin_token = load_admin_token(os.environ.get("INSIGHT_ADMIN_TOKEN"),
                                    args.admin_token_file)
 
+    install_script = load_install_script(args.install_script)
+    manifest = install_manifest(install_script)
+
     allowed = load_allowed(os.environ.get("INSIGHT_ALLOWED"), args.allowed_file)
     try:
         store = store_mod.open_store(args.store)
@@ -496,14 +679,19 @@ def main(argv: Optional[List[str]] = None) -> int:
                       "designed to sit behind nginx on loopback"}))
 
     server = ThreadingHTTPServer((args.host, args.port), build_handler(
-        store, allowed, admin_token))
+        store, allowed, admin_token, install_script=install_script,
+        manifest=manifest))
     log.info(json.dumps({"event": "listening", "host": args.host,
                          "port": args.port, "store": args.store,
-                         "people": len(allowed)}, sort_keys=True))
+                         "people": len(allowed),
+                         "install_script": bool(install_script),
+                         "serving_version": json.loads(manifest)["version"]
+                         if manifest else None},
+                        sort_keys=True))
 
     # A second listener that serves uploads and nothing else.
     #
-    # `docs/TRANSPORT.md` splits the routes by exposure, not by token: uploading
+    # `server/README.md` splits the routes by exposure, not by token: uploading
     # has to be reachable from every laptop, and reading exposes the whole team
     # at once. Where a reverse proxy on this host enforces that split, this is
     # not needed. Where the gateway is on *another* machine -- so it cannot
@@ -521,7 +709,8 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "one of them serves the read routes and the other does not")
         upload_server = ThreadingHTTPServer(
             (args.host, args.upload_port),
-            build_handler(store, allowed, admin_token, read_routes=False))
+            build_handler(store, allowed, admin_token, read_routes=False,
+                          install_script=install_script, manifest=manifest))
         threading.Thread(target=upload_server.serve_forever, daemon=True).start()
         log.info(json.dumps({"event": "listening_upload_only",
                              "host": args.host, "port": args.upload_port},

@@ -1,0 +1,615 @@
+#!/usr/bin/env python3
+"""Read VS Code's Copilot Chat sessions -- the surface the CLI journal misses.
+
+    python3 cli/vscode_read.py [--root <VS Code User dir>]
+
+Why this exists
+---------------
+`copilot_read.py` reads ``~/.copilot/session-state``, which Copilot CLI writes
+for its own ``/resume``. **The VS Code Copilot Chat panel writes nothing there.**
+
+Measured on the pilot samples (``samples/ngocnguyen``, ``samples/linhhoang``,
+2026-08-26): neither machine has a ``session-state`` directory at all.
+**Not because server mode cannot journal** -- an earlier reading of this claimed
+that and it is wrong. The machine these tests were written on shows the
+identical log pattern (29 ``server mode (stdio)`` starts in August, ``Destroying
+0 active sessions`` on every shutdown) and journals perfectly well; it simply
+created 0 session dirs in August against 28 in April-June. The CLI server is
+started by VS Code whenever the editor opens; a session directory appears only
+when a Copilot CLI session actually runs.
+
+So a QA engineer working entirely in the chat panel produces **zero** contract
+events from the journal -- not because the journal is broken, but because the
+chat panel is a different surface that never creates one. A zero that means "not
+watched" is reported identically to a zero that means "did no work". That is the
+failure this module exists to close.
+
+VS Code does keep the sessions, in its own store:
+
+    <User>/workspaceStorage/<hash>/chatSessions/<uuid>.json
+
+Measured on a real machine: 145 workspaces, 55 session files, 27 of them
+carrying requests, 93 requests, 603 tool calls.
+
+Two storage formats
+-------------------
+`.json`  -- one object with a `requests` array. The older format.
+`.jsonl` -- an append-only log: a header, then records that add or **patch**
+            requests. This is the current format.
+
+Reading only `.json` is how this module first shipped, and it was wrong in a
+way worth recording: it saw **93** requests where the machine held **5,036**,
+and reported the newest activity as six months old on a machine in use that
+afternoon. A file-extension filter decided a finding. Both are read now, and
+`.jsonl` records are merged by `requestId` because a request's `result` -- and
+with it its token counts -- can arrive in a later record than the request.
+
+What this can and cannot see
+----------------------------
+**It can see cost, on some requests.** `promptTokens` and `outputTokens` are
+present in the `.jsonl` metadata. An earlier version of this docstring stated
+the opposite in the strongest terms -- "cannot be recovered from this surface
+at any later date" -- and that was read off the older format. Measured
+2026-08-26 on a live request: promptTokens 31,991, outputTokens 170.
+
+They are absent on requests whose `result` never landed, and there they are
+NULL, never 0. What is genuinely unavailable is the cache split and the
+premium-request count.
+
+**It sees what the CLI journal cannot.** `result.timings.totalElapsed` is a
+real per-request latency, per *call* rather than per session. The journal
+totals usage at shutdown and stamps one row for a whole session, so it carries
+no per-call latency at all. The two surfaces are complementary:
+
+    journal   premium requests, cache split, per-session totals -- no latency
+    chat      latency, per-call grain, tool names, prompt/output tokens
+
+Content safety
+--------------
+These files are **mostly content**. A single request carries `message.text`
+(the prompt), `response` (137 elements on one measured request),
+`metadata.codeBlocks`, `metadata.renderedUserMessage` and the arguments of
+every tool call. None of it may be stored.
+
+So this module names what it keeps, exactly as `copilot_read.py` does, and
+never inspects the rest. `KEEP` below is the whole surface. A field that is not
+named there is not read -- not read and dropped, *not read*. An exclusion list
+would have to keep pace with a format that gains keys without asking; there is
+no version of that which stays correct.
+
+Tool names are the one dimension taken from inside a tool call, and they are
+taken because they are bounded: 12 distinct values across 603 calls on the
+measured machine (`read_file`, `grep_search`, `replace_string_in_file`, ...).
+The *arguments* are never touched.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+from datetime import datetime, timezone
+from typing import Any, Dict, Iterator, List, Optional, Tuple
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+if _HERE not in sys.path:
+    sys.path.insert(0, _HERE)
+
+_ROOT = os.path.dirname(_HERE)
+for _p in (_ROOT,):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import common  # noqa: E402
+
+#: CONTRACT.md §2.3. Named separately from `copilot-cli` because the whole point
+#: of this module is that the two surfaces see different things; folding them
+#: into one name would hide which half of a figure came from where.
+SURFACE = "vscode-copilot-chat"
+
+#: Where VS Code keeps per-workspace state, on the platforms we support.
+DEFAULT_ROOTS = (
+    "~/Library/Application Support/Code/User",          # macOS
+    "~/.config/Code/User",                              # Linux
+    "~/Library/Application Support/VSCodium/User",
+    "~/.config/VSCodium/User",
+)
+
+#: Named because they are kept. Everything else in a request -- the prompt, the
+#: response, the rendered context, the code blocks, every tool argument -- is
+#: dropped without inspection. Paths are dotted, from one entry of `requests`.
+KEEP: Tuple[str, ...] = (
+    "requestId",
+    "modelId",
+    "timestamp",
+    "responseTimestamp",
+    "timeSpentWaiting",
+    "result.timings.totalElapsed",
+    "result.timings.firstProgress",
+    "result.metadata.agentId",
+    "result.metadata.maxToolCallsExceeded",
+    # Present only in the `.jsonl` format, and only on some requests. Measured
+    # 2026-08-26: 1 of 4 requests in a fresh session carried them.
+    "result.metadata.promptTokens",
+    "result.metadata.outputTokens",
+    "result.metadata.resolvedModel",
+)
+
+#: Taken from inside each tool-call round. The name only.
+KEEP_TOOL: Tuple[str, ...] = ("name",)
+
+#: CONTRACT.md §3 `tool_kind`. Mapping is by exact name against a closed set --
+#: never by substring, which would put `manage_todo_list` in `read` for
+#: containing "list". An unmapped name is `other`, and stays visible as such.
+TOOL_KINDS: Dict[str, str] = {
+    "read_file": "read",
+    "list_dir": "read",
+    "get_errors": "read",
+    "grep_search": "search",
+    "file_search": "search",
+    "semantic_search": "search",
+    "create_file": "edit",
+    "replace_string_in_file": "edit",
+    "multi_replace_string_in_file": "edit",
+    "run_in_terminal": "execute",
+    "runSubagent": "delegate",
+    "manage_todo_list": "plan",
+}
+
+
+def dig(data: Any, path: str) -> Any:
+    """Follow a dotted path, returning None rather than raising."""
+    node = data
+    for part in path.split("."):
+        if not isinstance(node, dict):
+            return None
+        node = node.get(part)
+    return node
+
+
+def keep(request: Dict[str, Any]) -> Dict[str, Any]:
+    """Project one request onto `KEEP`. Nothing else is looked at."""
+    return {path: dig(request, path) for path in KEEP}
+
+
+def stamp(epoch_ms: Any) -> Optional[str]:
+    """VS Code writes epoch milliseconds; the contract wants RFC3339 UTC."""
+    if not isinstance(epoch_ms, (int, float)) or epoch_ms <= 0:
+        return None
+    return datetime.fromtimestamp(epoch_ms / 1000.0, tz=timezone.utc).isoformat(
+        timespec="milliseconds").replace("+00:00", "Z")
+
+
+def normalise_model(model_id: Any) -> Optional[str]:
+    """``copilot/claude-sonnet-4.5`` -> ``claude-sonnet-4.5``.
+
+    The prefix names the *vendor route*, not the model, and the CLI journal
+    records the same model without it. Left in place, one model would appear as
+    two rows in every by-model breakdown, split by which surface it ran on --
+    which is the opposite of what a by-model breakdown is for.
+    """
+    if not isinstance(model_id, str) or not model_id:
+        return None
+    name = model_id.split("/", 1)[1] if "/" in model_id else model_id
+    # `resolvedModel` spells the version with a dash where `modelId` uses a
+    # dot: `claude-sonnet-4-6` against `claude-sonnet-4.6`. Measured
+    # 2026-08-26, preferring `resolvedModel` without this split one model into
+    # two rows -- 12 under one spelling and 7 under the other. The CLI journal
+    # writes the dot, so the dot is canonical.
+    return re.sub(r"-(\d+)-(\d+)\b", r"-\1.\2", name)
+
+
+def default_root() -> Optional[str]:
+    """Where VS Code keeps user state, honouring an override.
+
+    ``$VSCODE_HOME`` mirrors ``$COPILOT_HOME`` in `copilot_read`, and it is not
+    only a convenience. Without it every test of the hourly run parsed the
+    developer's real chat history -- 937 sessions and 12,536 events on the
+    machine this was written on -- which made one test suite take four minutes
+    and, worse, made tests read data they had no business touching.
+    """
+    override = os.environ.get("VSCODE_HOME")
+    if override:
+        return override if os.path.isdir(
+            os.path.join(override, "workspaceStorage")) else None
+    for candidate in DEFAULT_ROOTS:
+        path = os.path.expanduser(candidate)
+        if os.path.isdir(os.path.join(path, "workspaceStorage")):
+            return path
+    return None
+
+
+def workspace_folder(storage_dir: str) -> Optional[str]:
+    """The filesystem folder a workspaceStorage hash stands for.
+
+    Measured 2026-08-26: 145 of 145 directories holding chat sessions carried a
+    readable ``workspace.json``, so this is a reliable edge rather than a
+    best-effort one. A ``workspace`` key (a ``.code-workspace`` file) rather
+    than a ``folder`` key is a multi-root window; it names no single repository
+    and is left unresolved instead of being attributed to one of them.
+    """
+    path = os.path.join(storage_dir, "workspace.json")
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (OSError, ValueError):
+        return None
+    uri = data.get("folder")
+    if not isinstance(uri, str) or not uri.startswith("file://"):
+        return None
+    from urllib.parse import unquote
+    return unquote(uri[len("file://"):])
+
+
+def repo_of(folder: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
+    """``(repo_full_name, branch)`` for a workspace folder, or ``(None, None)``.
+
+    Read from the clone, which means it is read **now** -- and a folder that has
+    been deleted since the chat happened resolves to nothing. That is the same
+    perishability `copilot_read.run_bound` was built around, and the same
+    answer applies: what cannot be evidenced is left NULL.
+    """
+    if not folder or not os.path.isdir(folder):
+        return None, None
+
+    def git(*args: str) -> Optional[str]:
+        try:
+            out = subprocess.run(("git", "-C", folder) + args,
+                                 capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout.strip() if out.returncode == 0 else None
+
+    url = git("config", "--get", "remote.origin.url")
+    name = None
+    if url:
+        url = url[:-4] if url.endswith(".git") else url
+        parts = [p for p in url.replace(":", "/").split("/") if p]
+        name = "/".join(parts[-2:]) if len(parts) >= 2 else None
+    return name, git("rev-parse", "--abbrev-ref", "HEAD")
+
+
+def iter_sessions(root: str) -> Iterator[Tuple[str, str, str]]:
+    """``(storage_dir, session_id, path)`` for every chat session under root."""
+    base = os.path.join(root, "workspaceStorage")
+    try:
+        hashes = sorted(os.listdir(base))
+    except OSError:
+        return
+    for name in hashes:
+        storage = os.path.join(base, name)
+        folder = os.path.join(storage, "chatSessions")
+        if not os.path.isdir(folder):
+            continue
+        try:
+            files = sorted(os.listdir(folder))
+        except OSError:
+            continue
+        for filename in files:
+            # `.jsonl` is the current format and `.json` the one before it.
+            # Reading only `.json` is how this module first shipped, and it
+            # made a live machine look six months idle -- every recent session
+            # was in a file the loop skipped. Both are read.
+            for suffix in (".jsonl", ".json"):
+                if filename.endswith(suffix):
+                    yield storage, filename[:-len(suffix)], \
+                        os.path.join(folder, filename)
+                    break
+
+
+def load_requests(path: str) -> List[Dict[str, Any]]:
+    """Every request in one chat session, from either storage format.
+
+    `.json` is a single object with a `requests` array. `.jsonl` is an
+    **append-only log**: a header record, then records that add or *patch*
+    requests. Measured on a live session, one request's `result` -- and with it
+    its token counts -- arrived in a later record than the request itself, so a
+    reader that took the first sighting and stopped would report the tokens as
+    absent. Records are therefore merged by `requestId`, later winning.
+
+    A file VS Code is mid-write on yields whatever parsed; a truncated final
+    line is skipped rather than losing the session.
+    """
+    try:
+        with open(path, "r", encoding="utf-8") as handle:
+            text = handle.read()
+    except OSError:
+        return []
+
+    if path.endswith(".jsonl"):
+        merged: Dict[str, Dict[str, Any]] = {}
+        order: List[str] = []
+        for line in text.splitlines():
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except ValueError:
+                continue          # a half-written trailing line
+            value = record.get("v")
+            if isinstance(value, list):
+                items = value
+            elif isinstance(value, dict) and isinstance(value.get("requests"), list):
+                items = value["requests"]
+            else:
+                continue
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                request_id = item.get("requestId")
+                if not request_id:
+                    continue
+                if request_id not in merged:
+                    order.append(request_id)
+                    merged[request_id] = {}
+                merged[request_id].update(item)
+        return [merged[r] for r in order]
+
+    try:
+        data = json.loads(text)
+    except ValueError:
+        return []
+    requests = data.get("requests")
+    return [r for r in requests if isinstance(r, dict)] \
+        if isinstance(requests, list) else []
+
+
+def session_events(path: str, session_id: str,
+                   repo: Optional[str], branch: Optional[str],
+                   actor: Optional[Dict[str, Any]] = None,
+                   jira_projects: Optional[Tuple[str, ...]] = None
+                   ) -> List[Dict[str, Any]]:
+    """Build contract events for one chat session file."""
+    requests = load_requests(path)
+    if not requests:
+        return []
+
+    context = common.make_context(
+        jira_issue_key=common.extract_jira_key(None, branch,
+                                               projects=jira_projects),
+        repo_full_name=repo,
+        branch_name=branch,
+    )
+    agent = common.make_agent("copilot.chat", surface=SURFACE)
+    # The journal reader nulls this for the same reason: the agent's version is
+    # not something the surface records, and the poller's own version number
+    # would be a confident wrong answer.
+    agent["agent_version"] = None
+
+    events: List[Dict[str, Any]] = []
+
+    def emit(event_type: str, when: Optional[str], attributes: Dict[str, Any],
+             suffix: str) -> None:
+        events.append(common.build_event(
+            event_type=event_type,
+            event_time=when,
+            natural_key=(session_id, suffix),
+            attributes=attributes,
+            actor=actor,
+            context=context,
+            agent=agent,
+            # `heuristic` 0.9, not `explicit`: the request is a real record,
+            # but nothing in it names a run, and the repository is resolved
+            # from where the window happened to be open.
+            link=common.make_link("heuristic", 0.9),
+            trace_id=session_id,
+            # No run: VS Code chat has no run concept, and inventing one to
+            # satisfy a column would manufacture a join key (AR-1). Null is
+            # accepted here -- CONTRACT.md §2.4.
+            run_id=None,
+        ))
+
+    for index, request in enumerate(requests):
+        if not isinstance(request, dict):
+            continue
+        attrs = keep(request)
+        request_id = attrs.get("requestId") or "req-{}".format(index)
+        when = stamp(attrs.get("timestamp"))
+
+        # -- the human turn -------------------------------------------------
+        # `chars` is deliberately NOT taken. It would require measuring the
+        # prompt, and a length is a weak but real signal about content; the
+        # turn happening is what this is for.
+        emit("human.turn", when, {
+            "turn_index": index,
+            "turn_kind": "prompt",
+            "chars": None,
+        }, "turn:{}".format(request_id))
+
+        # -- the model call -------------------------------------------------
+        elapsed = attrs.get("result.timings.totalElapsed")
+        prompt_tokens = attrs.get("result.metadata.promptTokens")
+        output_tokens = attrs.get("result.metadata.outputTokens")
+        emit("model.call", when, {
+            # `resolvedModel` is what actually served the request; `modelId` is
+            # what was asked for. They agree today, and when they disagree the
+            # served one is the true answer.
+            "model_id": normalise_model(
+                attrs.get("result.metadata.resolvedModel")
+                or attrs.get("modelId")),
+            "latency_ms": elapsed if isinstance(elapsed, (int, float)) else None,
+            # Present on this surface after all. An earlier version of this
+            # module asserted they were "NULL forever and cannot be recovered
+            # at any later date" -- that was read off the older `.json`
+            # format, and the `.jsonl` format carries them. Measured
+            # 2026-08-26 on a live request: promptTokens 31,991, outputTokens
+            # 170.
+            #
+            # Still NULL when absent, which is the common case: only 1 of 4
+            # requests in that session carried them, because the counts arrive
+            # with the `result` and a request whose result never landed has
+            # none. Zero would claim a request that cost nothing.
+            "input_tokens": prompt_tokens if isinstance(prompt_tokens, int) else None,
+            "output_tokens": output_tokens if isinstance(output_tokens, int) else None,
+            # These genuinely are not recorded here: the surface reports a
+            # prompt total, not its cache split, and no premium-request count.
+            "cached_input_tokens": None,
+            "cache_write_tokens": None,
+            "reasoning_tokens": None,
+            "premium_requests": None,
+            "request_count": 1,
+            "retry_count": None,
+            "finish_reason": (
+                "max_tool_calls"
+                if attrs.get("result.metadata.maxToolCallsExceeded") else None),
+        }, "model:{}".format(request_id))
+
+        # -- the tool calls -------------------------------------------------
+        rounds = dig(request, "result.metadata.toolCallRounds")
+        if not isinstance(rounds, list):
+            continue
+        position = 0
+        for round_ in rounds:
+            if not isinstance(round_, dict):
+                continue
+            for call in (round_.get("toolCalls") or []):
+                if not isinstance(call, dict):
+                    continue
+                name = call.get("name")
+                if not isinstance(name, str) or not name:
+                    continue
+                emit("tool.call", when, {
+                    "tool_name": name,
+                    "tool_kind": TOOL_KINDS.get(name, "other"),
+                    # The store records no per-tool outcome or duration. A
+                    # status of "ok" would be an assumption that every tool
+                    # succeeded, which is exactly the claim we cannot make.
+                    "status": None,
+                    "duration_ms": None,
+                    "error_class": None,
+                }, "tool:{}:{}".format(request_id, position))
+                position += 1
+
+    return events
+
+
+def to_events(root: Optional[str] = None,
+              actor: Optional[Dict[str, Any]] = None,
+              jira_projects: Optional[Tuple[str, ...]] = None
+              ) -> Dict[str, Any]:
+    """Read every chat session under ``root``."""
+    root = root or default_root()
+    if not root or not os.path.isdir(os.path.join(root, "workspaceStorage")):
+        return {"present": False, "root": root, "events": [], "sessions": 0,
+                "requests": 0, "coverage": coverage(0, 0, 0)}
+
+    events: List[Dict[str, Any]] = []
+    sessions = with_requests = 0
+    resolved: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+
+    for storage, session_id, path in iter_sessions(root):
+        sessions += 1
+        if storage not in resolved:
+            resolved[storage] = repo_of(workspace_folder(storage))
+        repo, branch = resolved[storage]
+        found = session_events(path, session_id, repo, branch, actor,
+                               jira_projects)
+        if found:
+            with_requests += 1
+            events += found
+
+    return {
+        "present": True,
+        "root": root,
+        "events": events,
+        "sessions": sessions,
+        "sessions_with_requests": with_requests,
+        "requests": sum(1 for e in events if e["event_type"] == "model.call"),
+        "coverage": coverage(
+            sessions, with_requests,
+            sum(1 for e in events if e["event_type"] == "model.call"
+                and e["attributes"].get("input_tokens") is not None)),
+    }
+
+
+def coverage(sessions: int, with_requests: int,
+             tokens_seen: int = 0) -> Dict[str, Any]:
+    """What this surface could not see, published with every run.
+
+    CONTRACT.md §1: an unmeasured quantity and a measured zero must never look
+    the same. The cost fields here are permanently unavailable, not pending.
+    """
+    return {
+        "surface": SURFACE,
+        "sessions_seen": sessions,
+        "sessions_with_requests": with_requests,
+        "sessions_empty": sessions - with_requests,
+        "usage_available": tokens_seen > 0,
+        "requests_with_tokens": tokens_seen,
+        "unavailable_fields": [
+            "cached_input_tokens", "cache_write_tokens", "reasoning_tokens",
+            "premium_requests",
+        ],
+        "reason": (
+            "Prompt and output token counts are present on requests whose "
+            "`result` landed, and NULL on the rest -- not zero. The cache "
+            "split and the premium-request count are not recorded on this "
+            "surface at all."),
+        "surfaces_not_covered": ["inline-completions"],
+    }
+
+
+def verify_no_content(events: List[Dict[str, Any]]) -> List[str]:
+    """Refuse to ship anything that looks like content or a home directory.
+
+    Checked before a write, not on ingest: this runs on a machine full of the
+    things it must not collect.
+    """
+    problems: List[str] = []
+    home = os.path.expanduser("~")
+    for event in events:
+        for key, value in (event.get("attributes") or {}).items():
+            if isinstance(value, str):
+                if home in value or value.startswith("/Users/") \
+                        or value.startswith("/home/"):
+                    problems.append("{}.{} carries an absolute path".format(
+                        event["event_type"], key))
+                elif len(value) > 200:
+                    problems.append("{}.{} is {} chars -- content?".format(
+                        event["event_type"], key, len(value)))
+    return problems
+
+
+def main(argv: Optional[List[str]] = None) -> int:
+    parser = argparse.ArgumentParser(
+        description="Emit contract events from VS Code Copilot Chat sessions.")
+    parser.add_argument("--root", help="VS Code User directory")
+    parser.add_argument("--out", help="NDJSON output (default: summary only)")
+    parser.add_argument("--jira-projects",
+                        help="Comma-separated real Jira project keys")
+    args = parser.parse_args(argv)
+
+    projects = None
+    if args.jira_projects:
+        projects = tuple(sorted({p.strip().upper()
+                                 for p in args.jira_projects.split(",")
+                                 if p.strip()})) or None
+
+    result = to_events(args.root, jira_projects=projects)
+    problems = verify_no_content(result["events"])
+    if problems:
+        for problem in problems[:5]:
+            print("REJECTED " + problem, file=sys.stderr)
+        return 2
+
+    if args.out:
+        with open(args.out, "w", encoding="utf-8") as handle:
+            for event in result["events"]:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+    print(json.dumps({
+        "present": result["present"],
+        "sessions": result["sessions"],
+        "sessions_with_requests": result.get("sessions_with_requests", 0),
+        "requests": result["requests"],
+        "events": len(result["events"]),
+        "coverage": result["coverage"],
+    }, indent=2, sort_keys=True))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

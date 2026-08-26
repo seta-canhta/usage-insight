@@ -1,0 +1,631 @@
+#!/bin/sh
+# =============================================================================
+# insight -- installer.
+#
+#   curl -fsSL https://aeris-insight.seta-international.com/install | sh
+#
+# Template. The five placeholders in the assignments below are substituted at
+# tag time by `.github/workflows/release.yml`, which attaches the result to the
+# release; the endpoint serves it from /etc/insight/install.sh at GET /install,
+# and derives GET /install.json from it (server/proxy.py). They appear only
+# there and nowhere else in this file, so a comment cannot be rewritten by
+# accident -- which it was, the first time.
+#
+# ---------------------------------------------------------------------------
+# It installs, and then it stops.
+#
+# It does not run `setup`, does not pass `--yes`, and never touches
+# ~/.seta-insight/. Piping into `sh` means there is no terminal, so running
+# setup from here would have to pass `--yes` -- and that records consent nobody
+# was shown, which is the one thing every design decision in this codebase
+# refuses. The whitelist line `setup` prints at the end is also text a person
+# has to read and act on, and text at the tail of a piped installer is text
+# people scroll past.
+#
+# So the last thing this prints is: run `insight setup`.
+# ---------------------------------------------------------------------------
+# POSIX sh. On Ubuntu `sh` is dash: no `[[`, no arrays, no `pipefail`, no
+# `local` beyond one word. Checked with `shellcheck -s sh` in the release job.
+# =============================================================================
+
+set -eu
+
+VERSION="@VERSION@"
+SHA256="@SHA256@"
+URL="@URL@"
+ENDPOINT="@ENDPOINT@"
+
+# Not used by any line of shell below. It is here because the endpoint derives
+# GET /install.json from *this file* (server/proxy.py, `install_manifest`), and
+# `cli/update.py` needs to know which schema_version the release named above
+# emits before it will replace a working client with it. Kept in one file
+# rather than two so the installer and the update manifest cannot disagree
+# about what the current release is -- which, if they did, would be invisible
+# from the outside until laptops stopped updating.
+# shellcheck disable=SC2034  # read by server/proxy.py, not by this script
+SCHEMA="@SCHEMA@"
+
+# Where the two halves of the trust decision come from, and why they are two.
+#
+# This script -- with SHA256 baked into it -- is served by the endpoint over
+# TLS. The .pyz it names is fetched from GitHub Releases. Those are two
+# independent origins, so someone who compromises GitHub Releases alone cannot
+# put code on a laptop: the digest they would have to match is not theirs to
+# change, and the mismatch stops the install.
+#
+# That is also why this does NOT additionally fetch a SHA256SUMS file from
+# GitHub and cross-check it. Same origin as the artifact, so it adds no trust
+# root whatsoever -- it only adds a second thing that can fail to download.
+
+FORCE=0
+UNINSTALL=0
+ALLOW_ROOT=0
+PREFIX=""
+PY=""
+TMP=""
+
+# ---------------------------------------------------------------------------
+# output
+# ---------------------------------------------------------------------------
+
+say()  { printf '%s\n' "$*"; }
+warn() { printf '%s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+    cat <<EOF
+insight $VERSION installer
+
+  --prefix DIR    install under DIR instead of \$HOME/.local
+  --force         reinstall even if this version is already present
+  --uninstall     remove the launcher, the archive and the schedule
+  --allow-root    permit running as root (you almost certainly do not want this)
+  -h, --help      this
+
+Installs to ~/.local/bin/insight and ~/.local/share/seta-insight/.
+Nothing is written to ~/.seta-insight/ -- that is \`insight setup\`'s to create.
+EOF
+}
+
+# ---------------------------------------------------------------------------
+# platform
+# ---------------------------------------------------------------------------
+
+detect_os() {
+    OS="$(uname -s 2>/dev/null || echo unknown)"
+    ARCH="$(uname -m 2>/dev/null || echo unknown)"
+    case "$OS" in
+        Darwin) OS_NAME="macOS" ;;
+        Linux)  OS_NAME="Linux" ;;
+        *)      die "$OS is not supported. This installs on macOS and Linux; \
+on anything else, clone the repository and run ./insight." ;;
+    esac
+    # ARCH is printed and never branched on. The artifact is a zipapp: pure
+    # Python, no compiled extension, no wheel, identical bytes on arm64 and
+    # x86_64. Building a darwin-arm64 / linux-amd64 matrix here is the reflex
+    # when copying an installer from a Go or Rust project, and it would give
+    # four artifacts to publish, four digests to keep straight, and one more
+    # way to hand somebody the wrong file. There is one file.
+    :
+}
+
+refuse_root() {
+    [ "$ALLOW_ROOT" -eq 1 ] && return 0
+    [ "$(id -u)" -ne 0 ] && return 0
+    # Not paranoia about the install itself -- it is that everything downstream
+    # would then be root's. The tool would live in /root/.local/bin, `setup`
+    # would write /root/.seta-insight/, and the hourly job would be root's user
+    # unit rather than the engineer's. They would own none of it and see none
+    # of it.
+    if [ -n "${SUDO_USER:-}" ]; then
+        die "run this without sudo.
+
+You ran it as root via sudo. insight installs into your own home and its
+scheduled job runs as you -- under sudo all of that would belong to root, and
+\`insight status\` as yourself would show an empty machine.
+
+  curl -fsSL $ENDPOINT/install | sh"
+    fi
+    die "refusing to install as root.
+
+This installs into \$HOME and its hourly job is a per-user launchd agent or
+systemd --user timer. As root that is /root, and not the account doing the
+work. Run it as the engineer who will use it, or pass --allow-root if you
+really mean root's own home."
+}
+
+# ---------------------------------------------------------------------------
+# python
+# ---------------------------------------------------------------------------
+
+python_ok() {
+    # 3.9 because that is what macOS ships with the Xcode command line tools,
+    # and the client is written to that floor. Tested by running it, not by
+    # parsing `--version`: a version string can come from a shim that then
+    # execs something else.
+    "$1" -c 'import sys; raise SystemExit(0 if sys.version_info[:2] >= (3,9) else 1)' \
+        >/dev/null 2>&1
+}
+
+find_python() {
+    # /usr/bin/python3 is deliberately LAST on this list. On macOS it is the
+    # Xcode command line tools stub, and invoking it when the tools are not
+    # installed pops a graphical "install command line developer tools" dialog
+    # -- from a script the user piped into sh, which is a startling thing to do
+    # to somebody. Any real interpreter earlier in the list avoids it.
+    _found=""
+    _old=""
+    for _c in "${INSIGHT_PYTHON:-}" python3 python3.13 python3.12 python3.11 \
+              python3.10 python3.9 /opt/homebrew/bin/python3 \
+              /usr/local/bin/python3 /usr/bin/python3; do
+        [ -n "$_c" ] || continue
+        command -v "$_c" >/dev/null 2>&1 || continue
+        if python_ok "$_c"; then
+            _found="$_c"
+            break
+        fi
+        [ -n "$_old" ] || _old="$_c"
+    done
+
+    if [ -z "$_found" ]; then
+        if [ -n "$_old" ]; then
+            # Name the version AND the path. "Python 3.8" without a path sends
+            # someone to install a new one and wonder why nothing changed.
+            _v="$("$_old" -c 'import sys;print("%d.%d.%d"%sys.version_info[:3])' 2>/dev/null || echo unknown)"
+            _p="$(command -v "$_old")"
+            warn "found Python $_v at $_p -- insight needs 3.9 or newer."
+        else
+            warn "no Python 3 found."
+        fi
+        if [ "$OS" = "Darwin" ]; then
+            die "install one with:
+
+    xcode-select --install        # Apple's, ships 3.9
+    brew install python@3.12      # or Homebrew's
+
+then re-run this. Set INSIGHT_PYTHON=/path/to/python3 to name one directly."
+        fi
+        # Never `sudo apt-get install` from here, not even offered. A script
+        # fetched over the network acquiring root is a categorically larger act
+        # than the one the user agreed to when they piped it into sh, and an
+        # installer that asks for a password is an installer that teaches
+        # people to give one to a curl pipe.
+        die "install one with:
+
+    sudo apt-get install -y python3
+
+then re-run this. Set INSIGHT_PYTHON=/path/to/python3 to name one directly."
+    fi
+
+    # Resolve to what sys.executable actually is, so the launcher pins a real
+    # interpreter rather than a pyenv/asdf/mise shim. Shims resolve through the
+    # user's shell environment, and the hourly job does not have one: launchd
+    # gives an agent PATH=/usr/bin:/bin:/usr/sbin:/sbin and nothing else, so a
+    # shim recorded here becomes an hourly failure nobody sees.
+    PY="$("$_found" -c 'import sys;print(sys.executable)')"
+    [ -n "$PY" ] && [ -x "$PY" ] || die "could not resolve $_found to an interpreter"
+}
+
+# ---------------------------------------------------------------------------
+# download and verify
+# ---------------------------------------------------------------------------
+
+fetch() {
+    # $1 url, $2 output path
+    #
+    # -f matters as much as the TLS flags: without it curl writes a proxy's
+    # HTML error page to disk and exits 0, and the next thing to touch that
+    # file is the checksum, which would at least catch it -- but the error the
+    # user then reads would be "digest mismatch" instead of "404".
+    #
+    # There is no --insecure anywhere in this file, and none is offered in any
+    # error message. A corporate proxy breaking TLS is a conversation with
+    # whoever runs the proxy.
+    if command -v curl >/dev/null 2>&1; then
+        curl -fsSL --proto '=https' --tlsv1.2 --retry 3 --max-time 120 \
+             -o "$2" "$1" || die "download failed: $1"
+    elif command -v wget >/dev/null 2>&1; then
+        wget --https-only --quiet --tries=3 --timeout=120 -O "$2" "$1" \
+            || die "download failed: $1"
+    else
+        die "neither curl nor wget is available -- cannot download $1"
+    fi
+    [ -s "$2" ] || die "downloaded an empty file from $1"
+}
+
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | cut -d' ' -f1
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | cut -d' ' -f1
+    elif command -v openssl >/dev/null 2>&1; then
+        openssl dgst -sha256 "$1" | sed 's/.*= *//'
+    else
+        # The Python already validated above. This is the reason there is no
+        # machine on which verification is impossible, and therefore no code
+        # path in this script that proceeds unverified.
+        "$PY" -c 'import hashlib,sys
+with open(sys.argv[1],"rb") as f:
+    h=hashlib.sha256()
+    for b in iter(lambda: f.read(1<<20), b""): h.update(b)
+print(h.hexdigest())' "$1"
+    fi
+}
+
+verify() {
+    # $1 file
+    #
+    # Mandatory, and there is no way past it. No --skip-checksum, not hidden,
+    # not environment-gated: a flag like that gets pasted into Slack as the
+    # workaround for a corporate proxy the week it is added, and from then on
+    # nobody verifies anything.
+    _got="$(sha256_of "$1")"
+    [ -n "$_got" ] || die "could not compute a sha256 -- refusing to install unverified"
+    if [ "$_got" != "$SHA256" ]; then
+        rm -f "$1"
+        die "checksum mismatch -- nothing was installed.
+
+  expected  $SHA256
+            (from this install script, served over TLS by the endpoint)
+  got       $_got
+            (from the archive at $URL)
+
+Those are two different origins on purpose, and they disagree. That is either a
+corrupted download -- try again -- or the artifact is not the one this script
+was published alongside. Do not work around it."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# layout
+# ---------------------------------------------------------------------------
+
+layout() {
+    if [ -n "$PREFIX" ]; then
+        BIN_DIR="$PREFIX/bin"
+        DATA_DIR="$PREFIX/share/seta-insight"
+    else
+        BIN_DIR="$HOME/.local/bin"
+        DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/seta-insight"
+    fi
+    BIN="$BIN_DIR/insight"
+    PYZ="$DATA_DIR/insight-$VERSION.pyz"
+    CURRENT="$DATA_DIR/current.pyz"
+    # Not /usr/local/bin. cli/schedule.py's docstring promises "Nothing here
+    # runs as root, installs a system service, or writes outside the user's own
+    # home", and it keeps that promise -- a launchd *user* agent, a systemd
+    # *--user* timer, both running as the engineer. An installer that needed
+    # sudo would make that promise false at the first step.
+}
+
+MARKER="# generated by the insight installer -- do not edit"
+
+check_existing_launcher() {
+    [ -e "$BIN" ] || return 0
+    [ "$FORCE" -eq 1 ] && return 0
+    grep -qF "$MARKER" "$BIN" 2>/dev/null && return 0
+    die "$BIN already exists and was not written by this installer.
+
+Refusing to replace it -- the same rule \`insight install-hook\` follows for a
+commit hook it did not write. Move it aside, pass --force, or use
+--prefix DIR to install somewhere else."
+}
+
+# ---------------------------------------------------------------------------
+# install
+# ---------------------------------------------------------------------------
+
+write_launcher() {
+    # A shell launcher, not the .pyz with a rewritten shebang.
+    #
+    # `#!/usr/bin/env python3` resolves against PATH, and launchd hands an
+    # agent PATH=/usr/bin:/bin:/usr/sbin:/sbin. So the hourly run would find a
+    # different interpreter than the one validated here -- on macOS, most
+    # likely the Xcode stub. This execs the absolute path instead.
+    #
+    # INSIGHT_EXE is how `insight schedule` learns what to put in the launchd
+    # ProgramArguments / systemd ExecStart. Without it the scheduler would
+    # record the .pyz path and lose the pinned interpreter with it.
+    cat > "$BIN.new" <<EOF
+#!/bin/sh
+$MARKER
+# insight $VERSION
+INSIGHT_EXE="\$0"
+export INSIGHT_EXE
+exec "$PY" "$CURRENT" "\$@"
+EOF
+    chmod 0755 "$BIN.new"
+    mv -f "$BIN.new" "$BIN"
+}
+
+self_test() {
+    # One command, and it is worth its own step. It catches a $HOME on a noexec
+    # mount, an interpreter that resolved to something broken, a truncated
+    # archive that somehow matched, and a dangling current.pyz -- four failures
+    # that would otherwise surface an hour later inside a launchd job.
+    _out="$("$BIN" --version 2>&1)" || {
+        warn "$_out"
+        return 1
+    }
+    case "$_out" in
+        *"insight $VERSION"*) say "  $_out" ;;
+        *) warn "installed, but \`insight --version\` said:"
+           warn "  $_out"
+           warn "expected version $VERSION"
+           return 1 ;;
+    esac
+}
+
+do_install() {
+    if [ -f "$PYZ" ] && [ "$FORCE" -eq 0 ]; then
+        if [ "$(sha256_of "$PYZ")" = "$SHA256" ] && [ -e "$BIN" ]; then
+            say "insight $VERSION is already installed at $BIN"
+            say "Re-run with --force to reinstall."
+            report_untouched_config
+            path_advice
+            exit 0
+        fi
+    fi
+
+    check_existing_launcher
+
+    mkdir -p "$BIN_DIR" "$DATA_DIR"
+
+    # Downloaded into the destination directory, not /tmp, so the mv at the end
+    # is a rename on one filesystem: atomic, and it cannot half-happen. The
+    # version already installed stays live and working until that instant.
+    TMP="$(mktemp -d "$DATA_DIR/.install.XXXXXX")"
+    trap 'rm -rf "$TMP"' EXIT INT TERM HUP
+
+    say "Downloading insight $VERSION ..."
+    fetch "$URL" "$TMP/insight.pyz"
+    verify "$TMP/insight.pyz"
+    say "  sha256 verified"
+
+    chmod 0755 "$TMP/insight.pyz"
+    mv -f "$TMP/insight.pyz" "$PYZ"
+
+    _previous=""
+    [ -L "$CURRENT" ] && _previous="$(readlink "$CURRENT" 2>/dev/null || true)"
+    ln -sfn "$PYZ" "$CURRENT"
+
+    write_launcher
+
+    if ! self_test; then
+        # Put the symlink back before saying anything else. A failed upgrade
+        # that leaves current.pyz pointing at the new archive is an hourly job
+        # running the thing that just failed its own smoke test.
+        if [ -n "$_previous" ] && [ -f "$_previous" ]; then
+            ln -sfn "$_previous" "$CURRENT"
+            die "the installed insight did not run -- rolled back to $_previous"
+        fi
+        die "the installed insight did not run. Nothing is scheduled and
+nothing under ~/.seta-insight was touched. Re-run with a different
+INSIGHT_PYTHON, or clone the repository and run ./insight instead."
+    fi
+
+    # Remove archives from older versions, keeping the one running.
+    for _old in "$DATA_DIR"/insight-*.pyz; do
+        [ -f "$_old" ] || continue
+        [ "$_old" = "$PYZ" ] && continue
+        rm -f "$_old"
+    done
+
+    repoint_schedule
+    report_untouched_config
+    path_advice
+    say ""
+    say "Now run:"
+    say ""
+    say "    insight setup"
+    say ""
+    # Said here and not sold: `setup` is where the question is actually asked,
+    # with a default and a sentence about what it means. This is the one line
+    # that stops it being a surprise if the answer there is yes.
+    say "(setup will ask whether this machine may install its own updates."
+    say " Either answer is fine; \`insight update --off\` changes it later.)"
+    say ""
+}
+
+# ---------------------------------------------------------------------------
+# an existing schedule
+# ---------------------------------------------------------------------------
+
+# Labels and paths come from cli/schedule.py. If they change there, they change
+# here, and the release job's smoke test will not catch it -- this is the note
+# that has to.
+LAUNCHD_PLIST="$HOME/Library/LaunchAgents/vn.seta.insight.plist"
+SYSTEMD_TIMER="$HOME/.config/systemd/user/insight-collect.timer"
+
+repoint_schedule() {
+    _old_path=""
+    if [ "$OS" = "Darwin" ] && [ -f "$LAUNCHD_PLIST" ]; then
+        # Only <string> elements holding an absolute path. Matching on the
+        # word "insight" instead picks up <string>vn.seta.insight</string> --
+        # the Label, which is the line above ProgramArguments -- and then this
+        # reports the label as the old program path.
+        _old_path="$(sed -n 's|.*<string>\(/[^<]*\)</string>.*|\1|p' \
+                     "$LAUNCHD_PLIST" 2>/dev/null | head -n 1 || true)"
+    elif [ "$OS" = "Linux" ] && [ -f "$SYSTEMD_TIMER" ]; then
+        _old_path="$(sed -n 's/^ExecStart=\(.*\) auto$/\1/p' \
+                     "$(dirname "$SYSTEMD_TIMER")/insight-collect.service" \
+                     2>/dev/null | head -n 1 || true)"
+    else
+        return 0
+    fi
+
+    [ "$_old_path" = "$BIN" ] && return 0
+
+    say ""
+    say "An hourly schedule is already installed on this machine."
+    [ -n "$_old_path" ] && say "  it runs: $_old_path"
+    say "  now:     $BIN"
+
+    # `--yes` here, and nowhere else in this script.
+    #
+    # It is defensible in exactly this situation and no other: hourly consent
+    # was given once already, in a conversation this machine had with a person,
+    # and this re-points an existing schedule rather than enabling a new one.
+    # An engineer who upgraded from a clone otherwise keeps a plist firing
+    # against a checkout path forever, silently.
+    #
+    # Do NOT copy this to the setup path. There, `--yes` records consent nobody
+    # was shown, which is a different act with the same three characters.
+    if "$BIN" schedule --hourly --yes >/dev/null 2>&1; then
+        say "  repointed. \`insight schedule --status\` confirms it."
+    else
+        say "  could not repoint it automatically. Run:"
+        say "      insight schedule --off && insight schedule --hourly"
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# the configuration this never touches
+# ---------------------------------------------------------------------------
+
+report_untouched_config() {
+    # Printed every time there is something to print, and it is not padding.
+    # An engineer whose machine id, salt and upload secret live in
+    # ~/.seta-insight is going to wonder what an installer did to them, and the
+    # answer is nothing -- no code path in this file opens that directory for
+    # writing, or at all. The guarantee holds by construction; saying so is
+    # what makes it visible.
+    [ -d "$HOME/.seta-insight" ] || return 0
+    say ""
+    say "Your existing configuration, machine id, salt and upload secret are"
+    say "untouched. This installer never reads or writes ~/.seta-insight."
+}
+
+# ---------------------------------------------------------------------------
+# PATH
+# ---------------------------------------------------------------------------
+
+path_advice() {
+    case ":$PATH:" in
+        *":$BIN_DIR:"*) return 0 ;;
+    esac
+
+    _shell="$(basename "${SHELL:-sh}")"
+    case "$_shell" in
+        zsh)  _rc="$HOME/.zshrc"; _line="export PATH=\"$BIN_DIR:\$PATH\"" ;;
+        fish) _rc="$HOME/.config/fish/config.fish"
+              _line="fish_add_path $BIN_DIR" ;;
+        bash) if [ "$OS" = "Darwin" ]; then
+                  # macOS Terminal starts bash as a login shell, which reads
+                  # .bash_profile and not .bashrc. A line in .bashrc there is a
+                  # line that never runs.
+                  _rc="$HOME/.bash_profile"
+              else
+                  _rc="$HOME/.bashrc"
+              fi
+              _line="export PATH=\"$BIN_DIR:\$PATH\"" ;;
+        *)    _rc="your shell's startup file"
+              _line="export PATH=\"$BIN_DIR:\$PATH\"" ;;
+    esac
+
+    say ""
+    say "$BIN_DIR is not on your PATH. Add it:"
+    say ""
+    say "    echo '$_line' >> $_rc"
+    say "    $_line"
+    say ""
+    # Not done for them. `insight install-hook` refuses to overwrite a commit
+    # hook it did not write; appending to somebody's shell rc unasked is the
+    # same act with a wider blast radius and no undo.
+    say "(Not done automatically -- this does not edit your shell config.)"
+    if [ "$OS" = "Linux" ]; then
+        # Otherwise reported as a bug, reliably: Ubuntu's stock ~/.profile does
+        # add ~/.local/bin, but only inside `if [ -d "$HOME/.local/bin" ]`,
+        # evaluated at login. The directory was created a moment ago, so the
+        # test failed this morning and passes tomorrow.
+        say ""
+        say "Ubuntu's stock ~/.profile adds ~/.local/bin only if it already"
+        say "existed at login, so it will also start working by itself after"
+        say "you next log in."
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# uninstall
+# ---------------------------------------------------------------------------
+
+do_uninstall() {
+    # The schedule goes FIRST. Remove the binary first and launchd goes on
+    # firing a missing path every hour forever -- it does not notice, does not
+    # stop, and writes an error to a log nobody opens.
+    if [ -x "$BIN" ]; then
+        if "$BIN" schedule --off >/dev/null 2>&1; then
+            say "hourly schedule removed"
+        else
+            warn "could not run \`$BIN schedule --off\` -- check"
+            warn "  launchctl list | grep vn.seta.insight"
+            warn "  systemctl --user list-timers insight-collect.timer"
+        fi
+    elif [ -f "$LAUNCHD_PLIST" ] || [ -f "$SYSTEMD_TIMER" ]; then
+        warn "a schedule exists but $BIN is already gone -- remove it by hand:"
+        [ -f "$LAUNCHD_PLIST" ] && warn "  launchctl bootout gui/$(id -u)/vn.seta.insight; rm $LAUNCHD_PLIST"
+        [ -f "$SYSTEMD_TIMER" ] && warn "  systemctl --user disable --now insight-collect.timer"
+    fi
+
+    [ -e "$BIN" ] && rm -f "$BIN" && say "removed $BIN"
+    [ -d "$DATA_DIR" ] && rm -rf "$DATA_DIR" && say "removed $DATA_DIR"
+
+    # Printed, never deleted. Both of these are the user's, not this script's.
+    say ""
+    say "Not removed, on purpose:"
+    say ""
+    say "  ~/.seta-insight/   your config, machine id, salt, upload secret and"
+    say "                     any bundles not yet sent. To delete it:"
+    say "                         insight purge --yes --all"
+    say "                     (run that BEFORE uninstalling, or by hand after)"
+    say ""
+    say "  prepare-commit-msg hooks in your repositories. They exit 0 and write"
+    say "  nothing when there is no run to record, so leaving them costs you"
+    say "  nothing. To find them:"
+    say ""
+    say "      grep -rl AI-Run-Id ~/*/.git/hooks/prepare-commit-msg 2>/dev/null"
+    say ""
+}
+
+# ---------------------------------------------------------------------------
+
+parse_args() {
+    while [ $# -gt 0 ]; do
+        case "$1" in
+            --force)      FORCE=1 ;;
+            --uninstall)  UNINSTALL=1 ;;
+            --allow-root) ALLOW_ROOT=1 ;;
+            --prefix)     shift; [ $# -gt 0 ] || die "--prefix needs a directory"
+                          PREFIX="$1" ;;
+            --prefix=*)   PREFIX="${1#--prefix=}" ;;
+            -h|--help)    usage; exit 0 ;;
+            *)            die "unknown option: $1  (try --help)" ;;
+        esac
+        shift
+    done
+}
+
+main() {
+    parse_args "$@"
+    detect_os
+    refuse_root
+    layout
+
+    if [ "$UNINSTALL" -eq 1 ]; then
+        do_uninstall
+        return 0
+    fi
+
+    find_python
+    say "insight $VERSION -- $OS_NAME ($ARCH), $PY"
+    do_install
+}
+
+# The last line in the file, and every function above is defined before it.
+#
+# This is not style. This script is delivered through `curl | sh`, and a dropped
+# connection hands the shell a truncated file. Truncated here, that file defines
+# some functions and reaches EOF without ever calling main -- so nothing runs
+# and nothing is installed. Sprinkle the calls through the file instead and a
+# dropped connection runs half an installer.
+main "$@"

@@ -39,6 +39,11 @@ jobs:
           local = {p.stem for p in pathlib.Path("cli").rglob("*.py")}
           local |= {p.stem for p in pathlib.Path("pollers").rglob("*.py")}
           local |= {p.stem for p in pathlib.Path("collector").rglob("*.py")}
+          # The shared library is a package, so its stem is `__init__`, not
+          # `common`. Named explicitly: without it this guard reports the one
+          # import every module in cli/ makes as a third-party dependency.
+          local |= {p.parent.name
+                    for p in pathlib.Path(".").glob("*/__init__.py")}
           bad = []
           for path in sorted(pathlib.Path("cli").rglob("*.py")):
               tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
@@ -134,3 +139,68 @@ jobs:
             echo "--- $suite"
             python3 -m unittest discover -s "$suite/tests"
           done
+
+      # The client ships as one file, so the packaged form is the form that
+      # runs on fourteen laptops -- and three of the ways it can break are
+      # invisible to every test above, because they are all about a `.pyz`
+      # rather than a checkout. Built and exercised on every push, not only at
+      # a tag, so the release job is never the first thing to find out.
+      - name: The client builds as a zipapp, and the zipapp runs
+        run: |
+          set -eu
+          python3 tools/build_pyz.py --out /tmp/insight-a.pyz
+          python3 tools/build_pyz.py --out /tmp/insight-b.pyz
+          # Reproducible. The digest published in install.sh is what every
+          # laptop verifies against; a digest that moves when nothing moved is
+          # a number to trust rather than a number to check.
+          a="$(sha256sum /tmp/insight-a.pyz | cut -d' ' -f1)"
+          b="$(sha256sum /tmp/insight-b.pyz | cut -d' ' -f1)"
+          [ "$a" = "$b" ] || { echo "two builds differ: $a $b"; exit 1; }
+
+          python3 /tmp/insight-a.pyz --version
+
+          # The archive must not carry the test suite, and must not carry the
+          # central pipeline. An engineer's laptop has no business with either.
+          python3 - <<'PY'
+          import zipfile
+          names = zipfile.ZipFile("/tmp/insight-a.pyz").namelist()
+          bad = [n for n in names
+                 if n.startswith(("importers/", "report/", "sql/", "server/"))
+                 or "/tests/" in n or n.endswith(".pyc")]
+          assert not bad, bad
+          print("archive holds %d files, none of them shipped by accident" % len(names))
+          PY
+
+          home="$(mktemp -d)"
+          repo="$(mktemp -d)"
+          git init -q "$repo"
+          export SETA_INSIGHT_HOME="$home"
+          python3 /tmp/insight-a.pyz init --yes >/dev/null
+          # The only genuinely zip-specific code in the client: the commit hook
+          # is a data file inside the archive, reached through zipimport's
+          # get_data rather than open(). A regression is silent everywhere else.
+          python3 /tmp/insight-a.pyz install-hook --repo "$repo"
+          diff "$repo/.git/hooks/prepare-commit-msg" cli/hooks/prepare-commit-msg
+          echo "zipapp: reproducible, runs, and the bundled hook survives it"
+
+      - name: The installer template is valid POSIX sh
+        run: |
+          set -eu
+          # Rendered with throwaway values -- this checks the template's shape,
+          # not a release. The release job checks the rendered article.
+          sed -e 's|@VERSION@|0.0.0|' -e "s|@SHA256@|$(printf '0%.0s' $(seq 64))|" \
+              -e 's|@URL@|https://example.com/x.pyz|' \
+              -e 's|@ENDPOINT@|https://example.com|' -e 's|@SCHEMA@|1.1.0|' \
+              server/install.sh.in > /tmp/install.sh
+          sh -n /tmp/install.sh
+          sudo apt-get install -y --no-install-recommends shellcheck >/dev/null
+          shellcheck -s sh -S warning /tmp/install.sh
+          # And that the endpoint can still read its manifest out of it -- the
+          # two are coupled by four lines, and this is where that is checked.
+          python3 - <<'PY'
+          import json, pathlib, sys
+          sys.path[:0] = ["server", "cli"]
+          import proxy
+          print(json.loads(proxy.install_manifest(
+              pathlib.Path("/tmp/install.sh").read_bytes())))
+          PY

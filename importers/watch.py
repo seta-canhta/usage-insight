@@ -36,7 +36,7 @@ from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (os.path.join(_ROOT, "pollers"), os.path.join(_ROOT, "importers")):
+for _p in (_ROOT, os.path.join(_ROOT, "importers")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 

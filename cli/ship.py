@@ -28,7 +28,7 @@ from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_POLLERS = os.path.join(_ROOT, "pollers")
+_POLLERS = _ROOT
 if _POLLERS not in sys.path:
     sys.path.insert(0, _POLLERS)
 
@@ -289,6 +289,26 @@ def _attempt(url, body, headers, timeout, retries, post, manifest, window,
                 "{} knows this credential and refused it (HTTP 403){}. The "
                 "address has been removed from the server whitelist rather "
                 "than mistyped".format(url, " -- " + detail if detail else ""))
+        if status == 400 and "schema_version" in (detail or ""):
+            # The one 400 that is not about this machine. A client upgraded
+            # ahead of the server emits a version the server has never been
+            # taught, and the bare message reads as a corrupt bundle -- so
+            # somebody re-packs, re-ships, and gets the same 400 again.
+            #
+            # Seen for real on 2026-08-26, the day the contract went to 1.1.0:
+            # the deployed proxy still listed {"1.0.0"} and every upload from
+            # an upgraded client failed for an hour before anybody looked. The
+            # ordering rule this states is the fix: a server learns a version
+            # before a client sends it, never the other way round.
+            raise ShipError(
+                "{} does not know this bundle's schema version{}.\n"
+                "\n"
+                "Nothing here is wrong and nothing was lost -- the bundle is "
+                "still on disk and `ship` will send it once the server "
+                "accepts. This client is newer than the collection server: "
+                "whoever runs it needs to deploy a build that lists this "
+                "version in KNOWN_SCHEMAS. Send them this line.".format(
+                    url, " -- " + detail if detail else ""))
         if 400 <= status < 500:
             # The proxy read it and refused it. Retrying changes nothing, and
             # the message is the only thing that will.

@@ -72,175 +72,226 @@ class TestConsent(ClientTestCase):
             self.insight.load_config()["machine_id"], first["machine_id"])
 
 
-class TestAdoptedToken(ClientTestCase):
-    """`init --token` — a secret issued by whoever runs the server.
+class TestConsentTextDescribesReality(ClientTestCase):
+    """The consent record has to say what is actually collected.
 
-    The onboarding case: somebody is added to the whitelist before their laptop
-    has been touched, so the secret has to exist before the config file does.
+    It drifted once already: it went on naming "latency" for a fortnight after
+    the source stopped carrying it, and gained premium requests, tool outcomes
+    and gate verdicts without saying so. A consent text that describes the
+    wrong thing is not a weaker consent record, it is a false one -- so the
+    drift is held down by a test rather than by remembering.
     """
 
-    def test_the_issued_secret_is_the_one_used(self):
-        self.run_cli("init", "--yes", "--email", "ngoc@aeris.net",
-                     "--token", "issued-by-the-admin")
-        self.assertEqual(self.insight.load_config()["endpoint_token"],
-                         "issued-by-the-admin")
+    def flowed(self):
+        """The text with its display wrapping collapsed.
 
-    def test_the_printed_line_matches_the_issued_secret(self):
-        # The admin already put a fingerprint in the whitelist. If `whoami`
-        # printed a different one, the two would disagree and every upload
-        # would 401 with nothing to point at.
-        import identity
-        _, out = self.run_cli("init", "--yes", "--email", "ngoc@aeris.net",
-                              "--token", "issued-by-the-admin")
-        self.assertIn(identity.fingerprint("issued-by-the-admin"), out)
+        It is hard-wrapped for a terminal, so a phrase can straddle a newline.
+        Asserting against the wrapping would make a reflow look like a change
+        in what is collected.
+        """
+        return " ".join(self.insight.CONSENT_TEXT.lower().split())
 
-    def test_init_with_an_issued_secret_says_so(self):
-        _, out = self.run_cli("init", "--yes", "--email", "ngoc@aeris.net",
-                              "--token", "issued")
-        self.assertIn("already on the server whitelist", out)
-        self.assertNotIn("Send this line", out)
+    def test_it_names_what_the_reader_actually_emits(self):
+        text = self.flowed()
+        for phrase in ("premium requests", "token counts", "model ids",
+                       "quality gates", "commit hashes"):
+            self.assertIn(phrase, text)
 
-    def test_without_it_a_secret_is_minted_locally(self):
+    def test_it_does_not_promise_what_the_source_no_longer_carries(self):
+        # `latency_ms` is NULL except on single-model sessions, and per-call
+        # latency is gone entirely with the span source.
+        self.assertNotIn("latency", self.flowed())
+
+    def test_it_names_the_surfaces_it_cannot_see(self):
+        # Every read publishes `surfaces_not_covered`; the person agreeing to
+        # collection is the one who most needs to know the Chat panel is not in
+        # it, or absence of measurement reads to them as absence of work.
+        text = self.flowed()
+        self.assertIn("chat", text)
+        self.assertIn("inline completions", text)
+
+    def test_it_says_the_journal_is_not_altered(self):
+        # The command this replaced truncated its source on every run. Somebody
+        # agreeing to have ~/.copilot read is entitled to know it stays intact.
+        self.assertIn("never alters or deletes", self.flowed())
+
+    def test_it_is_shown_before_the_question(self):
+        _, out = self.run_cli("init", "--email", "ngoc@aeris.net", "--yes")
+        self.assertIn("This collects, from this machine", out)
+
+
+class TestSecretsAreMintedHereOnly(ClientTestCase):
+    """There used to be `init --token`, which adopted a secret issued by
+    whoever runs the server.
+
+    It existed for pre-provisioning: adding somebody to the whitelist before
+    their laptop had been touched, so the secret had to exist before the config
+    file did. It is gone, and its absence is the property under test. That path
+    put the live secret through whatever channel carried it -- Slack, usually --
+    which `cli/identity.py` names as the reason the direction was granted only
+    as an exception. Removing the exception means every secret on every machine
+    is one that has never travelled.
+    """
+
+    def test_a_secret_is_minted_locally(self):
         self.run_cli("init", "--yes", "--email", "ngoc@aeris.net")
         token = self.insight.load_config()["endpoint_token"]
         self.assertTrue(token)
-        self.assertNotEqual(token, "issued-by-the-admin")
 
-    def test_a_token_on_its_own_is_enough(self):
-        # No --email alongside it. The server resolves the fingerprint to a
-        # person itself -- that is the whole mechanism -- and `ship` has never
-        # sent an address in any header, so asking for one here would be
-        # asking twice for the same fact.
-        self.run_cli("init", "--yes", "--token", "issued-by-the-admin")
-        config = self.insight.load_config()
-        self.assertEqual(config["endpoint_token"], "issued-by-the-admin")
-        self.assertTrue(config["endpoint"])
+    def test_two_machines_do_not_share_a_secret(self):
+        self.run_cli("init", "--yes", "--email", "ngoc@aeris.net")
+        first = self.insight.load_config()["endpoint_token"]
+        self.setUp()
+        self.run_cli("init", "--yes", "--email", "ngoc@aeris.net")
+        self.assertNotEqual(self.insight.load_config()["endpoint_token"], first)
 
-    def test_whoami_works_without_a_local_address(self):
+    def test_the_whitelist_line_is_always_asked_for(self):
+        # There is no longer a case where the server already has the line, so
+        # the paragraph that used to say "you are already on the whitelist" is
+        # gone too. One direction, one message.
+        _, out = self.run_cli("init", "--yes", "--email", "ngoc@aeris.net")
+        self.assertIn("Send this line", out)
+        self.assertNotIn("already on the server whitelist", out)
+
+    def test_the_printed_line_matches_the_stored_secret(self):
         import identity
-        self.run_cli("init", "--yes", "--token", "issued-by-the-admin")
-        _, out = self.run_cli("whoami")
-        self.assertIn(identity.fingerprint("issued-by-the-admin"), out)
+        _, out = self.run_cli("init", "--yes", "--email", "ngoc@aeris.net")
+        self.assertIn(
+            identity.fingerprint(self.insight.load_config()["endpoint_token"]),
+            out)
 
-    def test_rotating_works_without_a_local_address(self):
-        self.run_cli("init", "--yes", "--token", "issued-by-the-admin")
+    def test_init_rejects_an_issued_token(self):
+        # Not silently ignored -- argparse refuses the flag, so anyone with the
+        # old command in their notes gets told rather than getting a machine
+        # whose fingerprint is on nobody's list.
+        with self.assertRaises(SystemExit):
+            self.run_cli("init", "--yes", "--email", "ngoc@aeris.net",
+                         "--token", "issued-by-the-admin")
+
+    def test_rotation_still_keeps_the_old_secret_valid(self):
+        # Rotation is unrelated to adoption and still needs the two-secret
+        # window, or a machine stops uploading the moment it rotates.
+        self.run_cli("init", "--yes", "--email", "ngoc@aeris.net")
+        first = self.insight.load_config()["endpoint_token"]
         self.run_cli("rotate-token")
         config = self.insight.load_config()
-        self.assertNotEqual(config["endpoint_token"], "issued-by-the-admin")
-        self.assertEqual(config["endpoint_token_previous"], "issued-by-the-admin")
-
-    def test_rotating_afterwards_replaces_it_with_a_local_one(self):
-        # The whole point of adopting one: it travelled over some channel to
-        # get here. Rotation is where this machine starts holding a secret
-        # nobody else has seen, and the old one stays valid meanwhile.
-        self.run_cli("init", "--yes", "--email", "ngoc@aeris.net",
-                     "--token", "issued-by-the-admin")
-        self.run_cli("rotate-token")
-        config = self.insight.load_config()
-        self.assertNotEqual(config["endpoint_token"], "issued-by-the-admin")
-        self.assertEqual(config["endpoint_token_previous"], "issued-by-the-admin")
+        self.assertNotEqual(config["endpoint_token"], first)
+        self.assertEqual(config["endpoint_token_previous"], first)
 
 
-class TestSetupAdoptsAnIssuedToken(ClientTestCase):
-    """The case this was written for: a machine that has been collecting for
-    weeks, and an address that was added to the server whitelist yesterday."""
+class TestSetup(ClientTestCase):
+    """`setup` on a machine that has been collecting for weeks.
+
+    It used to adopt a secret issued by the server admin (`--token`) and to
+    take a repeated `--repo`. Both are gone: secrets are only ever minted here,
+    and repositories are discovered from Copilot's own session journals. What
+    is left is a wizard, and these tests drive its non-interactive form.
+    """
 
     def setUp(self):
         super().setUp()
         import vscode_setup
-        # Do not touch the real editor settings from a test.
-        self.addCleanup(setattr, vscode_setup, "settings_path",
-                        vscode_setup.settings_path)
         vscode_setup.settings_path = lambda: None
+        # Point discovery away from the developer's real ~/.copilot so the
+        # result does not depend on whose laptop the suite runs on.
+        self.insight.COPILOT_ROOT = os.path.join(self.home, "no-copilot")
 
     def setup_cli(self, *extra):
         return self.run_cli("setup", "--yes", "--no-schedule", *extra)
 
-    def test_an_existing_machine_adopts_the_issued_secret(self):
-        self.init()                                  # collecting, no address yet
+    def test_it_mints_a_secret_and_asks_for_the_line(self):
+        self.init()
+        _, out = self.setup_cli("--email", "ngoc@aeris.net")
+        self.assertTrue(self.insight.load_config()["endpoint_token"])
+        self.assertIn("Send this line", out)
+
+    def test_nothing_already_collected_is_disturbed(self):
+        self.init()
         before = self.insight.load_config()
-        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        self.setup_cli("--email", "ngoc@aeris.net")
         config = self.insight.load_config()
-        self.assertEqual(config["endpoint_token"], "issued")
         self.assertEqual(config["email"], "ngoc@aeris.net")
-        # and nothing already collected is disturbed
         self.assertEqual(config["salt"], before["salt"])
         self.assertEqual(config["machine_id"], before["machine_id"])
 
-    def test_without_a_token_setup_mints_one_as_before(self):
-        self.init()
-        self.setup_cli("--email", "ngoc@aeris.net")
-        token = self.insight.load_config()["endpoint_token"]
-        self.assertTrue(token)
-        self.assertNotEqual(token, "issued")
-
-    def test_a_machine_that_was_already_uploading_keeps_working(self):
-        # Replacing the secret outright would break every upload between now
-        # and the server being told. The old one stays valid, which is exactly
-        # what `rotate-token` does.
-        self.init()
-        self.setup_cli("--email", "ngoc@aeris.net")
-        original = self.insight.load_config()["endpoint_token"]
-        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
-        config = self.insight.load_config()
-        self.assertEqual(config["endpoint_token"], "issued")
-        self.assertEqual(config["endpoint_token_previous"], original)
-
     def test_running_it_twice_does_not_shuffle_the_secrets(self):
-        # Idempotence matters here: `setup` is the command people re-run when
-        # they are not sure it worked, and a second run must not push the
-        # issued secret into `previous` and leave nothing valid.
+        # `setup` is the command people re-run when they are not sure it
+        # worked, and a second run must not push the live secret into
+        # `previous` and leave nothing valid.
         self.init()
-        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
-        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        self.setup_cli("--email", "ngoc@aeris.net")
+        first = self.insight.load_config()["endpoint_token"]
+        self.setup_cli("--email", "ngoc@aeris.net")
         config = self.insight.load_config()
-        self.assertEqual(config["endpoint_token"], "issued")
+        self.assertEqual(config["endpoint_token"], first)
         self.assertIsNone(config.get("endpoint_token_previous"))
-
-    def test_it_does_not_ask_for_a_line_the_server_already_has(self):
-        # Telling somebody to send a line that is already in place trains them
-        # to skip this paragraph -- and the thing they do have to do, rotate,
-        # is in the same paragraph.
-        self.init()
-        _, out = self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
-        self.assertIn("already on the server whitelist", out)
-        self.assertIn("rotate-token", out)
-        self.assertNotIn("Send this line", out)
 
     def test_the_paragraph_is_printed_once(self):
         # `setup` runs `init`, and both used to print it. A paragraph somebody
         # has already scrolled past is one they stop reading.
-        _, out = self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
-        self.assertEqual(out.count("already on the server whitelist"), 1)
+        _, out = self.setup_cli("--email", "ngoc@aeris.net")
+        self.assertEqual(out.count("Send this line"), 1)
 
-    def test_a_minted_secret_still_asks_for_the_line(self):
+    def test_it_refuses_an_issued_token(self):
+        self.init()
+        with self.assertRaises(SystemExit):
+            self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+
+    def test_it_refuses_a_repo_flag(self):
+        # Repositories are discovered, not declared. Someone with the old
+        # command in their notes gets told rather than getting a setup that
+        # quietly ignored half of what they typed.
+        self.init()
+        with self.assertRaises(SystemExit):
+            self.setup_cli("--email", "ngoc@aeris.net", "--repo", self.home)
+
+    def test_it_does_not_complain_about_unregistered_repositories(self):
+        # It used to end in `[ FAIL ] repos` and a non-zero exit whenever none
+        # were registered. Nothing is registered any more, so that step would
+        # fail on every single run.
+        self.init()
+        code, out = self.setup_cli("--email", "ngoc@aeris.net")
+        self.assertEqual(code, 0)
+        self.assertNotIn("No repository is registered", out)
+        self.assertNotIn("FAIL ] repos", out)
+
+    def test_it_reports_what_discovery_found(self):
         self.init()
         _, out = self.setup_cli("--email", "ngoc@aeris.net")
-        self.assertIn("Send this line", out)
-
-    def test_setup_says_when_no_repository_is_registered(self):
-        # The failure this design exists to avoid: a machine that collects
-        # nothing still uploads a well-formed bundle declaring zero events,
-        # which is indistinguishable from a genuinely quiet day. Nothing
-        # downstream can tell them apart, so it has to be said here.
-        self.init()
-        _, out = self.setup_cli("--token", "issued")
-        self.assertIn("No repository is registered", out)
-        self.assertIn("--repo", out)
-
-    def test_setup_is_quiet_about_repos_once_one_is_registered(self):
-        self.init()
-        config = self.insight.load_config()
-        config["repos"] = ["/somewhere/a-repo"]
-        self.insight.write_json(self.insight.CONFIG_PATH, config)
-        _, out = self.setup_cli("--token", "issued")
-        self.assertNotIn("No repository is registered", out)
+        self.assertIn("repos", out)
 
     def test_the_endpoint_defaults_to_the_real_one(self):
         self.init()
-        self.setup_cli("--email", "ngoc@aeris.net", "--token", "issued")
+        self.setup_cli("--email", "ngoc@aeris.net")
         self.assertEqual(self.insight.load_config()["endpoint"],
                          self.insight.SETA_ENDPOINT)
+
+    def test_it_removes_the_span_file_the_retired_exporter_wrote(self):
+        # Removing the settings without removing what they produced leaves a
+        # document of somebody's work in a directory nobody looks at. That file
+        # exists only because this tool asked for it, so this tool clears it.
+        self.init()
+        spans = os.path.join(self.home, "copilot-spans.jsonl")
+        with open(spans, "w", encoding="utf-8") as handle:
+            handle.write('{"resourceSpans": []}\n')
+        _, out = self.setup_cli("--email", "ngoc@aeris.net")
+        self.assertFalse(os.path.exists(spans))
+        self.assertIn("retired span file", out)
+
+    def test_cleanup_is_silent_when_there_is_nothing_to_clean(self):
+        self.init()
+        _, out = self.setup_cli("--email", "ngoc@aeris.net")
+        self.assertNotIn("retired span file", out)
+
+    def test_the_wizard_refuses_to_guess_without_a_terminal(self):
+        # `input()` on a closed stdin used to raise EOFError and traceback.
+        # With a wizard as the normal path -- and the installer telling people
+        # to run `setup` right after a `curl | sh` -- that is one piped command
+        # away.
+        self.init()
+        with self.assertRaises(SystemExit) as caught:
+            self.run_cli("setup", "--no-schedule")
+        self.assertIn("needs a terminal", str(caught.exception))
 
 
 class TestPackDeclaresSources(ClientTestCase):
@@ -258,9 +309,20 @@ class TestPackDeclaresSources(ClientTestCase):
 
     def test_a_fresh_machine_declares_that_it_has_nothing(self):
         self.init()
+        # Pointed away from the developer's own ~/.copilot: the whole point of
+        # this flag is that it reports the machine, so a test that reads the
+        # real one passes or fails depending on whose laptop it runs on.
+        self.insight.COPILOT_ROOT = os.path.join(self.home, "no-copilot-here")
         sources = self.manifest()["sources"]
         self.assertEqual(sources["repos"], 0)
-        self.assertFalse(sources["otel"])
+        self.assertFalse(sources["copilot"])
+
+    def test_a_machine_that_has_run_copilot_says_so(self):
+        self.init()
+        root = os.path.join(self.home, "copilot", "session-state")
+        os.makedirs(root, exist_ok=True)
+        self.insight.COPILOT_ROOT = os.path.dirname(root)
+        self.assertTrue(self.manifest()["sources"]["copilot"])
 
     def test_a_registered_repository_is_counted(self):
         self.init()
@@ -715,58 +777,466 @@ class TestPartitioning(ClientTestCase):
         self.assertEqual((written, dupes), (0, 1))
 
 
-class TestOtelCommand(ClientTestCase):
+class TestCopilotCommand(ClientTestCase):
+    """Reading Copilot's own session journals.
 
-    def spans_file(self, spans):
-        path = os.path.join(self.home, "copilot-spans.jsonl")
-        payload = {"resourceSpans": [{"scopeSpans": [{"spans": spans}]}]}
+    The journal replaced an OTel span exporter that had to be configured per
+    machine and silently collected nothing when it was not. These tests hold
+    the three properties that made the switch worth making, plus the one rule
+    the old command had that this one deliberately inverts.
+    """
+
+    def journal(self, records, session="sess-1"):
+        directory = os.path.join(self.home, "copilot", "session-state", session)
+        os.makedirs(directory, exist_ok=True)
+        path = os.path.join(directory, "events.jsonl")
         with open(path, "w", encoding="utf-8") as handle:
-            handle.write(json.dumps(payload) + "\n")
-        return path
+            for index, record in enumerate(records):
+                record.setdefault("id", "rec-{}".format(index))
+                record.setdefault("timestamp", "2026-08-20T09:00:0{}.000Z".format(index))
+                handle.write(json.dumps(record) + "\n")
+        return os.path.join(self.home, "copilot")
 
-    def a_span(self, name="chat gpt-5.3-codex", tokens=100, leak=False):
-        attrs = [
-            {"key": "gen_ai.operation.name", "value": {"stringValue": "chat"}},
-            {"key": "gen_ai.response.model", "value": {"stringValue": "gpt-5.3-codex"}},
-            {"key": "gen_ai.usage.input_tokens", "value": {"intValue": str(tokens)}},
-            {"key": "gen_ai.conversation.id", "value": {"stringValue": "conv_1"}},
-        ]
-        if leak:
-            attrs.append({"key": "gen_ai.input.messages",
-                          "value": {"stringValue": "a very secret prompt"}})
-        return {"name": name, "spanId": "s1",
-                "startTimeUnixNano": "1787000000000000000",
-                "endTimeUnixNano": "1787000001000000000",
-                "attributes": attrs}
+    def a_session(self, cwd="/home/someone/work/repo"):
+        return {"type": "session.start", "data": {
+            "sessionId": "sess-1", "selectedModel": "claude-sonnet-4.6",
+            "context": {"repository": "acme/repo", "branch": "feat/PRJ-1-thing",
+                        "gitRoot": cwd, "cwd": cwd}}}
 
-    def test_a_missing_span_file_is_reported_not_an_error(self):
+    def a_shutdown(self, tokens=100):
+        return {"type": "session.shutdown", "data": {
+            "shutdownType": "routine", "totalApiDurationMs": 4200,
+            "totalPremiumRequests": 3,
+            "modelMetrics": {"claude-sonnet-4.6": {
+                "requests": {"count": 7, "cost": 3},
+                "usage": {"inputTokens": tokens, "outputTokens": 12,
+                          "cacheReadTokens": 40, "cacheWriteTokens": 5,
+                          "reasoningTokens": 0}}}}}
+
+    def bound_rows(self):
+        return [e for e in self.insight.read_buffer()
+                if e["event_type"] == "run.bound"]
+
+    def test_a_moved_tree_is_bound_by_its_commit_range(self):
+        # The bridge CONTRACT.md §2.4 names, finally carrying evidence. The
+        # session recorded these SHAs itself, so the link is `explicit`.
         self.init()
-        code, output = self.run_cli("otel", "--source",
-                                    os.path.join(self.home, "nope.jsonl"))
+        start = self.a_session()
+        start["data"]["context"]["baseCommit"] = "a" * 40
+        start["data"]["context"]["headCommit"] = "b" * 40
+        start["data"]["context"]["repositoryHost"] = "github.com"
+        root = self.journal([start, self.a_shutdown()])
+        self.run_cli("copilot", "--root", root)
+        rows = self.bound_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["attributes"]["base_commit_sha"], "a" * 40)
+        self.assertEqual(rows[0]["attributes"]["head_commit_sha"], "b" * 40)
+        self.assertEqual(rows[0]["attributes"]["repository_host"], "github.com")
+        self.assertEqual(rows[0]["link"], {"method": "explicit", "confidence": 1.0})
+
+    def test_a_session_that_committed_nothing_binds_nothing(self):
+        # base == head is a session that read and did not write. An empty
+        # range would have to be special-cased downstream into this same
+        # answer, so it is not emitted.
+        self.init()
+        start = self.a_session()
+        start["data"]["context"]["baseCommit"] = "a" * 40
+        start["data"]["context"]["headCommit"] = "a" * 40
+        root = self.journal([start, self.a_shutdown()])
+        self.run_cli("copilot", "--root", root)
+        self.assertEqual(self.bound_rows(), [])
+
+    def test_a_branch_switch_does_not_merge_two_ranges_into_one(self):
+        # Measured on real journals: a session starts on `main` and resumes on
+        # a feature branch. First-base-to-last-head across that spans two
+        # unrelated lines of work and would charge this session for every
+        # commit in the gap. One range per branch instead.
+        self.init()
+        start = self.a_session()
+        start["data"]["context"]["branch"] = "main"
+        start["data"]["context"]["baseCommit"] = "1" * 40
+        start["data"]["context"]["headCommit"] = "2" * 40
+        resume = {"type": "session.resume", "data": {
+            "sessionId": "sess-1",
+            "context": {"repository": "acme/repo", "branch": "feat/thing",
+                        "gitRoot": "/home/someone/work/repo",
+                        "baseCommit": "3" * 40, "headCommit": "4" * 40}}}
+        root = self.journal([start, resume, self.a_shutdown()])
+        self.run_cli("copilot", "--root", root)
+        ranges = {r["context"]["branch_name"]:
+                  (r["attributes"]["base_commit_sha"],
+                   r["attributes"]["head_commit_sha"])
+                  for r in self.bound_rows()}
+        self.assertEqual(ranges, {"main": ("1" * 40, "2" * 40),
+                                  "feat/thing": ("3" * 40, "4" * 40)})
+
+    def test_the_bound_row_publishes_no_jira_key_it_cannot_evidence(self):
+        # `a_session` uses branch `feat/PRJ-1-thing`, so a key IS derivable
+        # from the name -- and this row still reports NULL. Measured
+        # 2026-08-26, 0 of 37 real branches carried one; a key that is right
+        # by luck on a test fixture is not evidence (AR-1).
+        self.init()
+        start = self.a_session()
+        start["data"]["context"]["baseCommit"] = "a" * 40
+        start["data"]["context"]["headCommit"] = "b" * 40
+        root = self.journal([start, self.a_shutdown()])
+        self.run_cli("copilot", "--root", root)
+        self.assertIsNone(self.bound_rows()[0]["attributes"]["jira_issue_key"])
+
+    def test_a_missing_copilot_home_is_reported_not_an_error(self):
+        # Copilot CLI may not be installed. That is a fact about the machine,
+        # not a failure of this one.
+        self.init()
+        code, output = self.run_cli("copilot", "--root",
+                                    os.path.join(self.home, "nope"))
         self.assertEqual(code, 0)
         self.assertIn('"present": false', output)
 
-    def test_spans_become_events_and_the_source_is_truncated(self):
-        # The raw file can hold prompts; keeping copies multiplies that
-        # exposure for no gain once the events exist.
+    def test_usage_becomes_a_model_call_carrying_the_billing_unit(self):
         self.init()
-        path = self.spans_file([self.a_span()])
-        self.run_cli("otel", "--source", path)
-        self.assertEqual(os.path.getsize(path), 0)
-        self.assertEqual(len(self.insight.read_buffer()), 1)
+        root = self.journal([self.a_session(), self.a_shutdown()])
+        self.run_cli("copilot", "--root", root)
+        events = [e for e in self.insight.read_buffer()
+                  if e["event_type"] == "model.call"]
+        self.assertEqual(len(events), 1)
+        attributes = events[0]["attributes"]
+        self.assertEqual(attributes["input_tokens"], 100)
+        self.assertEqual(attributes["cache_write_tokens"], 5)
+        self.assertEqual(attributes["request_count"], 7)
+        # The reason the whole source changed: Copilot bills per premium
+        # request, and the span stream never carried the number.
+        self.assertEqual(attributes["premium_requests"], 3)
 
-    def test_keep_raw_leaves_the_file_alone(self):
+    def test_the_journal_is_never_deleted(self):
+        # The command this replaced truncated its source every run, correctly:
+        # that file existed only because we asked for it. A session journal is
+        # Copilot's own history of somebody's work and is not ours to clear.
         self.init()
-        path = self.spans_file([self.a_span()])
-        self.run_cli("otel", "--source", path, "--keep-raw")
-        self.assertGreater(os.path.getsize(path), 0)
+        root = self.journal([self.a_session(), self.a_shutdown()])
+        path = os.path.join(root, "session-state", "sess-1", "events.jsonl")
+        before = os.path.getsize(path)
+        self.run_cli("copilot", "--root", root)
+        self.assertEqual(os.path.getsize(path), before)
+
+    def test_reading_twice_buffers_once(self):
+        # Which is what makes not deleting it affordable. A session stays open
+        # for days and the scheduler reads it hourly.
+        self.init()
+        root = self.journal([self.a_session(), self.a_shutdown()])
+        self.run_cli("copilot", "--root", root)
+        first = len(self.insight.read_buffer())
+        _, output = self.run_cli("copilot", "--root", root)
+        self.assertEqual(len(self.insight.read_buffer()), first)
+        self.assertIn('"written": 0', output)
 
     def test_content_never_reaches_the_buffer(self):
         self.init()
-        path = self.spans_file([self.a_span(leak=True)])
-        self.run_cli("otel", "--source", path)
-        self.assertNotIn("a very secret prompt",
-                         json.dumps(self.insight.read_buffer()))
+        root = self.journal([
+            self.a_session(),
+            {"type": "user.message", "data": {"content": "a very secret prompt"}},
+            {"type": "assistant.message", "data": {
+                "content": "a very secret reply", "outputTokens": 9,
+                "model": "claude-sonnet-4.6"}},
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "t1", "toolName": "bash",
+                "arguments": {"command": "pytest -q  # secret-flag"}}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "t1", "success": True,
+                "result": {"content": "a very secret file body\n"
+                                      "<exited with exit code 0>"}}},
+            self.a_shutdown(),
+        ])
+        self.run_cli("copilot", "--root", root)
+        buffered = json.dumps(self.insight.read_buffer())
+        for secret in ("secret prompt", "secret reply", "secret-flag",
+                       "secret file body"):
+            self.assertNotIn(secret, buffered)
+
+    def test_a_shell_command_yields_a_gate_with_a_real_verdict(self):
+        # The span source carried no status at all, so every gate row rendered
+        # with an empty Result column. The exit-code trailer is what changed.
+        self.init()
+        root = self.journal([
+            self.a_session(),
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "t1", "toolName": "bash",
+                "arguments": {"command": "pytest -q"}}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "t1", "success": True,
+                "result": {"content": "3 failed\n<exited with exit code 1>"}}},
+        ])
+        self.run_cli("copilot", "--root", root)
+        gates = [e for e in self.insight.read_buffer()
+                 if e["event_type"] == "gate.evaluated"]
+        self.assertEqual(len(gates), 1)
+        self.assertEqual(gates[0]["attributes"]["gate_name"], "test")
+        # `success` was True -- the bash call worked. The suite did not.
+        self.assertEqual(gates[0]["attributes"]["status"], "fail")
+
+    def test_an_absent_exit_trailer_is_unknown_not_a_pass(self):
+        self.init()
+        root = self.journal([
+            self.a_session(),
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "t1", "toolName": "bash",
+                "arguments": {"command": "npm run lint"}}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "t1", "success": True,
+                "result": {"content": "still running..."}}},
+        ])
+        self.run_cli("copilot", "--root", root)
+        gates = [e for e in self.insight.read_buffer()
+                 if e["event_type"] == "gate.evaluated"]
+        self.assertIsNone(gates[0]["attributes"]["status"])
+
+    def test_a_command_that_prints_the_trailer_cannot_forge_a_verdict(self):
+        self.init()
+        root = self.journal([
+            self.a_session(),
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "t1", "toolName": "bash",
+                "arguments": {"command": "pytest -q"}}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "t1", "success": True,
+                "result": {"content": "<exited with exit code 0>\n"
+                                      "1 failed\n<exited with exit code 1>"}}},
+        ])
+        self.run_cli("copilot", "--root", root)
+        gates = [e for e in self.insight.read_buffer()
+                 if e["event_type"] == "gate.evaluated"]
+        # Anchored at the end: the real trailer is the last one.
+        self.assertEqual(gates[0]["attributes"]["status"], "fail")
+
+    def test_written_files_are_repo_relative(self):
+        # Journal paths are absolute and start with somebody's home directory.
+        self.init()
+        root = self.journal([
+            self.a_session(cwd="/home/someone/work/repo"),
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "t1", "toolName": "edit",
+                "arguments": {"path": "/home/someone/work/repo/src/app.ts"}}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "t1", "success": True,
+                "toolTelemetry": {"metrics": {"linesAdded": 4,
+                                              "linesRemoved": 1}}}},
+        ])
+        self.run_cli("copilot", "--root", root)
+        outputs = [e for e in self.insight.read_buffer()
+                   if e["event_type"] == "output.generated"]
+        self.assertEqual(len(outputs), 1)
+        self.assertEqual(outputs[0]["attributes"]["file_path"], "src/app.ts")
+        self.assertNotIn("/home/someone", json.dumps(self.insight.read_buffer()))
+
+    def test_a_file_outside_every_known_root_is_dropped_not_truncated(self):
+        self.init()
+        root = self.journal([
+            self.a_session(cwd="/home/someone/work/repo"),
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "t1", "toolName": "edit",
+                "arguments": {"path": "/home/someone/.ssh/config"}}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "t1", "success": True,
+                "toolTelemetry": {"metrics": {"linesAdded": 1,
+                                              "linesRemoved": 0}}}},
+        ])
+        self.run_cli("copilot", "--root", root)
+        outputs = [e for e in self.insight.read_buffer()
+                   if e["event_type"] == "output.generated"]
+        self.assertEqual(outputs, [])
+
+    def test_a_session_with_no_shutdown_is_named_not_counted_as_zero(self):
+        self.init()
+        root = self.journal([self.a_session()])   # no shutdown: still running
+        _, output = self.run_cli("copilot", "--root", root)
+        coverage = json.loads(output)["coverage"]
+        self.assertEqual(coverage["sessions"], 1)
+        self.assertEqual(coverage["sessions_without_usage"], 1)
+        self.assertEqual(coverage["usage_coverage"], 0.0)
+        # The surface this source cannot see is stated on every read, so that a
+        # surface nobody measured never reads as a surface nobody used.
+        self.assertIn("vscode-copilot-chat", coverage["surfaces_not_covered"])
+
+    def test_a_session_activation_is_a_run(self):
+        # Without this the report's adoption, speed, reliability and human
+        # sections are all structurally empty -- they key off run.* events, and
+        # the journal was producing none.
+        self.init()
+        root = self.journal([self.a_session(), self.a_shutdown()])
+        self.run_cli("copilot", "--root", root)
+        started = [e for e in self.insight.read_buffer()
+                   if e["event_type"] == "run.started"]
+        completed = [e for e in self.insight.read_buffer()
+                     if e["event_type"] == "run.completed"]
+        self.assertEqual(len(started), 1)
+        self.assertEqual(len(completed), 1)
+        self.assertEqual(started[0]["run_id"], completed[0]["run_id"])
+        self.assertEqual(started[0]["trace_id"], "sess-1")
+
+    def test_a_resume_is_a_second_run_not_a_continuation(self):
+        # Measured 2026-08-26: 38 resumes against 22 starts. Treating a resume
+        # as a continuation would hide most of the activity on this surface.
+        self.init()
+        root = self.journal([
+            self.a_session(), self.a_shutdown(),
+            {"type": "session.resume", "data": {
+                "sessionId": "sess-1",
+                "context": {"repository": "acme/repo", "branch": "main",
+                            "gitRoot": "/home/someone/work/repo"}}},
+            self.a_shutdown(),
+        ])
+        self.run_cli("copilot", "--root", root)
+        started = [e for e in self.insight.read_buffer()
+                   if e["event_type"] == "run.started"]
+        self.assertEqual(len(started), 2)
+        self.assertEqual(len({e["run_id"] for e in started}), 2)
+        self.assertEqual(sorted(e["attributes"]["input_source"] for e in started),
+                         ["resume", "start"])
+
+    def test_a_subagent_is_a_child_run_and_owns_its_tool_calls(self):
+        self.init()
+        root = self.journal([
+            self.a_session(),
+            {"type": "subagent.started", "data": {
+                "toolCallId": "task1", "agentName": "reviewer",
+                "agentDisplayName": "Reviewer Agent"}},
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "t1", "parentToolCallId": "task1",
+                "toolName": "view"}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "t1", "parentToolCallId": "task1",
+                "success": True}},
+            {"type": "subagent.completed", "data": {"toolCallId": "task1"}},
+        ])
+        self.run_cli("copilot", "--root", root)
+        events = self.insight.read_buffer()
+        session_run = [e for e in events if e["event_type"] == "run.started"
+                       and e["attributes"]["input_source"] == "start"][0]
+        child = [e for e in events if e["event_type"] == "run.started"
+                 and e["attributes"]["input_source"] == "subagent"][0]
+        self.assertEqual(child["parent_run_id"], session_run["run_id"])
+        self.assertEqual(child["agent"]["agent_name"], "reviewer")
+        # AR-4 rolls a supervisor up by trace_id, so both must share one.
+        self.assertEqual(child["trace_id"], session_run["trace_id"])
+        tool = [e for e in events if e["event_type"] == "tool.call"][0]
+        self.assertEqual(tool["run_id"], child["run_id"])
+        self.assertEqual(tool["agent"]["agent_name"], "reviewer")
+
+    def test_usage_is_never_attributed_to_a_run(self):
+        # CONTRACT §3: the journal totals usage per session, and a session
+        # hosts several runs. Stamping the open run would charge one agent for
+        # what the others spent.
+        self.init()
+        root = self.journal([self.a_session(), self.a_shutdown()])
+        self.run_cli("copilot", "--root", root)
+        usage = [e for e in self.insight.read_buffer()
+                 if e["event_type"] == "model.call"]
+        self.assertIsNone(usage[0]["run_id"])
+
+    def test_a_write_with_no_line_metrics_is_still_an_output(self):
+        # It used to be dropped, taking the acceptance denominator with it.
+        # An absent count is NULL; a counted zero is 0.
+        self.init()
+        root = self.journal([
+            self.a_session(),
+            {"type": "tool.execution_start", "data": {
+                "toolCallId": "t1", "toolName": "create",
+                "arguments": {"path": "/home/someone/work/repo/new.py"}}},
+            {"type": "tool.execution_complete", "data": {
+                "toolCallId": "t1", "success": True}},
+        ])
+        self.run_cli("copilot", "--root", root)
+        outputs = [e for e in self.insight.read_buffer()
+                   if e["event_type"] == "output.generated"]
+        self.assertEqual(len(outputs), 1)
+        self.assertIsNone(outputs[0]["attributes"]["lines_added"])
+
+    def test_one_skill_is_attributed_and_two_are_not(self):
+        # Two skills cannot both be credited with the outcome, and picking the
+        # most recent would make the attribution depend on ordering.
+        self.init()
+        root = self.journal([
+            self.a_session(),
+            {"type": "skill.invoked", "data": {"name": "brainstorming"}},
+            self.a_shutdown(),
+        ])
+        self.run_cli("copilot", "--root", root)
+        usage = [e for e in self.insight.read_buffer()
+                 if e["event_type"] == "model.call"][0]
+        self.assertEqual(usage["agent"]["skill_name"], "brainstorming")
+        # And the agent version is unknown, not the poller's own.
+        self.assertIsNone(usage["agent"]["agent_version"])
+
+        self.setUp()
+        self.init()
+        root = self.journal([
+            self.a_session(),
+            {"type": "skill.invoked", "data": {"name": "brainstorming"}},
+            {"type": "skill.invoked", "data": {"name": "executing-plans"}},
+            self.a_shutdown(),
+        ])
+        self.run_cli("copilot", "--root", root)
+        usage = [e for e in self.insight.read_buffer()
+                 if e["event_type"] == "model.call"][0]
+        self.assertIsNone(usage["agent"]["skill_name"])
+
+    def test_an_injected_message_is_not_a_human_turn(self):
+        # A `source` means a skill or hook wrote it. Counting those would
+        # inflate the manual-intervention rate with the agent talking to itself.
+        self.init()
+        root = self.journal([
+            self.a_session(),
+            {"type": "user.message", "data": {"content": "hello", "source": None}},
+            {"type": "user.message", "data": {
+                "content": "injected", "source": "skill-brainstorming"}},
+        ])
+        self.run_cli("copilot", "--root", root)
+        turns = [e for e in self.insight.read_buffer()
+                 if e["event_type"] == "human.turn"]
+        self.assertEqual(len(turns), 1)
+        self.assertEqual(turns[0]["attributes"]["chars"], 5)
+
+    def test_repositories_are_discovered_from_the_journal(self):
+        # This is what replaced `setup --repo <path>`, repeated once per
+        # repository. The one somebody forgot to name was the one that
+        # silently reported nothing; `session.start` has been recording
+        # `context.gitRoot` all along.
+        import copilot_read
+        repo = tempfile.mkdtemp(prefix="insight-discovered-")
+        self.addCleanup(shutil.rmtree, repo, True)
+        os.makedirs(os.path.join(repo, ".git"))
+        root = self.journal([self.a_session(cwd=repo)])
+        self.assertEqual(copilot_read.discover_repos(root), [repo])
+
+    def test_a_worktree_is_discovered_too(self):
+        # In a linked worktree `.git` is a *file* holding a gitdir pointer,
+        # not a directory, and worktrees are where a good deal of agent work
+        # happens.
+        import copilot_read
+        tree = tempfile.mkdtemp(prefix="insight-worktree-")
+        self.addCleanup(shutil.rmtree, tree, True)
+        with open(os.path.join(tree, ".git"), "w", encoding="utf-8") as handle:
+            handle.write("gitdir: /somewhere/.git/worktrees/x\n")
+        root = self.journal([self.a_session(cwd=tree)])
+        self.assertEqual(copilot_read.discover_repos(root), [tree])
+
+    def test_a_deleted_clone_is_not_discovered(self):
+        # A repository removed last month should not become an error every
+        # hour for the rest of the year.
+        import copilot_read
+        root = self.journal([self.a_session(cwd="/gone/for/good")])
+        self.assertEqual(copilot_read.discover_repos(root), [])
+
+    def test_a_torn_last_line_does_not_lose_the_session(self):
+        # The journal is appended to live; a read can catch a partial write.
+        self.init()
+        root = self.journal([self.a_session(), self.a_shutdown()])
+        path = os.path.join(root, "session-state", "sess-1", "events.jsonl")
+        with open(path, "a", encoding="utf-8") as handle:
+            handle.write('{"type": "tool.execution_st')
+        code, _ = self.run_cli("copilot", "--root", root)
+        self.assertEqual(code, 0)
+        self.assertTrue([e for e in self.insight.read_buffer()
+                         if e["event_type"] == "model.call"])
 
 
 class TestPackWindow(ClientTestCase):
@@ -821,7 +1291,17 @@ class TestPackWindow(ClientTestCase):
 
 class TestMultipleRepos(TestScan):
     """An engineer with four repositories should not have to remember four
-    commands — the one they forget is the one that silently reports nothing."""
+    commands — the one they forget is the one that silently reports nothing.
+
+    Registration is now a fallback rather than the mechanism: `scan` reads the
+    registered list *and* every git tree Copilot's journals name. These tests
+    cover the registered half, so they point discovery at an empty directory —
+    otherwise the result depends on what is in the developer's own ~/.copilot.
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.insight.COPILOT_ROOT = os.path.join(self.home, "no-copilot")
 
     def second_repo(self):
         other = tempfile.mkdtemp(prefix="insight-repo2-")
@@ -886,11 +1366,18 @@ class TestMultipleRepos(TestScan):
         self.assertTrue(any("error" in l for l in lines))
         self.assertTrue(any("commits" in l for l in lines))
 
-    def test_scan_with_nothing_registered_explains_itself(self):
+    def test_scan_with_nothing_to_walk_says_so_rather_than_failing(self):
+        # It used to raise. That was right when repositories were registered by
+        # hand -- an empty list meant somebody had not finished setting up. Now
+        # they are discovered from Copilot's journals, so an empty list means
+        # Copilot has not been run in a git tree yet, which is a fact about the
+        # machine and not a fault. Raising would put a failure in `auto.log`
+        # every hour, and an hourly failure is one nobody reads.
         self.init()
-        with self.assertRaises(SystemExit) as ctx:
-            self.run_cli("scan", "--since-days", "3650")
-        self.assertIn("no repositories registered", str(ctx.exception))
+        self.insight.COPILOT_ROOT = os.path.join(self.home, "no-copilot")
+        code, output = self.run_cli("scan", "--since-days", "3650")
+        self.assertEqual(code, 0)
+        self.assertEqual(json.loads(output)["repos"], 0)
 
     def test_init_keeps_the_repo_list(self):
         self.init()

@@ -4,7 +4,7 @@
     python3 importers/pull.py --week 2026-W34 --inbox inbox/ --roster roster.txt
     python3 importers/bundle.py --inbox inbox/ --out events.ndjson
 
-The download half of ``docs/TRANSPORT.md``. It stops at ``inbox/`` on purpose --
+The download half of ``server/README.md``. It stops at ``inbox/`` on purpose --
 ``bundle.py`` already parses, checksums, re-checks the allow-list and dedupes,
 and a bundle that arrived over HTTP has earned none of those exemptions. This
 just replaces the person who used to save attachments into a folder.
@@ -42,7 +42,7 @@ import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
 
 _ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-for _p in (os.path.join(_ROOT, "pollers"), os.path.join(_ROOT, "importers")):
+for _p in (_ROOT, os.path.join(_ROOT, "importers")):
     if _p not in sys.path:
         sys.path.insert(0, _p)
 
@@ -81,7 +81,7 @@ def _check(status: int, body: bytes, url: str) -> bytes:
         raise PullError(
             "{} rejected the admin token. Reading exposes every machine at "
             "once, so this route is authenticated even though uploading is "
-            "not -- see docs/TRANSPORT.md".format(url))
+            "not -- see server/README.md".format(url))
     if status != 200:
         detail = body.decode("utf-8", "replace")[:200]
         raise PullError("{} returned HTTP {}{}".format(

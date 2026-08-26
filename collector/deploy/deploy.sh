@@ -21,7 +21,6 @@
 # Optional (defaults shown):
 #   COLLECTOR_SA=aiep-collector
 #   PUBSUB_TOPIC=ai-run-events
-#   OTEL_TOPIC=ai-otel-spans
 #   BQ_DATASET_RAW=raw
 #   AR_REPO=aiep
 #   IMAGE_TAG=$(git rev-parse --short HEAD)
@@ -44,7 +43,6 @@ COLLECTOR_DIR="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
 
 COLLECTOR_SA="${COLLECTOR_SA:-aiep-collector}"
 PUBSUB_TOPIC="${PUBSUB_TOPIC:-ai-run-events}"
-OTEL_TOPIC="${OTEL_TOPIC:-ai-otel-spans}"
 BQ_DATASET_RAW="${BQ_DATASET_RAW:-raw}"
 AR_REPO="${AR_REPO:-aiep}"
 IMAGE_TAG="${IMAGE_TAG:-$(git -C "${COLLECTOR_DIR}" rev-parse --short HEAD 2>/dev/null || echo dev)}"
@@ -115,9 +113,11 @@ fi
 #      roles/iam.serviceAccountTokenCreator (no identity impersonation)
 #      any role on dim_person or any identity dataset
 #
-# B. OTEL COLLECTOR SERVICE ACCOUNT (if otel_config.yaml is deployed separately)
-#      roles/pubsub.publisher  on projects/${PROJECT_ID}/topics/${OTEL_TOPIC}
-#    ...and nothing else. Same reasoning.
+# B. (retired 2026-08-26) There was a second service account here, for the OTel
+#    collector that redacted Copilot's span stream on its way to Pub/Sub. That
+#    whole path is gone -- usage is read from Copilot's own session journal on
+#    the machine, by allow-list, and nothing is exported to redact. One fewer
+#    service account, one fewer topic, and one fewer place a prompt could land.
 #
 # C. PUB/SUB SERVICE AGENT  (service-<PROJECT_NUMBER>@gcp-sa-pubsub.iam...)
 #    Google-managed; needed for the BigQuery subscriptions that land the rows.
@@ -157,7 +157,6 @@ run gcloud iam service-accounts create "${COLLECTOR_SA}" \
 
 log "Creating Pub/Sub topics (idempotent)"
 run gcloud pubsub topics create "${PUBSUB_TOPIC}" --project "${PROJECT_ID}" || true
-run gcloud pubsub topics create "${OTEL_TOPIC}"   --project "${PROJECT_ID}" || true
 
 log "Binding IAM — topic-scoped publisher only"
 run gcloud pubsub topics add-iam-policy-binding "${PUBSUB_TOPIC}" \
@@ -225,7 +224,9 @@ NEXT STEPS — deliberately manual
        --bigquery-table "${PROJECT_ID}:${BQ_DATASET_RAW}.ai_run_event" \\
        --use-table-schema
 
-   ...and the equivalent for ${OTEL_TOPIC} -> ${BQ_DATASET_RAW}.otel_span.
+   `${BQ_DATASET_RAW}.otel_span` needs no subscription: it is frozen, not
+   written (see sql/01_raw.sql). It is kept only so pre-cutover weeks can still
+   be reprocessed, and it will stop being read once they age out.
    Grant the Pub/Sub service agent bigquery.dataEditor + bigquery.metadataViewer
    on the ${BQ_DATASET_RAW} dataset first (IAM note C above).
 

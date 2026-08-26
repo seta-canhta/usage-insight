@@ -1,43 +1,60 @@
 #!/usr/bin/env python3
-"""Join OTel conversations to emitter runs, with the evidence written down.
+"""Join Copilot sessions to emitter runs, with the evidence written down.
 
     python3 cli/link_runs.py
 
 Two streams describe the same work and neither can answer alone. The emitter
-knows *what* -- which agent, which ticket, which phases. OTel knows *what it
-cost* -- tokens, model, latency. `CONTRACT.md` §2.4 names the bridge
-(`run.bound` carrying `otel_conversation_id`) and then warns that it "is NOT a
-join key on its own".
+knows *what* -- which agent, which ticket, which phases. Copilot's session
+journal knows *what it cost* -- tokens, premium requests, model. `CONTRACT.md`
+§2.4 names the bridge (`run.bound` carrying `copilot_session_id`) and then warns
+that it "is NOT a join key on its own".
 
-**This produces a link table, not a `run_id` on an OTel event.** §2.4 is
+**This produces a link table, not a `run_id` on a usage event.** §2.4 is
 explicit: *"Never synthesise a `run_id` to force a join -- that manufactures a
-join key and breaches AR-1."* Writing the id onto the span would bury a guess
-inside a field that everything downstream reads as fact. A separate table with
-a method and a confidence keeps the guess visible and refusable.
+join key and breaches AR-1."* Writing the id onto the usage row would bury a
+guess inside a field that everything downstream reads as fact. A separate table
+with a method and a confidence keeps the guess visible and refusable.
+
+**Usage is session grain now, and every row says so.** The span source emitted
+one `model.call` per API call, each individually timestamped, so a time window
+placed tokens on the right run. The journal totals usage per *session* and
+stamps it at shutdown, so one `model.call` covers every run the session hosted
+-- measured 2026-08-26: 38 resumes against 22 starts, so multi-run sessions are
+the norm rather than the exception.
+
+The tokens are still reported, because a table that dropped them would report
+zero and zero is a claim. What travels with them is `usage_grain`: a link whose
+session held one run can carry its usage to that run, and one whose session
+held several cannot. Dividing a session total by time or by call count is,
+in CONTRACT.md §3's phrase, "the same offence wearing arithmetic" -- so the
+row says `per_session`, and CONTRACT.md §3 requires those runs to report
+`cost_usd = NULL` rather than a share.
 
 ## The tiers, strongest first
 
 | Method | Confidence | Evidence |
 |---|---|---|
-| `explicit` | 1.0 | `run.bound` names the conversation id |
+| `explicit` | 1.0 | `run.bound` names the session id |
 | `heuristic` | 0.8 | time containment **and** the agent name agrees |
 | `heuristic` | 0.5 | time containment alone, exactly one candidate |
 | none | — | more than one run overlaps, or none does |
 
 Tier 2 is worth more than time alone because the two signals are independent:
-`copilot_chat.mode_name` comes from Copilot, `--agent` from the agent's own
-instructions. Both saying "Platform Developer 2.0" is corroboration, not one fact
-counted twice.
+the agent name comes from Copilot's own `subagent.started` record, `--agent`
+from the agent's instructions. Both saying "Platform Developer 2.0" is
+corroboration, not one fact counted twice.
 
 Ambiguity is reported, never resolved by picking the nearest. Two runs
-overlapping one conversation is a real state -- someone ran two agents at once
--- and the honest output is "cannot attribute", because the alternative is
-charging one agent for another's tokens.
+overlapping one session is a real state -- someone ran two agents at once --
+and the honest output is "cannot attribute", because the alternative is
+charging one agent for another's work.
 
 **§2.4 also settles what this can be used for:** only `explicit` rows may feed
 cost-per-output. Until an agent emits `run.bound`, the joins here are good
-enough to report tokens by agent and not good enough to price an output. That
-limit is a property of the evidence, not a gap in the code.
+enough to report activity by agent and not good enough to price an output. That
+limit is a property of the evidence, not a gap in the code -- and since the
+journal reader emits everything at `heuristic`, `run.bound` from the emitter is
+now the *only* thing that can turn the cost-per-output metric on.
 """
 
 from __future__ import annotations
@@ -62,15 +79,24 @@ import insight  # noqa: E402
 SLACK = timedelta(seconds=90)
 
 #: How long an unfinished run is allowed to claim. A run with no completion
-#: event is open-ended, and open-ended means it would match every conversation
-#: for the rest of the day -- billing an agent that crashed at 10am for the
-#: chat somebody had at 4pm. Bounded instead: past this, the run is treated as
-#: abandoned and the conversation goes unlinked, which is the truthful answer.
+#: event is open-ended, and open-ended means it would match every session for
+#: the rest of the day -- billing an agent that crashed at 10am for the work
+#: somebody did at 4pm. Bounded instead: past this, the run is treated as
+#: abandoned and the session goes unlinked, which is the truthful answer.
 OPEN_RUN_MAX = timedelta(hours=1)
 
 RUN_START = "run.started"
 RUN_END = ("run.completed", "run.failed", "run.timeout")
-OTEL_TYPES = ("model.call", "tool.call", "gate.evaluated")
+#: What a session contributes to the link table.
+#:
+#: `model.call` is included because the table has to report what a session
+#: spent -- dropping it would leave the token columns permanently zero, which
+#: is worse than reporting them with their grain attached. But it is *session*
+#: grain: one event covers every run the session hosted. So a link row carries
+#: `usage_grain`, and a caller that divides a session total across runs is
+#: doing something this table has told it not to.
+SESSION_TYPES = ("model.call", "tool.call", "gate.evaluated",
+                 "output.generated")
 
 
 def parse(value: Optional[str]) -> Optional[datetime]:
@@ -102,15 +128,16 @@ def runs_from(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
             runs[run_id]["ended_at"] = event.get("event_time")
         elif event["event_type"] == "run.bound":
             runs.setdefault(run_id, {"run_id": run_id})
-            runs[run_id]["otel_conversation_id"] = (
-                event.get("attributes") or {}).get("otel_conversation_id")
+            attributes = event.get("attributes") or {}
+            runs[run_id]["copilot_session_id"] = attributes.get(
+                "copilot_session_id")
     return runs
 
 
 def conversations_from(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     found: Dict[str, Dict[str, Any]] = {}
     for event in events:
-        if event["event_type"] not in OTEL_TYPES:
+        if event["event_type"] not in SESSION_TYPES:
             continue
         conversation = event.get("trace_id")
         if not conversation:
@@ -139,13 +166,42 @@ def conversations_from(events: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]
     return found
 
 
+#: The grain vocabulary, shared with the warehouse on purpose.
+#:
+#: ``sql/03_core_fct.sql`` carries a ``usage_grain`` column over the same axis,
+#: with the values ``per_call`` (the retired span source, one row per API call),
+#: ``per_session_model`` (one ``model.call`` per session *and model*, which is
+#: what the reader emits) and ``none``. This table sits one step further out
+#: and sums a session's ``model.call`` events across every model in it, so its
+#: usage is ``per_session`` -- coarser again than the warehouse's coarsest.
+#:
+#: The words are shared rather than invented so the two can be read together.
+#: The distinction that matters is the same at both layers and is the only one
+#: a consumer needs: anything other than ``per_call`` cannot be attributed to a
+#: single run, and ``none`` is not zero.
+GRAIN_PER_SESSION = "per_session"
+GRAIN_NONE = "none"
+
+
+def grain_of(conversation: Dict[str, Any]) -> str:
+    """What the token columns on a link row actually describe.
+
+    ``per_session`` whenever usage is present: the journal totals at session
+    grain and this sums across models on top of that. ``none`` when the session
+    carried no ``model.call`` at all -- a real state, since a session that
+    crashed before shutdown records none, and its tokens are then unknowable
+    rather than zero.
+    """
+    return GRAIN_PER_SESSION if conversation.get("model_calls") else GRAIN_NONE
+
+
 def link(runs: Dict[str, Dict[str, Any]],
          conversations: Dict[str, Dict[str, Any]]) -> Dict[str, Any]:
     links: List[Dict[str, Any]] = []
     unlinked: List[Dict[str, Any]] = []
 
-    bound = {r.get("otel_conversation_id"): r for r in runs.values()
-             if r.get("otel_conversation_id")}
+    bound = {r.get("copilot_session_id"): r for r in runs.values()
+             if r.get("copilot_session_id")}
 
     for conversation_id, conversation in sorted(conversations.items()):
         run = bound.get(conversation_id)
@@ -154,7 +210,12 @@ def link(runs: Dict[str, Dict[str, Any]],
                 "conversation_id": conversation_id, "run_id": run["run_id"],
                 "agent": run.get("agent"), "jira_issue_key": run.get("jira_issue_key"),
                 "method": "explicit", "confidence": 1.0,
-                "evidence": ["run.bound names this conversation"],
+                "evidence": ["run.bound names this session"],
+                # Even an explicit link cannot make session-grain usage into
+                # run-grain usage. `explicit` says *which* run the session
+                # belongs to; `usage_grain` says what the tokens beside it
+                # describe, which is the whole session.
+                "usage_grain": grain_of(conversation),
                 **{k: conversation[k] for k in
                    ("model_calls", "input_tokens", "output_tokens", "cached_tokens")},
             })
@@ -180,14 +241,14 @@ def link(runs: Dict[str, Dict[str, Any]],
                 # from a count that says only "some".
                 "reason": ("no run covers this window" if not candidates
                            else "{} runs overlap; attributing to one would charge "
-                                "an agent for another's tokens".format(len(candidates))),
+                                "an agent for another's work".format(len(candidates))),
                 "candidate_run_ids": [c["run_id"] for c in candidates],
             })
             continue
 
         run = candidates[0]
         agrees = run.get("agent") and run["agent"] in conversation["agents"]
-        evidence = ["the run's window contains every span in this conversation"]
+        evidence = ["the run's window contains every event in this session"]
         if agrees:
             evidence.append(
                 "agent name agrees: Copilot reported {!r} and the emitter "
@@ -197,15 +258,16 @@ def link(runs: Dict[str, Dict[str, Any]],
             "agent": run.get("agent"), "jira_issue_key": run.get("jira_issue_key"),
             "method": "heuristic", "confidence": 0.8 if agrees else 0.5,
             "evidence": evidence,
+            "usage_grain": grain_of(conversation),
             **{k: conversation[k] for k in
                ("model_calls", "input_tokens", "output_tokens", "cached_tokens")},
         })
 
     return {
         "links": links,
-        "unlinked_conversations": unlinked,
+        "unlinked_sessions": unlinked,
         "runs_seen": len(runs),
-        "conversations_seen": len(conversations),
+        "sessions_seen": len(conversations),
         # §2.4: only explicit rows may feed cost-per-output. Reported so a
         # consumer does not have to re-derive the rule to know what it may do.
         "explicit_links": sum(1 for l in links if l["method"] == "explicit"),

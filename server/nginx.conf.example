@@ -1,9 +1,24 @@
 # usage-insight collection endpoint — the only thing facing the internet.
 #
-# One public route. Uploading has to be reachable from every laptop; reading
+# Three public routes, and each one is public because it has to be reachable by
+# a machine holding no credential: `/install` before there is an `insight`,
+# `/v1/bundle` from every laptop, `/healthz` from whatever is watching. Reading
 # exposes the whole team at once and is done from one machine by one person who
 # already has SSH, so the read routes are not published here at all. See
 # docs/TRANSPORT.md, "Ports: one public, one on loopback".
+
+# Rate limits. These live at file scope, not inside `server` -- `limit_req_zone`
+# is an http-context directive, and this file is included from inside `http`
+# (conf.d/), so the top of the file is that context. Inside the server block
+# nginx refuses to start.
+
+# A laptop uploads once an hour. Anything faster is a loop, not a person.
+limit_req_zone $binary_remote_addr zone=insight_upload:10m rate=30r/m;
+
+# Installing happens once per engineer, and re-running it after a failure is
+# normal. Generous enough not to punish that, tight enough that this is not a
+# bandwidth amplifier for a ~4 KB file.
+limit_req_zone $binary_remote_addr zone=insight_install:10m rate=12r/m;
 
 server {
     listen 443 ssl http2;
@@ -18,9 +33,6 @@ server {
 
     access_log /var/log/nginx/insight.access.log;
 
-    # A laptop uploads once an hour. Anything faster is a loop, not a person.
-    limit_req_zone $binary_remote_addr zone=insight_upload:10m rate=30r/m;
-
     location = /v1/bundle {
         limit_req zone=insight_upload burst=10 nodelay;
         proxy_pass http://127.0.0.1:8479;
@@ -30,6 +42,30 @@ server {
         # uploader from occupying a worker thread on the Python side.
         proxy_request_buffering on;
         proxy_read_timeout 60s;
+    }
+
+    # The installer:  curl -fsSL https://.../install | sh
+    #
+    # Public and unauthenticated, because it is what a laptop with no
+    # credential and no `insight` on it fetches first. What it returns is a
+    # fixed string the endpoint read at startup -- no path parameter, so there
+    # is nothing here that could be pointed at /etc/insight next door.
+    #
+    # Rated its own zone rather than sharing insight_upload: an install is a
+    # once-per-engineer event and a laptop uploading hourly should not be
+    # competing for burst with a team onboarding on the same afternoon.
+    location = /install {
+        limit_req zone=insight_install burst=5 nodelay;
+        proxy_pass http://127.0.0.1:8479;
+        proxy_set_header Host $host;
+        proxy_read_timeout 15s;
+    }
+
+    location = /install.sh {
+        limit_req zone=insight_install burst=5 nodelay;
+        proxy_pass http://127.0.0.1:8479;
+        proxy_set_header Host $host;
+        proxy_read_timeout 15s;
     }
 
     location = /healthz {

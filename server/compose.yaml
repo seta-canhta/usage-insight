@@ -44,6 +44,28 @@ services:
       INSIGHT_STORE: "${INSIGHT_STORE:-file:///var/lib/insight}"
       INSIGHT_ALLOWED_FILE: /etc/insight/allowed.env
       INSIGHT_ADMIN_TOKEN_FILE: /etc/insight/admin.token
+      # The installer served at GET /install, so onboarding is one curl instead
+      # of a git clone. Copy the install.sh from the release into ./etc beside
+      # the other two files -- it is the same read-only mount, and it holds the
+      # digest of the .pyz, so it is release-specific and changes when the
+      # release does.
+      #
+      # Read once at startup, and a named file that is not there stops the
+      # container rather than quietly 404ing: an endpoint that has been told to
+      # serve an installer and is not serving one is a state nobody discovers
+      # until an engineer's `curl | sh` prints nothing.
+      #
+      # **Empty by default, and that is the deliberate half.** Naming the path
+      # here would mean an existing deployment could not start until somebody
+      # had also placed the file -- so the day this proxy has to be redeployed
+      # for an unrelated reason (a schema the fleet is already sending, say)
+      # the redeploy fails on a feature nobody was asking for yet. Serving the
+      # installer is a decision; take it explicitly, in `.env`:
+      #
+      #     INSIGHT_INSTALL_SCRIPT=/etc/insight/install.sh
+      #
+      # From then on the loud behaviour above applies and is what you want.
+      INSIGHT_INSTALL_SCRIPT: "${INSIGHT_INSTALL_SCRIPT-}"
       INSIGHT_HOST: "0.0.0.0"          # container-internal; see the note above
       INSIGHT_PORT: "8479"              # full: uploads and the read routes
       INSIGHT_UPLOAD_PORT: "8480"       # uploads and /healthz only -- published

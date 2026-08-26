@@ -35,7 +35,11 @@ COPY cli/identity.py /app/cli/identity.py
 # notices the endpoint has stopped receiving -- deployed separately, it is the
 # piece most likely to be the one nobody deployed.
 COPY importers/watch.py importers/pull.py /app/importers/
-COPY pollers/common.py /app/pollers/common.py
+# The shared library. It moved out of `pollers/` to the repository root when
+# it became clear that cli/, importers/, report/ and collector/ all depend on
+# it -- see CLAUDE.md. `importers/watch.py` and `pull.py` add /app to sys.path
+# and `import common`, so the package has to sit at /app/common.
+COPY common/__init__.py /app/common/__init__.py
 
 RUN groupadd --system --gid 10001 insight \
  && useradd --system --uid 10001 --gid insight --no-create-home insight \

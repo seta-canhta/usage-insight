@@ -44,7 +44,11 @@ import os
 import sys
 from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The shared library sits at the repository root, one level up: it is
+# depended on by `cli/`, `importers/` and `report/` too, so it cannot
+# live inside one of its consumers.
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common import (  # noqa: E402
     AI_LABELS,

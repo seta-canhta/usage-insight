@@ -40,7 +40,11 @@ import sys
 import urllib.parse
 from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tuple
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+# The shared library sits at the repository root, one level up: it is
+# depended on by `cli/`, `importers/` and `report/` too, so it cannot
+# live inside one of its consumers.
+sys.path.insert(
+    0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from common import (  # noqa: E402
     Config,
@@ -278,7 +282,8 @@ class CiPoller:
                     aggregate[key] = (aggregate[key] or 0) + value
             tests = aggregate
 
-        jira_key = extract_jira_key(ref_name)
+        jira_key = extract_jira_key(ref_name,
+                                    projects=self.config.jira_project_keys)
         return build_event(
             "ci.pipeline.completed",
             completed_on,

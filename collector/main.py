@@ -97,20 +97,61 @@ MAX_FUTURE_SKEW = timedelta(minutes=5)
 
 ATTRIBUTE_ALLOWLIST: Dict[str, frozenset] = {
     "run.started": frozenset({"invocation_mode", "model_declared_id", "input_source"}),
-    "run.bound": frozenset({"otel_conversation_id", "jira_issue_key"}),
+    # `base_commit_sha`/`head_commit_sha` are the 1.1.0 addition, and they are
+    # what finally makes this event carry evidence rather than an assertion.
+    # A session id joins to a ticket only through something; measured
+    # 2026-08-26, the branch name is not that something (0 of 37 branches held
+    # a Jira key). A commit range is exact, and the client captures it while
+    # the clone still exists -- 6 of 7 of them were gone by the time anything
+    # went looking.
+    "run.bound": frozenset({
+        "copilot_session_id", "jira_issue_key",
+        "base_commit_sha", "head_commit_sha", "repository_host",
+    }),
     "run.phase.started": frozenset({"phase_name"}),
     "run.phase.completed": frozenset({"phase_name", "duration_ms", "status"}),
+    # Schema 1.1.0 widened this row with what Copilot's own session journal
+    # records and the OTel span stream never did — above all `premium_requests`,
+    # the unit Copilot actually bills. The weekly report's cost section carried
+    # a standing disclaimer that its per-token figure was "notional" for exactly
+    # as long as that number was unavailable.
+    #
+    # `cost_usd` and `cost_basis` are deliberately NOT here, though
+    # weekly_report.py reads both: CONTRACT.md §4 is explicit that cost is never
+    # emitted by a client and is derived in the warehouse against dated pricing.
+    # Permitting them would let a laptop assert a price. `premium_requests` is
+    # different in kind — a count of billed events, measured, not a valuation.
     "model.call": frozenset({
         "model_id", "input_tokens", "output_tokens", "cached_input_tokens",
-        "reasoning_tokens", "latency_ms", "retry_count", "finish_reason",
+        "cache_write_tokens", "reasoning_tokens", "latency_ms", "retry_count",
+        "finish_reason", "request_count", "premium_requests", "nano_aiu",
+        # Context composition, from `session.shutdown`. Not usage — a *level*:
+        # what the model was carrying, paid on every request in the session.
+        # `tool_definitions_tokens` is the one with a decision attached: it ran
+        # 14,318–34,219 across only 7 distinct values in 57 sessions, which is
+        # what a step function looks like, and it steps when an MCP server is
+        # connected. Nothing else in this system can price that decision.
+        #
+        # The other two are here so the composition adds up rather than being
+        # one number without a whole — and it does add up: the three sum to
+        # `currentTokens` within 4 tokens on all 57, so they are the whole
+        # context and not a subset of it. Measured 2026-08-26, and measured
+        # because the first figure written here (12–30% of context) was carried
+        # over from a plan rather than computed; the real share is 17.1–73.8%,
+        # median 34.2%. Multiplying any of them by `request_count` would be
+        # modelling, not measurement.
+        "tool_definitions_tokens", "system_tokens", "conversation_tokens",
     }),
     "tool.call": frozenset({
         "tool_name", "tool_kind", "duration_ms", "status", "error_class",
     }),
     "human.turn": frozenset({"turn_index", "turn_kind", "chars"}),
+    # `acceptance_state` added in 1.1.0 for the same reason as `cost_usd`
+    # above: weekly_report.py has grouped outputs by it since it was written,
+    # and every event carrying it was stripped at ingest.
     "output.generated": frozenset({
         "output_id", "artifact_type", "file_path", "lines_added", "lines_removed",
-        "output_content_hash", "reuse_source",
+        "output_content_hash", "reuse_source", "acceptance_state",
     }),
     "gate.evaluated": frozenset({
         "gate_name", "status", "quality_score", "coverage_pct", "attempt_index",
@@ -179,7 +220,7 @@ FORBIDDEN_ATTRIBUTE_KEYS = frozenset({
 # CONTRACT.md §2 — envelope allow-lists. Anything else is stripped before publish.
 ENVELOPE_SCALARS = (
     "schema_version", "event_id", "event_type", "event_time",
-    "trace_id", "run_id", "parent_run_id", "span_id", "workflow_id",
+    "trace_id", "run_id", "parent_run_id", "span_id",
 )
 ACTOR_FIELDS = ("person_id", "person_email_hash", "team_id", "role")
 CONTEXT_FIELDS = (
@@ -440,8 +481,29 @@ def normalise_event(raw: Any, now: Optional[datetime] = None) -> Tuple[Dict[str,
     # 2. Envelope validation.
     validate_schema_version(_require(raw, "schema_version"))
     event_type = validate_event_type(_require(raw, "event_type"))
-    for required in ("event_id", "event_time", "trace_id", "run_id"):
+    for required in ("event_id", "event_time", "trace_id"):
         _require(raw, required)
+    # `run_id` must be PRESENT and may be NULL, which is not the same rule.
+    #
+    # CONTRACT.md §2.4 is explicit -- "Poller events carry `run_id = null`
+    # unless the commit carries an `AI-Run-Id` trailer" -- and this loop used
+    # to demand a non-null value for every event type, so the collector
+    # rejected the exact shape the contract mandates. Measured 2026-08-26
+    # against real data: **all 57 `model.call` events** built from Copilot's
+    # session journal were refused with `envelope.missing_field: run_id`, and
+    # those are the rows carrying every token count and every premium request
+    # -- the whole Cost section of the weekly report.
+    #
+    # It survived 798 tests because the collector's own `make_event` fixture
+    # always stamped a run id, so the contract's mandated case was the one
+    # case never exercised.
+    #
+    # Present-but-null still has to be distinguished from absent: an event
+    # that simply forgot the field is malformed, and silently reading it as
+    # "no run" would turn a client bug into an unattributed row.
+    if "run_id" not in raw:
+        raise RejectionError("envelope.missing_field",
+                             "required field is missing", field="run_id")
 
     # 3. Allow-list strip. Anything not named in CONTRACT.md §2/§3 disappears.
     out: Dict[str, Any] = {name: raw.get(name) for name in ENVELOPE_SCALARS}

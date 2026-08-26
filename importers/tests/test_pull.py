@@ -103,7 +103,7 @@ class PullTests(unittest.TestCase):
         with self.assertRaises(pull_mod.PullError) as caught:
             pull_mod.pull_week("https://x.test", "2026-W34", "bad", self.inbox,
                                get=endpoint)
-        self.assertIn("TRANSPORT", str(caught.exception))
+        self.assertIn("server/README", str(caught.exception))
 
     def test_a_server_error_writes_nothing(self):
         endpoint = Endpoint(OBJECTS, status=500)

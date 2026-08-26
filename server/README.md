@@ -1,7 +1,6 @@
 # The collection endpoint
 
-Implements [`docs/TRANSPORT.md`](../docs/TRANSPORT.md). Laptops `PUT` bundles
-here; this owns the S3 credentials so they never leave the server.
+Laptops `PUT` bundles here; this owns the S3 credentials so they never leave the server.
 
 ```bash
 # Run it now, with no AWS account, and point a client at it:
@@ -429,3 +428,147 @@ covered: the key comes from the authenticated identity and not from a header,
 a stored bundle is never overwritten, a fingerprint is not a usable credential,
 an unknown secret gets `401` (so a rotating client retries) rather than `403`,
 and an engineer's own secret cannot read the team's data.
+
+---
+
+## Identity: a work email, a fingerprint, and one line of `.env`
+
+At setup the engineer gives their work email. The client mints a random secret,
+keeps it, and prints the **one line** to add to the server:
+
+```bash
+$ ./insight setup --email canh@seta-international.vn \
+      --endpoint https://aeris-insight.seta-international.com
+
+Send this line to whoever maintains the collection server, so they
+can add you to INSIGHT_ALLOWED in its .env:
+
+    canh@seta-international.vn:9f2ac41e8b...c3d1
+
+It is a hash, not a secret -- the secret stays in ~/.seta-insight/config.json.
+Uploading with `ship` will fail until that line is in place.
+```
+
+The server's `.env`, and nothing else:
+
+```bash
+INSIGHT_ALLOWED="canh@seta-international.vn:9f2ac41e8b...c3d1,\
+                 minh@seta-international.vn:4d7be0a219...88fa"
+INSIGHT_ADMIN_TOKEN="<for the read routes>"
+```
+
+No UI, no database, no token endpoint. Adding a person is a line; removing one
+is deleting that line.
+
+**The direction is the point.** The secret is generated on the laptop and never
+transmitted to whoever keeps the whitelist — they only ever receive
+`sha256(secret)`. So `INSIGHT_ALLOWED` is not a credential store: a copy of the
+server's `.env` lets nobody upload anything, and it can be pasted into a ticket
+or committed to a private ops repo without becoming an incident.
+
+The reverse arrangement — admin mints, engineer pastes — puts a live secret
+through chat. `insight setup --token` used to support it, for pre-provisioning a
+joiner before their laptop existed. **It is gone as of 2026-08-26.** Removing it
+removes the exception, and what is left is a stronger property than the
+convenience was worth: every secret on every machine is one that has never
+travelled anywhere.
+
+The cost is stated rather than hidden. An admin can no longer set someone up
+before their laptop is touched; every engineer runs `insight setup`, mints
+locally, and sends the `email:fingerprint` line. That is one more step for the
+one person joining, in exchange for there being no channel through which a live
+upload credential has ever passed.
+
+### Rotation without coordination
+
+```bash
+$ ./insight rotate-token          # mints the next secret, keeps the old working
+$ ./insight rotate-token --finish # after the new line is live, drop the old
+```
+
+`INSIGHT_ALLOWED` takes two fingerprints per person — `email:new:old` — and the
+client tries the new secret first, falling back to the old on `401`. So the
+engineer rotating and the admin editing `.env` never have to happen in the same
+minute, and uploads keep working throughout.
+
+That property is the whole reason rotation is worth building. A rotation that
+requires scheduling is a rotation that happens once.
+
+### What this does and does not buy
+
+Worth being exact, because overstating it would be worse than not having it.
+
+`ARCHITECTURE.md` declares this data **not an audit trail**: an engineer can
+read and edit their own bundle before sending it. That was traded away
+deliberately, for consent. Authentication does not take it back — a whitelisted
+person can still upload a bundle they edited.
+
+What it does buy:
+
+- only known SETA addresses can write into the bucket
+- every object carries **who** sent it, so coverage can name a person rather
+  than a machine id
+- one person can be removed without touching anyone else
+- reading — which exposes the whole team at once — is a separate, admin-only
+  credential
+
+**The email never becomes telemetry.** `CONTRACT.md §1.1` forbids raw email
+addresses in collected data, and nothing writes one into a bundle: it lives in
+`config.json` and the `Authorization` header, both outside the event path.
+Objects are filed under `sha256(email)[:12]`, and `pull.py` names people only in
+its coverage report on stderr — never in the inbox that feeds `bundle.py`.
+
+That key prefix is key hygiene, not a privacy control, and it is worth saying
+so: the `.env` beside it holds every address in plaintext. Its job is to keep
+raw addresses out of object keys, access logs, and anything pasted into a
+ticket.
+
+---
+
+## Noticing when a machine goes quiet
+
+```bash
+python3 importers/watch.py --roster roster.txt
+```
+
+Run it once a day from cron. It lists recent weeks, works out who has not
+reported, and posts to **ntfy.sh** when someone crosses the threshold.
+
+**A miss is a working day, not an hour.** `auto` uploads nothing in an hour
+where nothing changed, so three silent hours is what a normal afternoon of
+non-AI work looks like -- alerting on it would train everyone to mute the
+channel. A working day with no bundle at all is different: even an idle day
+uploads one empty bundle, so silence for a whole day means the collection is
+broken on that machine.
+
+Nights and weekends are not misses, which is what the working hours are for. A
+laptop shut at 19:00 on Friday is not a fault.
+
+| `.env` | default | |
+|---|---|---|
+| `INSIGHT_WORK_START` | `09:00` | |
+| `INSIGHT_WORK_END` | `19:00` | |
+| `INSIGHT_WORK_DAYS` | `0,1,2,3,4` | Monday = 0 |
+| `INSIGHT_TZ_OFFSET` | `+07:00` | fixed offset; Vietnam has no DST, so no tz database is needed |
+| `INSIGHT_MISS_THRESHOLD` | `3` | consecutive working days |
+| `INSIGHT_NTFY_URL` | `https://ntfy.sh/seta-insight` | |
+| `INSIGHT_NTFY_TOKEN` | *(empty)* | only for an access-protected topic |
+
+Two rules keep the channel worth listening to:
+
+**One outage is one message.** The alert fires when the threshold is crossed and
+again only if the streak grows. A fortnight-long outage is one problem, not ten
+notifications, and a channel that repeats is a channel that gets muted -- which
+is worse than having none, because everyone believes it is still watching.
+
+**A new joiner is never the first thing it pages about.** Someone added to the
+roster today has no uploads for the three working days before they existed here,
+which looks exactly like a broken machine. First sighting is recorded, and the
+clock starts then.
+
+⚠️ **A public ntfy.sh topic is readable by anyone who guesses the name**, and
+these messages carry work email addresses. Either use an access-protected topic
+with `INSIGHT_NTFY_TOKEN`, or accept that the topic name is the only thing
+keeping a list of your engineers private. `ntfy.sh/seta-insight` is guessable.
+
+---

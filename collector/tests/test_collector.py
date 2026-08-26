@@ -301,6 +301,50 @@ class TestHappyPath(CollectorTestCase):
         )
 
 
+class TestRunIdMayBeNull(CollectorTestCase):
+    """CONTRACT.md §2.4 — "Poller events carry `run_id = null`".
+
+    Regression, found 2026-08-26: the envelope check demanded a NON-NULL
+    `run_id` for every event type, so the collector rejected the exact shape
+    the contract mandates. Every Jira, Bitbucket and AIO row, and **all 57**
+    `model.call` events built from Copilot's session journal -- the rows
+    carrying every token count and premium request -- were refused with
+    `envelope.missing_field: run_id`.
+
+    It survived the whole suite because `make_event` always stamped a run id,
+    so the mandated case was the one case never exercised. That is why these
+    tests build the null explicitly rather than relying on the fixture.
+    """
+
+    def test_a_poller_event_with_a_null_run_id_is_accepted(self):
+        event = make_event(event_type="jira.transition", attributes={})
+        event["run_id"] = None
+        status, body = self.post([event])
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["rejected"], 0)
+
+    def test_session_grain_usage_with_a_null_run_id_is_accepted(self):
+        # `model.call` from the journal is session grain: one row covers every
+        # run the session hosted, so stamping one run would charge one agent
+        # for what the others spent.
+        event = make_event(event_type="model.call",
+                           attributes={"model_id": "claude-sonnet-4.6",
+                                       "input_tokens": 100})
+        event["run_id"] = None
+        status, body = self.post([event])
+        self.assertEqual(status, 200, body)
+        self.assertEqual(body["rejected"], 0)
+
+    def test_an_absent_run_id_is_still_rejected(self):
+        # Present-but-null is a claim: "no run owns this". Absent is a client
+        # that forgot the field, and reading that as "no run" would turn a bug
+        # into a silently unattributed row.
+        event = make_event(event_type="jira.transition", attributes={})
+        event.pop("run_id")
+        status, body = self.post([event])
+        self.assertEqual(body["rejected"], 1, body)
+
+
 class TestSchemaValidation(CollectorTestCase):
     def test_unknown_event_type_is_400(self):
         event = make_event(event_type="run.exploded")
@@ -324,16 +368,17 @@ class TestSchemaValidation(CollectorTestCase):
 
     def test_the_three_copies_of_the_enum_agree(self):
         # The enum is written down three times -- CONTRACT.md §3, the collector,
-        # and the pollers' common.py. A drift between them is a rejected event at
+        # and the shared library. A drift between them is a rejected event at
         # runtime, so it is checked here rather than discovered in production.
         import importlib.util
         import os
         # main.py lives in collector/, so two levels up is the repository root,
-        # which is where pollers/ sits.
-        pollers = os.path.join(
+        # which is where `common/` sits -- it moved out of `pollers/` because
+        # cli/, importers/ and report/ all depend on it too.
+        shared = os.path.join(
             os.path.dirname(os.path.dirname(os.path.abspath(collector_main.__file__))),
-            "pollers", "common.py")
-        spec = importlib.util.spec_from_file_location("pollers_common", pollers)
+            "common", "__init__.py")
+        spec = importlib.util.spec_from_file_location("shared_common", shared)
         module = importlib.util.module_from_spec(spec)
         # @dataclass resolves annotations through sys.modules, so the module has
         # to be registered before it is executed.

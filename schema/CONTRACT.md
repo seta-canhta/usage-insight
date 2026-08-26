@@ -1,4 +1,4 @@
-# AI Telemetry — Schema Contract v1.0.0
+# AI Telemetry — Schema Contract v1.1.0
 
 **This file is the single source of truth.** Every component (emitter, collector,
 pollers, warehouse, metric SQL) MUST conform to it. Do not redefine these structures
@@ -44,7 +44,14 @@ Every event is one JSON object with exactly these top-level keys.
   "ingested_at":    "RFC3339 UTC",    // set by the collector, never by the client
 
   "trace_id":       "trc_<uuid4hex>", // required — one user-initiated workflow
-  "run_id":         "run_<uuid4hex>", // required — one agent invocation
+  "run_id":         "run_<uuid4hex>", // required KEY, nullable VALUE — one agent
+                                      //   invocation. Null means "no run owns
+                                      //   this": a poller observation (§2.4), or
+                                      //   session-grain usage covering several
+                                      //   runs. Absent is a malformed event and
+                                      //   is rejected — reading a forgotten field
+                                      //   as "no run" turns a client bug into a
+                                      //   silently unattributed row
   "parent_run_id":  null,             // string|null — sub-agent -> supervisor
   "span_id":        "spn_<uuid4hex>", // string|null — one phase
   "workflow_id":    "wf-PRJ-6383-20260819", // string|null — legacy bridge
@@ -110,14 +117,14 @@ everything else is `heuristic` or `marker_only`.
 | # | `event_type` | Source | `attributes` |
 |---|---|---|---|
 | 1 | `run.started` | emitter | `invocation_mode` (`jira_driven`\|`direct_plan`\|`unknown`), `model_declared_id`, `input_source` |
-| 2 | `run.bound` | emitter | **`otel_conversation_id`** (= `gen_ai.conversation.id`), `jira_issue_key`. ⭐ The bridge between the OTel stream and the correlation stream — **but see the warning below: it is NOT a join key on its own** |
+| 2 | `run.bound` | emitter **and `insight copilot`** | **`copilot_session_id`** (= the `~/.copilot/session-state/<id>` directory name), `jira_issue_key`, **`base_commit_sha`**, **`head_commit_sha`**, `repository_host`. ⭐ The bridge between the usage stream and the correlation stream — **but see the warning below: it is NOT a join key on its own**. **Renamed in 1.1.0** from `otel_conversation_id`, which the collector still accepts: an exact-match rename would reject a whole week from any client that had not upgraded. **The commit range was added in 1.1.0** and is what makes this row evidence rather than an assertion: a session id joins to a ticket only *through* something, and measured 2026-08-26 the branch name is not that something — **0 of 37** real branches carried a Jira key, so deriving one from the branch resolves to NULL on every real session. A SHA does not have that problem. One row **per branch** the session moved: a session that starts on `main` and resumes on a feature branch has two ranges, and spanning them would charge it for every commit in the gap. `jira_issue_key` stays NULL here — resolving a range to a ticket is the warehouse's job, where the SCM side of the join lives. **Captured live, never reconstructed:** of the seven `gitRoot`s these journals name, one still existed when anything went looking; worktrees are deleted when their branch merges, which is precisely the sessions that produced something |
 | 3 | `run.phase.started` | emitter | `phase_name` |
 | 4 | `run.phase.completed` | emitter | `phase_name`, `duration_ms`, `status` (`ok`\|`failed`\|`skipped`) |
-| 5 | `model.call` | **OTel** | `model_id`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `reasoning_tokens`, `latency_ms`, `retry_count`, `finish_reason`. **Wire attribute names, measured 2026-08-19:** `gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`, `gen_ai.usage.cache_read.input_tokens` (→ `cached_input_tokens`), `gen_ai.usage.cache_creation.input_tokens`, `gen_ai.usage.reasoning.output_tokens` (→ `reasoning_tokens`), `gen_ai.response.model` (→ `model_id` — authoritative), `gen_ai.response.finish_reasons`. There is no `gen_ai.usage.total_tokens` |
-| 6 | `tool.call` | **OTel** | `tool_name`, `tool_kind` (`mcp`\|`terminal`\|`file`\|`http`\|`other`), `duration_ms`, `status`, `error_class` |
+| 5 | `model.call` | **journal** | `model_id`, `input_tokens`, `output_tokens`, `cached_input_tokens`, `cache_write_tokens`, `reasoning_tokens`, `latency_ms`, `retry_count`, `finish_reason`, `request_count`, `premium_requests`, `nano_aiu`, `tool_definitions_tokens`, `system_tokens`, `conversation_tokens`. **Source changed in 1.1.0** from Copilot's OTel span stream to its own session journal; the wire names below are that journal's. **Wire names, measured 2026-08-26:** `session.shutdown.modelMetrics.<model>.usage.{inputTokens, outputTokens, cacheReadTokens, cacheWriteTokens, reasoningTokens}`, `.requests.count` (→ `request_count`), `.requests.cost` (→ `premium_requests`), `.totalNanoAiu`. **`premium_requests` is the billing unit** — Copilot charges per seat plus premium requests, never per token, so a token figure is an economic weight and this is the invoice line. One event covers every call to one model in one session: the journal totals usage per session, so `latency_ms` is carried only where a session used a single model (`totalApiDurationMs` is the session's, and dividing it by `request_count` would be modelling). `retry_count` and `finish_reason` are **not recorded by this source** and stay NULL — never 0. The three `*_tokens` context fields are a **level, not a total**: what the model was carrying at the end of the session and paid for on every request in it, from `session.shutdown.{toolDefinitionsTokens, systemTokens, conversationTokens}`. `tool_definitions_tokens` measured 14,318–34,219 across only 7 distinct values in 57 sessions — a step function, and it steps when an MCP server is connected, making it the only measure in this contract that prices that decision. Its share of context is **17.1–73.8%, median 34.2%**, and the three fields sum to `session.shutdown.currentTokens` within 4 tokens on all 57, so they are the whole context rather than a subset. Multiplying any of the three by `request_count` would be modelling, not measurement |
+| 6 | `tool.call` | **journal** | `tool_name`, `tool_kind` (`mcp`\|`terminal`\|`file`\|`http`\|`other`), `duration_ms`, `status`, `error_class`. **Source changed in 1.1.0.** `status` was structurally NULL under the span source — spans carried no status field — so the weekly report's tool-failure count was always 0 by construction, not by measurement. `tool.execution_complete.success` now supplies a real verdict and `error.code`/`.message` a bounded `error_class`; the message itself is read to classify and discarded. `duration_ms` stays NULL: the journal timestamps the two ends of a call, and the gap includes waiting for a human to approve it, which is not the tool's duration |
 | 7 | `human.turn` | emitter | `turn_index`, `turn_kind` (`clarification`\|`correction`\|`approval`\|`rejection`), `chars` |
-| 8 | `output.generated` | emitter | `output_id`, `artifact_type` (`code`\|`test`\|`spec`\|`mock`\|`doc`\|`csv`\|`config`), `file_path`, `lines_added`, `lines_removed`, `output_content_hash`, `reuse_source` |
-| 9 | `gate.evaluated` | emitter | `gate_name` (`build`\|`test`\|`lint`\|`secrets`\|`coverage`), `status` (`pass`\|`fail`\|`skipped`), `quality_score`, `coverage_pct`, `attempt_index` |
+| 8 | `output.generated` | emitter, git hook, **journal** | `output_id`, `artifact_type` (`code`\|`test`\|`spec`\|`mock`\|`doc`\|`csv`\|`config`), `file_path`, `lines_added`, `lines_removed`, `output_content_hash`, `reuse_source`, `acceptance_state`. **`acceptance_state` added in 1.1.0** — `weekly_report.py` has grouped outputs by it since it was written and this list never permitted it, so ingest stripped every one and the acceptance section rendered empty for reasons that had nothing to do with the emitter. The journal supplies these per edit (`toolTelemetry.metrics.linesAdded`/`linesRemoved`), which is the first source that attributes a written file to the agent that wrote it rather than to the commit that carried it. `file_path` is **repo-relative**: journal paths are absolute and begin with somebody's home directory, and design §11.3 keeps raw identifiers out of the stream |
+| 9 | `gate.evaluated` | emitter, **journal** | `gate_name` (`build`\|`test`\|`lint`\|`secrets`\|`coverage`), `status` (`pass`\|`fail`\|`skipped`), `quality_score`, `coverage_pct`, `attempt_index`. A shell command that runs a test, lint or build **is** a gate evaluation whether or not an agent emitted one, so the journal synthesises these from the command — read to classify, then discarded. **`status` is a real verdict as of 1.1.0:** Copilot's bash tool appends `<exited with exit code N>` to the output it returns, matched anchored at the end so a command that merely prints the phrase cannot forge a result, and only the integer is taken. Absent on ~12% of calls (still running, or output truncated), and absent means NULL — a missing verdict and a passing one are different facts. `success` on the tool call is **not** the verdict: a failing test suite is a successful bash call, and reading it that way would report every red build green |
 | 10 | `run.completed` | emitter | `duration_ms`, `phases_completed` |
 | 11 | `run.failed` | emitter | `duration_ms`, `failure_class`, `dependency_failed` (`vpn`\|`network`\|`jira`\|`bitbucket`\|`mcp`\|`aio`\|`ci`\|`none`) |
 | 12 | `run.timeout` | emitter | `duration_ms`, `timeout_policy` |
@@ -130,7 +137,7 @@ everything else is `heuristic` or `marker_only`.
 | 19 | `scm.revert` | **poller** | `reverted_commit_sha`, `revert_commit_sha`, `days_to_revert` |
 | 20 | `ci.pipeline.completed` | **poller** | `pipeline_id`, `commit_sha`, `status`, `duration_ms`, `tests_total`, `tests_passed`, `tests_failed`, `coverage_pct`, `ci_provider`, `ci_kind` (`build`\|`deploy`), `job_name`, `job_branch`, `build_number`. **Measured 2026-08-19:** CI is self-hosted **Jenkins**, not Bitbucket Pipelines. The source is `/commit/{sha}/statuses`, which needs no Jenkins credential. `tests_*` and `coverage_pct` are NOT available on that path and stay NULL — never 0 |
 | 21 | `jira.transition` | **poller** | `from_status`, `to_status`, `transitioned_at`, `status_category`, `issue` (snapshot sub-object: status, assignee accountId, issue type, labels, parent, estimates), `attribution` (AR-3 evidence sub-object: `rule`, `ai_labels`, `has_ai_labels`, `label_authored_by_ai`, `label_planned_by_ai`, `label_generated_by_ai`, `label_reviewed_by_ai`, `unrecognised_ai_labels`, `has_ai_label_drift`, `is_delivery_ticket_candidate`, `delivery_ticket_key`, `feature_ticket_key`, `feature_ticket_source`, `resolution_confidence`, `linked_issues`, `parent_key`). Issue creation is synthesised as a transition so every issue yields ≥1 event — the enum is closed, so there is no separate snapshot event. **`unrecognised_ai_labels` is a DQ signal, never a count:** it carries label *names* outside the §3.1 closed set, and those tickets are deliberately excluded from every AI figure |
-| 22 | `test.run.completed` | **poller** | `test_case_key`, `test_cycle_key`, `test_run_id`, `status` (AIO run status name), `status_category` (`passed`\|`failed`\|`blocked`\|`skipped`\|`in_progress`\|`not_run`\|`other`), `is_automated`, `executed_by_person_id`, `assigned_to_person_id`, `executed_at`, `effort_seconds`, `defect_count`, `folder_name`, `priority`. **Added 2026-08-20**, when an AioAuth key first made AIO TCMS reachable — the enum stopped at 21 because this source was blocked (`401 Invalid or missing API Token`), not because test execution did not matter. For a QA engineer the test cycle *is* the delivery record; pull requests are not. `test_case_title` is deliberately **not** carried: titles are free text and belong to the §11.3 exclusions. A run that has never been executed emits `status_category = not_run` with a NULL `executed_at` — it is **not** a failure and must never be counted as one |
+| 22 | `test.run.completed` | **poller** | `test_case_key`, `test_cycle_key`, `test_run_id`, `status` (AIO run status name), `status_category` (`passed`\|`failed`\|`blocked`\|`skipped`\|`in_progress`\|`not_run`\|`other`), `is_automated`, `executed_by_person_id`, `assigned_to_person_id`, `executed_at`, `effort_seconds`, `defect_count`, `folder_name`, `priority`. **Added 2026-08-20**, when an AioAuth key first made AIO TCMS reachable — the enum stopped at 21 because this source was blocked (`401 Invalid or missing API Token`), not because test execution did not matter. For a QA engineer the test cycle *is* the delivery record; pull requests are not. `test_case_title` is deliberately **not** carried: titles are free text and belong to the design §11.3 exclusions. A run that has never been executed emits `status_category = not_run` with a NULL `executed_at` — it is **not** a failure and must never be counted as one |
 | 23 | `test.case.snapshot` | **poller** | `test_case_key`, `automation_status` (AIO's own value, e.g. `Automated` / `To Be Automated`, or NULL when nobody has set it), `automation_owner_person_id`, `has_automation_key`, `test_case_status`, `script_type`, `folder_name`, `priority`, `is_archived`, `created_at`, `updated_at`. **Added 2026-08-20.** This is the *inventory* event, and it exists because the denominator of Automation Coverage is invisible to event 22: a test case nobody has ever executed emits no run, and those are exactly the un-automated cases the coverage metric has to count. `automation_status` is passed through verbatim and is **NULL for roughly half the estate** — an unset field is not "not automated", so a coverage figure must state its known-status denominator or it is measuring how diligently the field is filled in |
 
 ### 3.1 Provenance markers — two closed sets, not one
@@ -182,42 +189,82 @@ from the AI figure until reconciled, so the names must reach a report.
 
 ---
 
-> ### 🔴 Copilot exports content by DEFAULT — the collector must strip it
+> ### 🔴 The session journal is mostly content — read it by allow-list
 >
-> Measured 2026-08-19 with no content setting enabled: `gen_ai.input.messages`,
-> `gen_ai.output.messages`, `gen_ai.system_instructions`, `gen_ai.tool.call.arguments`,
-> `gen_ai.tool.call.result` and `copilot_chat.user_request` carried prompts, replies,
-> the system prompt, absolute paths with the username, and **source file contents**.
-> Vendor docs say `captureContent` defaults off; it was off, and content still arrived.
+> `~/.copilot/session-state/<id>/events.jsonl` holds the entire conversation next to
+> the numbers: `user.message.content`, `assistant.message.content`, `arguments.file_text`,
+> `arguments.old_str`/`new_str`, `result.content` (real command output and file
+> contents), `reasoningText`, and absolute paths carrying the username. Measured
+> 2026-08-26: a single 28-session tree ran to 900 KB per journal.
 >
-> Never point Copilot's OTLP exporter at an endpoint that does not redact.
-> `collector/otel_config.yaml` is that redactor and its behaviour is verified by
-> replaying real captured spans through it.
+> This is a smaller exposure than the span stream it replaced — the file never leaves
+> the machine on its own, so there is no redacting collector standing between a leak
+> and the internet — but it is a **larger** concentration of content in one place, and
+> the reader is the only thing between it and a bundle.
 >
-> **Key-pattern sweeps in that config MUST be anchored to a whole dot-segment**, for
-> exactly the reason stated for the JSON path above. An unanchored sweep containing
-> `response` silently deleted `gen_ai.response.model` — the field `dim_model_pricing`
-> joins on — which would have priced every run to NULL. Found by measurement, not review.
+> `cli/copilot_read.py` therefore **names the fields it keeps**, by dotted path, and
+> drops everything else without inspection. An exclusion list is only as good as
+> today's knowledge of a format that gains keys without asking. Three fields are read
+> to classify and then discarded — the shell command (which gate?), the tool error
+> message (which failure class?), and the anchored tail of command output (which exit
+> code?) — the same rule the commit-subject parser follows. Nested values are refused
+> outright: a `dict` or `list` leaf returns nothing even if its path is on the
+> keep-list, because free text hides in structure.
+>
+> **`file_path` MUST be made repo-relative.** Journal paths are absolute and begin
+> `/Users/<name>/`. A path that sits under no known `gitRoot` or `cwd` is dropped, not
+> truncated — a half-path is not worth a guess about which prefix was safe to remove.
+>
+> **Never delete the journal after reading it.** The OTel path truncated its span file
+> each run, correctly, because that file existed only for us and held prompts. This
+> file is Copilot's own session history and the user's to keep.
 
-> ### ⚠️ `otel_conversation_id` is not a join key
+> ### ⚠️ `copilot_session_id` is not a join key
 >
-> A Copilot `gen_ai.conversation.id` identifies a chat **session**, not a run. One
-> session hosts sequential runs, and a supervisor's nine sub-agents all share it. A
-> plain equijoin on conversation id is therefore **many-to-many** and silently
-> multiplies every token in the session by the number of runs in it.
+> A Copilot session id identifies a **session**, not a run. One session hosts
+> sequential runs, and a supervisor's nine sub-agents all share it. A plain equijoin
+> on session id is therefore **many-to-many** and silently multiplies every token in
+> the session by the number of runs in it.
 >
-> The bind MUST be conversation id **plus a time window**:
+> For `tool.call`, `gate.evaluated`, `output.generated` and `human.turn` — one event
+> per journal record, each with its own timestamp — the bind is session id **plus a
+> time window**:
 > 1. Build each bound run's active window `[started_at − 300s, terminal_at + 300s]`,
 >    capped at 24h for a run with no terminal event (matching the DQ-2 orphan window,
 >    so an abandoned run stops absorbing later tokens).
-> 2. Join spans on `conversation_id` AND `start_time` inside that window.
-> 3. Force one span to exactly one run:
->    `QUALIFY ROW_NUMBER() OVER (PARTITION BY span_id ORDER BY started_at DESC, run_id ASC) = 1`
+> 2. Join on `copilot_session_id` AND `event_time` inside that window.
+> 3. Force one event to exactly one run:
+>    `QUALIFY ROW_NUMBER() OVER (PARTITION BY event_id ORDER BY started_at DESC, run_id ASC) = 1`
 >
-> `PARTITION BY span_id` is load-bearing — it makes double-counting structurally
-> impossible rather than merely unlikely. `started_at DESC` assigns a span to the most
-> recently started run whose window contains it, so tokens land on the **sub-agent**
-> that issued the call; AR-4 then rolls the supervisor up by `trace_id`.
+> `PARTITION BY event_id` is load-bearing — it makes double-counting structurally
+> impossible rather than merely unlikely. `started_at DESC` assigns an event to the
+> most recently started run whose window contains it, so work lands on the
+> **sub-agent** that did it; AR-4 then rolls the supervisor up by `trace_id`.
+>
+> ### 🔴 `model.call` cannot be split across runs at all — and this is new in 1.1.0
+>
+> The span source emitted one `model.call` per API call, each individually timestamped,
+> so the window join above placed tokens on the right sub-agent. **The journal does
+> not.** It totals usage per session in `session.shutdown`, so 1.1.0 emits **one
+> aggregate `model.call` per (session, model)** carrying the whole session's tokens and
+> premium requests, stamped at shutdown.
+>
+> The window join is therefore **invalid for `model.call`**. Applied anyway it charges
+> every token in a multi-run session to whichever run happened to be open when the
+> session ended.
+>
+> What is still true, and what is not:
+> * **Valid** — tokens and premium requests per session, per model, per person, per
+>   repository, per week. Every §6 Cost figure is built from these and is unaffected.
+> * **Valid** — tokens by agent *where the session ran one agent*, which is the common
+>   case for the CLI surface.
+> * **Invalid** — tokens attributed to one run inside a multi-run session, and any
+>   cost-per-output that divides by outputs from a single run in such a session.
+>
+> A session that hosted more than one run must report `cost_usd = NULL` for its
+> constituent runs rather than a share of the total. §2.4 already forbids synthesising
+> a join key; apportioning a measured total across runs by time or by call count is the
+> same offence wearing arithmetic.
 
 ---
 
@@ -239,6 +286,28 @@ price change. If **any** call in a run is unpriceable, the run's `cost_usd` is `
 summing only the priceable calls yields a number that looks complete and is
 systematically low.
 
+**Since 1.1.0 "per call" means per (session, model)**, because that is the grain the
+journal records — see the `model.call` warning in §3. A session that straddles a price
+change is priced at the boundary it ends on, and a session using two models is priced
+per model, which is exact. The looser grain is a property of the source; inventing a
+finer one would be a guess with a decimal point on it.
+
+### 4.1 Tokens are a weight; `premium_requests` is the bill
+
+Copilot charges **per seat plus premium requests**, never per token. The derivation
+above therefore produces an *economic weight* — the right thing for comparing agents,
+models and configurations against each other, and the wrong thing to hand a finance
+team as spend.
+
+`premium_requests` (1.1.0, from `modelMetrics.<model>.requests.cost`) is the measured
+count of the unit actually billed, and `nano_aiu` is Copilot's own usage quantum.
+Neither is a price. Report them **alongside** `cost_usd`, never blended into it: one is
+measured and dimensionless, the other is modelled and in dollars, and a single number
+carrying both would be defensible as neither.
+
+The seat component is not visible from any client and never will be — it is a contract
+term, not telemetry. Any total presented as spend must state it is excluded.
+
 `cost_basis ∈ {measured, modelled, seat_allocated}`. OTel spans ⇒ `measured`; the same
 event types arriving on the correlation stream (non-exporting surfaces) ⇒ `modelled`.
 **Never mix the two within one run.**
@@ -250,12 +319,14 @@ An unpriced `model_id` ⇒ `cost_usd = NULL` (**never 0**) + DQ-6 finding.
 
 Computed nightly on `fct_ai_output`. (Design §8.7, §9.2)
 
-```
-generated ──> in_flight ──┬──> accepted   (merged AND post_review_change_ratio <= 0.25
-                          │                AND NOT reverted within 30d)
-                          ├──> reworked   (merged AND ratio > 0.25)
-                          ├──> rejected   (PR declined OR never committed within 7d)
-                          └──> reverted   (was merged, revert detected within 30d)
+```mermaid
+stateDiagram-v2
+    [*] --> generated
+    generated --> in_flight
+    in_flight --> accepted : merged AND ratio &le; 0.25<br/>AND not reverted within 30d
+    in_flight --> reworked : merged AND ratio &gt; 0.25
+    in_flight --> rejected : PR declined OR<br/>never committed within 7d
+    accepted --> reverted : revert detected within 30d
 ```
 
 `post_review_change_ratio = lines_changed_after_first_review / lines_generated`

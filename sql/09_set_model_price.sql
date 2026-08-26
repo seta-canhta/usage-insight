@@ -39,6 +39,33 @@
 -- Record which interpretation you are using. Label it on the dashboard. A notional
 -- cost quoted as though it were an invoice is exactly the failure mode design
 -- §8.16 and §14.5 exist to prevent.
+--
+-- ---------------------------------------------------------------------------
+-- NEW IN CONTRACT 1.1.0: the billed unit is now MEASURED
+-- ---------------------------------------------------------------------------
+-- Everything above was written when the premium-request count was unavailable. It
+-- is not any more. Copilot's session journal reports
+-- `modelMetrics.<model>.requests.cost`, which is the actual count of premium
+-- requests billed, and it flows through to `premium_requests` on
+-- core.fct_ai_run, marts.agg_daily_person_agent and marts.v_session_usage.
+--
+-- That changes what this file is for, and what it is NOT for. The rates entered
+-- here still produce the notional per-token weight — the right unit for comparing
+-- agents, models and skill configurations. The premium-request count is the right
+-- unit for reconciling against a bill. They are DIFFERENT NUMBERS and CONTRACT
+-- §4.1 forbids adding them together: "one is measured and dimensionless, the other
+-- is modelled and in dollars, and a single number carrying both would be
+-- defensible as neither."
+--
+-- Do not, therefore, be tempted to enter a "price per premium request" in the
+-- columns below to make the two commensurate. There is no such column and the cost
+-- formula in CONTRACT §4 has no term for it; a rate invented to bridge the two
+-- would put a number in front of finance that neither source supports. DQ-BILL in
+-- 07_dq_checks.sql scans view definitions for anyone who tries.
+--
+-- The seat component remains invisible from any client and always will — it is a
+-- contract term, not telemetry. Any total presented as spend must state it is
+-- excluded.
 -- =============================================================================
 
 BEGIN TRANSACTION;
