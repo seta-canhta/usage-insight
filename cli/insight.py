@@ -1945,6 +1945,104 @@ def cmd_auto(args: argparse.Namespace) -> int:
             os.remove(LOCK_PATH)
 
 
+
+def cmd_backfill(args: argparse.Namespace) -> int:
+    """Everything on this machine since a date, in one command.
+
+    The six-command sequence this replaces was six commands because each of
+    them is a different reader with a different notion of "since": the journals
+    take a date, `scan` takes a number of days, `pack` takes a range and `ship`
+    takes a flag. A person backfilling a laptop should not have to hold that.
+
+    Safe to run twice. Every event id is derived from the fact it describes
+    rather than minted per run, so a day read, packed and shipped twice is one
+    day at the far end -- the proxy answers 409 to a digest it already holds.
+    """
+    config = require_config()
+    since = args.since
+    try:
+        start = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        raise SystemExit("--since takes a date: YYYY-MM-DD")
+    today = datetime.now(timezone.utc)
+    if start > today:
+        raise SystemExit("--since is in the future")
+    days = max(1, (today - start).days + 1)
+
+    steps: List[Dict[str, Any]] = []
+    problems: List[str] = []
+
+    def run(step: str, fn, ns: argparse.Namespace) -> str:
+        problem, out = _quietly(step, fn, ns)
+        if problem:
+            problems.append(problem)
+            steps.append({"step": step, "ok": False, "detail": problem})
+        else:
+            detail = ""
+            try:
+                payload = json.loads(out.strip().splitlines()[-1])
+                detail = json.dumps({
+                    k: payload[k] for k in
+                    ("events", "written", "already_buffered", "present",
+                     "sessions_read", "sessions", "repos", "commits",
+                     "event_count", "days_covered")
+                    if k in payload}, sort_keys=True)
+            except (ValueError, IndexError):
+                detail = out.strip().splitlines()[-1] if out.strip() else ""
+            steps.append({"step": step, "ok": True, "detail": detail})
+        return out
+
+    # The readers. `--since` is an optimisation for the journal reader and a
+    # requirement for none of them: skipping a journal wrongly costs a re-read,
+    # never a lost day, because ids are deterministic.
+    run("copilot", cmd_copilot, argparse.Namespace(root=None, since=since))
+    run("vscode", cmd_vscode, argparse.Namespace(root=None))
+    run("rtk", cmd_rtk, argparse.Namespace(probe=False))
+    run("collect", cmd_collect, argparse.Namespace(source=None))
+    run("scan", cmd_scan, argparse.Namespace(repo=None, since_days=days))
+
+    until = today.strftime("%Y-%m-%d")
+    packed = run("pack", cmd_pack, argparse.Namespace(
+        window_start=None, window_end=None, since=since, until=until,
+        clear=False))
+
+    bundle = None
+    try:
+        bundle = json.loads(packed.strip().splitlines()[-1])
+    except (ValueError, IndexError):
+        pass
+
+    shipped = None
+    if args.no_ship:
+        pass
+    elif not config.get("endpoint") or not config.get("endpoint_token"):
+        steps.append({"step": "ship", "ok": True,
+                      "detail": "no endpoint -- the bundle is in {}".format(
+                          REPORTS_DIR)})
+    else:
+        shipped = run("ship", cmd_ship, argparse.Namespace(
+            bundle=None, all=True, endpoint=None, token=None, timeout=60,
+            dry_run=args.dry_run))
+
+    print()
+    for step in steps:
+        print("[{}] {:<9} {}".format(
+            "  ok  " if step["ok"] else " FAIL ", step["step"],
+            step.get("detail") or ""))
+    print()
+    if bundle:
+        print("{:,} events, {} day(s), {} -> {}".format(
+            bundle.get("event_count", 0), len(bundle.get("days_covered") or []),
+            since, until))
+    if args.no_ship or args.dry_run:
+        print("Nothing was uploaded. `insight ship --all` sends it.")
+    if problems:
+        print()
+        print("{} step(s) had a problem; the rest still ran.".format(
+            len(problems)), file=sys.stderr)
+    return 0
+
+
 def cmd_schedule(args: argparse.Namespace) -> int:
     import schedule as schedule_mod
 
@@ -2275,21 +2373,17 @@ SEEING WHAT LEAVES
 
 SENDING NOW, AND BACKFILLING
 
-    insight auto --force-ship     collect and upload now, ignoring the hourly
-                                  batch window
+    insight backfill --since 2026-08-01     everything since that day: read,
+                                            packed and sent, in one command
+    insight auto --force-ship               send what is buffered now, without
+                                            waiting for the hourly batch
 
-    Copilot's journals go back as far as they go, and installing this does not
-    start the clock -- the readers see everything already on disk:
+    Installing this does not start the clock -- the readers see every journal
+    already on disk, so a machine with months of history can send all of it.
+    Add --no-ship to pack it and look first.
 
-    insight copilot               every session journal
-    insight vscode                every VS Code chat session
-    insight rtk                   rtk history, if installed
-    insight scan --since-days 90  commit metadata that far back
-    insight pack --since 2026-08-01 --until 2026-08-26
-    insight ship --all
-
-    Re-running any of it is safe. Event ids are derived from the fact, not
-    minted per run, so a day packed twice is one day at the far end.
+    Running it twice is safe. Event ids are derived from the fact rather than
+    minted per run, so a day collected twice is one day at the far end.
 
 CONTROL
 
@@ -2453,6 +2547,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--force-ship", action="store_true",
                    help="upload now, ignoring the batching interval")
     p.set_defaults(func=cmd_auto)
+
+    p = sub.add_parser(
+        "backfill",
+        help="read, pack and send everything on this machine since a date")
+    p.add_argument("--since", required=True, metavar="YYYY-MM-DD",
+                   help="first day to collect")
+    p.add_argument("--no-ship", action="store_true",
+                   help="pack it, upload nothing")
+    p.add_argument("--dry-run", action="store_true",
+                   help="show what would be uploaded, and upload nothing")
+    p.set_defaults(func=cmd_backfill)
 
     p = sub.add_parser(
         "schedule", help="collect hourly instead of remembering to")

@@ -661,7 +661,7 @@ class BitbucketPoller:
         """Deterministic trace id for events with no agent trace of their own.
 
         Groups every event about one entity (a PR, a revert) without inventing
-        an agent run. See pollers/README.md, "Contract notes".
+        an agent run. See CONTRACT.md 2.4.
         """
         return deterministic_id("trc", "bitbucket", self.repo_full_name, *parts)
 

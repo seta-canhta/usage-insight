@@ -5,7 +5,7 @@
         --events exports/jira-PRJ.ndjson --events exports/aio-PRJ.ndjson \\
         --out mapping.json
 
-Column spec: ``importers/README.md``.
+One row is one piece of work; see the header of `load_rows`.
 
 **This importer emits no events, deliberately.** The daily report is
 self-reported, written after the fact, by the people being measured. Counting

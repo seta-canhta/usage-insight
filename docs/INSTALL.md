@@ -72,27 +72,26 @@ insight ship              # send it
 
 ## Sending now, and backfilling
 
-To push without waiting for the hourly batch:
+Installing this does not start the clock. The readers see every journal already
+on disk, so one command sends everything since a date:
+
+```bash
+insight backfill --since 2026-08-01
+```
+
+It runs every reader, packs the range and uploads it, and prints a line per step
+including the ones that found nothing. `--no-ship` packs it and stops so you can
+read it first.
+
+To push what is already buffered without waiting for the hourly batch:
 
 ```bash
 insight auto --force-ship
 ```
 
-Installing this does not start the clock. The readers see every journal already
-on disk, so a machine with months of history can send all of it:
-
-```bash
-insight copilot                  # every Copilot session journal
-insight vscode                   # every VS Code chat session
-insight rtk                      # rtk history, if installed
-insight scan --since-days 90     # commit metadata that far back
-insight pack --since 2026-08-01 --until 2026-08-26
-insight ship --all
-```
-
-Re-running any of it is safe. Event ids are derived from the fact rather than
-minted per run, so a day packed twice arrives as one day. The server answers
-`409` to a bundle it already holds.
+Running either twice is safe. Event ids are derived from the fact rather than
+minted per run, so a day collected twice arrives as one day, and the server
+answers `409` to a bundle it already holds.
 
 ## Controls
 

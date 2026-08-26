@@ -9,7 +9,7 @@
 # It splits the same way the nginx config does, and for the same reason: the
 # upload route is the only one the internet may reach. The read routes list
 # every engineer at once and are reached from the office network or over an SSH
-# tunnel -- see server/README.md.
+# tunnel -- see docs/OPERATE.md.
 
 http:
   middlewares:

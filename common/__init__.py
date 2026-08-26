@@ -1124,7 +1124,7 @@ def build_event(
     Fabricating one would manufacture a join key and breach AR-1. It is
     populated *only* when the underlying commit carries an ``AI-Run-Id`` trailer
     (CONTRACT.md §9), which is also the only case that earns
-    ``link.method = 'explicit'``. See pollers/README.md, "Contract notes".
+    ``link.method = 'explicit'``. See CONTRACT.md 2.4.
     """
     if event_type not in EVENT_TYPES:
         raise ValueError(f"event_type {event_type!r} is not in the CONTRACT.md §3 enum")

@@ -1474,3 +1474,56 @@ class TestHelpCommand(ClientTestCase):
         code, out = self.run_cli()
         self.assertEqual(code, 0)
         self.assertIn("WHAT IT READS", out)
+
+
+class TestBackfill(ClientTestCase):
+    """One command, one date. The six-command sequence it replaces was six
+    commands only because each reader spells "since" differently."""
+
+    def setUp(self):
+        super().setUp()
+        self.init()
+        # No Copilot, no VS Code, no rtk on this machine -- the point is that
+        # backfill reports each of those as a fact and keeps going.
+        for var in ("COPILOT_ROOT", "VSCODE_HOME"):
+            os.environ[var] = os.path.join(self.home, "absent")
+            self.addCleanup(os.environ.pop, var, None)
+
+    def test_a_date_is_required_and_must_be_one(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("backfill", "--since", "last-tuesday")
+
+    def test_a_future_date_is_refused(self):
+        with self.assertRaises(SystemExit):
+            self.run_cli("backfill", "--since", "2099-01-01")
+
+    def test_it_runs_every_reader_and_names_the_ones_with_nothing(self):
+        code, out = self.run_cli("backfill", "--since", "2026-08-01",
+                                 "--no-ship")
+        self.assertEqual(code, 0)
+        for step in ("copilot", "vscode", "rtk", "collect", "scan", "pack"):
+            self.assertIn(step, out)
+        self.assertIn("Nothing was uploaded", out)
+
+    def test_a_reader_that_fails_does_not_stop_the_rest(self):
+        def explode(args):
+            raise RuntimeError("no journal here")
+
+        with mock.patch.object(self.insight, "cmd_vscode", explode):
+            code, out = self.run_cli("backfill", "--since", "2026-08-01",
+                                     "--no-ship")
+        self.assertEqual(code, 0)
+        self.assertIn("FAIL", out)
+        self.assertIn("pack", out)
+
+    def test_running_it_twice_buffers_each_day_once(self):
+        buffered = os.path.join(self.home, "buffer")
+        self.run_cli("backfill", "--since", "2026-08-01", "--no-ship")
+        first = {}
+        for name in os.listdir(buffered):
+            with open(os.path.join(buffered, name)) as handle:
+                first[name] = len(handle.readlines())
+        self.run_cli("backfill", "--since", "2026-08-01", "--no-ship")
+        for name, count in first.items():
+            with open(os.path.join(buffered, name)) as handle:
+                self.assertEqual(len(handle.readlines()), count, name)

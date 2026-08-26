@@ -1,12 +1,12 @@
 #!/usr/bin/env python3
-"""The collection endpoint. Implements ``server/README.md``.
+"""The collection endpoint. Deployment notes: ``docs/OPERATE.md``.
 
     python3 server/proxy.py --store file:///tmp/insight --allowed-file allowed.env
     python3 server/proxy.py --store s3://aeris-insight
 
 Binds **127.0.0.1** by default. Nginx terminates TLS on 443 and exposes exactly
 one route; the read routes stay on loopback and are reached over SSH. See
-``server/nginx.conf.example`` and ``server/README.md``.
+``server/nginx.conf.example`` and ``docs/OPERATE.md``.
 
 Stdlib only, except boto3 for the S3 backend. Fourteen laptops uploading once an
 hour is fourteen requests an hour, so ``ThreadingHTTPServer`` is not a compromise
@@ -448,7 +448,7 @@ class Handler(BaseHTTPRequestHandler):
                 # "what versions of the contract does this speak" is a fact
                 # about a service that belongs in its health check. It is not a
                 # disclosure: KNOWN_SCHEMAS is protocol, published in
-                # server/README.md, and worth nothing to anyone who cannot
+                # docs/OPERATE.md, and worth nothing to anyone who cannot
                 # already authenticate.
                 self._send(200, {"ok": True, "people": len(self.allowed),
                                  "schemas": sorted(KNOWN_SCHEMAS)})
@@ -691,7 +691,7 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     # A second listener that serves uploads and nothing else.
     #
-    # `server/README.md` splits the routes by exposure, not by token: uploading
+    # The routes split by exposure, not by token: uploading
     # has to be reachable from every laptop, and reading exposes the whole team
     # at once. Where a reverse proxy on this host enforces that split, this is
     # not needed. Where the gateway is on *another* machine -- so it cannot

@@ -30,7 +30,7 @@ services:
       # Defaults suit running this from server/ in a checkout. A deployment
       # that keeps its configuration outside the source tree -- so a redeploy
       # cannot overwrite it -- sets these in an .env file and runs compose with
-      # --project-directory; see server/README.md.
+      # --project-directory; see docs/OPERATE.md.
       context: "${INSIGHT_SRC:-..}"
       dockerfile: server/Dockerfile
     image: aeris-insight-proxy:latest
