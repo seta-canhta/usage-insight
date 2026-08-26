@@ -896,8 +896,30 @@ def cmd_setup(args: argparse.Namespace) -> int:
             tail = " && insight ship" if final.get("endpoint") else ""
             print("Then: insight copilot && insight scan && insight pack" + tail)
         if final.get("endpoint_token"):
+            # Registered here rather than printed for somebody to relay. The
+            # fingerprint travels; the secret does not.
+            result = enroll_identity(final)
+            record_enrolment(result)
             print()
-            print_whitelist_line(final)
+            if result.get("ok"):
+                print("Registered with {}. Nothing else to do.".format(
+                    final.get("endpoint")))
+            elif result.get("status") == 403:
+                print("Not registered: nobody is expecting {} at the endpoint "
+                      "yet.".format(final.get("email")))
+                print("Ask whoever runs the pipeline to add it. This retries "
+                      "by itself,")
+                print("so there is nothing to send them and nothing to re-run.")
+            elif result.get("status") == 409:
+                print("Not registered: that address is enrolled from another "
+                      "machine.")
+                print("A replacement laptop needs the old entry reset by "
+                      "whoever runs the pipeline.")
+            else:
+                print("Not registered yet ({}). Collection has started; "
+                      "`insight enroll`".format(
+                          result.get("outcome")))
+                print("retries, and so does every scheduled run.")
     return 0 if all(s.get("ok") for s in steps) else 1
 
 
@@ -1906,6 +1928,16 @@ def cmd_auto(args: argparse.Namespace) -> int:
                   "reason": "no endpoint or no upload secret", "problems": problems})
             return 0
 
+        # Until it sticks. A laptop set up before the admin added the address
+        # would otherwise 401 forever with nobody watching; retrying here costs
+        # one request an hour and turns that into a wait.
+        if not config.get("enrolled_at"):
+            outcome = enroll_identity(config)
+            record_enrolment(outcome)
+            if outcome.get("ok"):
+                _log({"event": "enrolled", "outcome": outcome.get("outcome")})
+                config = load_config() or config
+
         # Collected, sealed, and deliberately held. The bundle stays on disk and
         # the next due run ships the day whole -- `pack` re-seals the same day,
         # so waiting costs nothing but the wait.
@@ -2107,6 +2139,106 @@ def cmd_schedule(args: argparse.Namespace) -> int:
 # --------------------------------------------------------------------------
 # identity
 # --------------------------------------------------------------------------
+
+
+# --------------------------------------------------------------------------
+# enrol -- the step that used to be a person
+# --------------------------------------------------------------------------
+
+def enroll_identity(config: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]:
+    """Register this machine's fingerprint with the endpoint.
+
+    This replaces the worst step in the old setup: read a fingerprint off your
+    screen, send it to an admin over chat, wait for them to edit a file and
+    restart a service, and until all of that happens every upload is a 401 that
+    looks like a bug. The endpoint accepts the first fingerprint offered for an
+    address somebody has put on its roster, so the admin's work is adding an
+    address once -- which they already did, for the coverage report.
+
+    Only ever sends the fingerprint. The secret does not travel, here or
+    anywhere: `identity.py` argues that point at length and this does not make
+    an exception to it.
+    """
+    import identity
+
+    endpoint = config.get("endpoint")
+    email = config.get("email")
+    secret = config.get("endpoint_token")
+    if not endpoint or not email or not secret:
+        return {"ok": False, "outcome": "not_configured"}
+
+    url = endpoint.rstrip("/")
+    url = url[:-len("/v1/bundle")] if url.endswith("/v1/bundle") else url
+    payload = json.dumps({
+        "email": email, "fingerprint": identity.fingerprint(secret),
+    }).encode("utf-8")
+
+    import urllib.error
+    import urllib.request
+    request = urllib.request.Request(
+        url + "/v1/enroll", data=payload, method="POST",
+        headers={"Content-Type": "application/json",
+                 "User-Agent": "insight/" + version_mod.VERSION})
+    # Sent when there is one. A machine that is already enrolled and is
+    # rotating proves who it is this way, and skips the roster entirely.
+    if config.get("endpoint_token_previous") or config.get("enrolled_at"):
+        request.add_header("Authorization", "Bearer " + secret)
+    try:
+        with urllib.request.urlopen(
+                request, timeout=timeout,
+                context=common.ssl_context()) as response:
+            body = json.loads(response.read().decode("utf-8") or "{}")
+            return {"ok": True, "status": response.status,
+                    "outcome": body.get("outcome") or "enrolled"}
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = json.loads(exc.read().decode("utf-8")).get("error") or ""
+        except Exception:  # noqa: BLE001 -- an error page is not JSON
+            pass
+        return {"ok": False, "status": exc.code, "outcome": "rejected",
+                "detail": detail}
+    except Exception as exc:  # noqa: BLE001 -- offline is not a failed setup
+        return {"ok": False, "outcome": "unreachable",
+                "detail": "{}: {}".format(type(exc).__name__, exc)}
+
+
+def record_enrolment(result: Dict[str, Any]) -> None:
+    config = load_config()
+    if config is None or not result.get("ok"):
+        return
+    config["enrolled_at"] = now()
+    write_json(CONFIG_PATH, config)
+    os.chmod(CONFIG_PATH, 0o600)
+
+
+def cmd_enroll(args: argparse.Namespace) -> int:
+    """Register with the endpoint, or say exactly why it did not work."""
+    config = require_config()
+    result = enroll_identity(config)
+    record_enrolment(result)
+    print(json.dumps(result, sort_keys=True))
+    if result.get("ok"):
+        print()
+        print("This machine can upload. Nothing else to do.")
+        return 0
+    if result.get("status") == 403:
+        print()
+        print("Nobody is expecting {} yet. Ask whoever runs the pipeline to "
+              "add it;".format(config.get("email")))
+        print("no fingerprint needs to travel -- this retries by itself on the "
+              "next run.")
+    elif result.get("status") == 409:
+        print()
+        print("That address is enrolled from another machine. A replacement "
+              "laptop needs")
+        print("the old entry reset by whoever runs the pipeline.")
+    elif result.get("outcome") == "unreachable":
+        print()
+        print("The endpoint could not be reached. Collection continues; this "
+              "retries on the next run.")
+    return 0
+
 
 def cmd_whoami(args: argparse.Namespace) -> int:
     """Print the whitelist line again.
@@ -2531,6 +2663,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--dry-run", action="store_true",
                    help="show what would be sent, and send nothing")
     p.set_defaults(func=cmd_ship)
+
+    p = sub.add_parser(
+        "enroll", help="register this machine with the endpoint")
+    p.set_defaults(func=cmd_enroll)
 
     p = sub.add_parser(
         "whoami", help="print the whitelist line to send to the server admin")

@@ -24,14 +24,18 @@ commit hook that records which agent run produced each commit. `insight setup
 --no-schedule`, `--no-auto-update` and `--no-commit-hook` opt out, and each is
 reversible afterwards.
 
-Setup ends by printing one line:
+Setup then registers this machine with the endpoint by itself and says so:
 
 ```
-you@seta-international.vn:a3f19c...
+Registered with https://aeris-insight.seta-international.com. Nothing else to do.
 ```
 
-Send it to whoever runs the pipeline. It is a fingerprint, not the secret. The
-secret stays in `~/.seta-insight/` and never leaves the machine.
+Only a fingerprint travels. The secret stays in `~/.seta-insight/` and never
+leaves the machine.
+
+If it says nobody is expecting your address yet, that is a wait, not an errand:
+ask whoever runs the pipeline to add it, and every scheduled run retries until
+it sticks. `insight enroll` retries on demand.
 
 You do not register repositories. Copilot records the git root of every session,
 so `insight scan` finds them.
@@ -100,7 +104,7 @@ answers `409` to a bundle it already holds.
 | | |
 |---|---|
 | `insight status` | what is buffered, and what has been uploaded |
-| `insight whoami` | your allow-list line, again |
+| `insight enroll` | register with the endpoint again |
 | `insight rotate-token` | replace the upload secret; uploads keep working |
 | `insight schedule --off` | stop the automatic run |
 | `insight purge --yes` | delete every event and bundle held here |
@@ -134,7 +138,7 @@ already uploaded. Ask whoever runs the pipeline to remove an uploaded bundle.
 | `python3 is too old` | needs 3.9+. Install one, or `INSIGHT_PYTHON=/path/to/python3 sh install.sh` |
 | `checksum mismatch` | nothing was installed. Do not retry; report it |
 | `insight: command not found` | add `export PATH="$HOME/.local/bin:$PATH"` to your shell rc |
-| `401 not on the whitelist` | your line has not reached the server yet. `insight whoami` prints it again |
+| `401 not on the whitelist` | this machine is not registered. `insight enroll` says why |
 | certificate cannot be verified | on a python.org macOS build, run `/Applications/Python 3.x/Install Certificates.command` |
 
 A failed upload does not lose the bundle. It stays in `~/.seta-insight/.reports/`

@@ -129,6 +129,7 @@ commit message, not a new markdown file.
 for s in pollers report collector cli importers server; do
   python3 -m unittest discover -s $s/tests
 done
+python3 -m unittest discover -s tests        # admin.py
 ```
 
 All suites must pass before anything ships.

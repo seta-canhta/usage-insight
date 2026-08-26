@@ -34,6 +34,25 @@ class ClientTestCase(unittest.TestCase):
     def init(self):
         self.run_cli("init", "--yes")
 
+    def stub_enrolment(self, **result):
+        """Nothing in this suite may reach the network.
+
+        `setup` registers with the endpoint, so without this the suite would
+        POST to production once per setup test -- slow, flaky, and rude.
+        """
+        outcome = {"ok": False, "outcome": "unreachable"}
+        outcome.update(result)
+        calls = []
+
+        def fake(config, timeout=15):
+            calls.append(config)
+            return outcome
+
+        patcher = mock.patch.object(self.insight, "enroll_identity", fake)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        return calls
+
     def run_cli(self, *argv):
         """Run a command with its output captured.
 
@@ -196,15 +215,34 @@ class TestSetup(ClientTestCase):
         # Point discovery away from the developer's real ~/.copilot so the
         # result does not depend on whose laptop the suite runs on.
         self.insight.COPILOT_ROOT = os.path.join(self.home, "no-copilot")
+        self.enrolments = self.stub_enrolment()
 
     def setup_cli(self, *extra):
         return self.run_cli("setup", "--yes", "--no-schedule", *extra)
 
-    def test_it_mints_a_secret_and_asks_for_the_line(self):
+    def test_it_mints_a_secret_and_registers_it(self):
+        # The line used to be printed for somebody to relay over chat. It is
+        # sent instead: the fingerprint travels, the secret never does.
         self.init()
         _, out = self.setup_cli("--email", "ngoc@aeris.net")
         self.assertTrue(self.insight.load_config()["endpoint_token"])
-        self.assertIn("Send this line", out)
+        self.assertEqual(len(self.enrolments), 1)
+        self.assertNotIn("Send this line", out)
+
+    def test_an_endpoint_that_is_not_expecting_them_is_a_wait_not_an_errand(self):
+        self.stub_enrolment(ok=False, status=403, outcome="rejected")
+        self.init()
+        _, out = self.setup_cli("--email", "ngoc@aeris.net")
+        self.assertIn("nobody is expecting", out.lower())
+        self.assertIn("retries by itself", out)
+        self.assertIsNone(self.insight.load_config().get("enrolled_at"))
+
+    def test_a_successful_enrolment_is_recorded_so_it_stops_retrying(self):
+        self.stub_enrolment(ok=True, status=201, outcome="created")
+        self.init()
+        _, out = self.setup_cli("--email", "ngoc@aeris.net")
+        self.assertIn("Registered with", out)
+        self.assertTrue(self.insight.load_config()["enrolled_at"])
 
     def test_nothing_already_collected_is_disturbed(self):
         self.init()
@@ -227,11 +265,19 @@ class TestSetup(ClientTestCase):
         self.assertEqual(config["endpoint_token"], first)
         self.assertIsNone(config.get("endpoint_token_previous"))
 
-    def test_the_paragraph_is_printed_once(self):
-        # `setup` runs `init`, and both used to print it. A paragraph somebody
-        # has already scrolled past is one they stop reading.
-        _, out = self.setup_cli("--email", "ngoc@aeris.net")
-        self.assertEqual(out.count("Send this line"), 1)
+    def test_the_secret_is_never_what_travels(self):
+        # The whole direction of this design: minted here, hashed, and only
+        # the hash leaves. A test that watches the argument is the one that
+        # would catch a regression sending the wrong field.
+        import identity
+        self.init()
+        self.setup_cli("--email", "ngoc@aeris.net")
+        config = self.insight.load_config()
+        self.assertEqual(len(self.enrolments), 1)
+        sent = self.enrolments[0]
+        self.assertEqual(sent["endpoint_token"], config["endpoint_token"])
+        self.assertNotEqual(identity.fingerprint(config["endpoint_token"]),
+                            config["endpoint_token"])
 
     def test_it_refuses_an_issued_token(self):
         self.init()

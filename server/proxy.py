@@ -48,6 +48,7 @@ for _p in (os.path.join(_ROOT, "cli"), _HERE):
         sys.path.insert(0, _p)
 
 import identity  # noqa: E402  -- the client's own whitelist rules, not a copy
+import registry as registry_mod  # noqa: E402
 import store as store_mod  # noqa: E402
 
 #: Matches the client's own cap in ``cli/ship.py``. Both sides agreeing is what
@@ -102,14 +103,14 @@ def object_key(email: str, window_start: str, machine: str, digest: str) -> str:
 
 
 def check_upload(headers: Dict[str, str], body: bytes,
-                 allowed: Dict[str, List[str]]) -> Tuple[str, str, str]:
+                 people: Any) -> Tuple[str, str, str]:
     """Authenticate and validate. Returns ``(email, key, digest)`` or raises.
 
     Order matters: identity first, so an unknown caller is turned away before
     the process spends anything on their body.
     """
     secret = _bearer(headers)
-    email = identity.identify(secret, allowed)
+    email = people.identify(secret)
     if email is None:
         # 401, not 403. `ship` retries a 401 with its previous secret, because
         # that is exactly what a rotation in flight looks like -- the new
@@ -307,9 +308,10 @@ class Handler(BaseHTTPRequestHandler):
 
     # Injected by serve()
     store: Any = None
-    allowed: Dict[str, List[str]] = {}
+    #: A ``registry.Registry`` -- the whitelist and the roster, reloaded when
+    #: either file changes so an enrolment is live without a restart.
+    people: Any = None
     admin_token: str = ""
-    by_person_key: Dict[str, str] = {}
     #: False on a listener that faces the internet. See ``serve_upload_only``.
     read_routes: bool = True
     #: ``install.sh``, read at startup. None means the route 404s.
@@ -410,7 +412,7 @@ class Handler(BaseHTTPRequestHandler):
             if urlparse(self.path).path != "/v1/bundle":
                 raise Rejected(404, "no such route")
             body = self._read_body()
-            email, key, digest = check_upload(self._headers(), body, self.allowed)
+            email, key, digest = check_upload(self._headers(), body, self.people)
 
             result = {"key": key, "sha256": digest, "bytes": len(body)}
             try:
@@ -439,6 +441,135 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("unhandled error on PUT")
             self._send(500, {"error": "internal error"})
 
+
+    # -- enrolment --------------------------------------------------------
+
+    def do_POST(self) -> None:     # noqa: N802
+        try:
+            path = urlparse(self.path).path
+            if path == "/v1/enroll":
+                self._enroll()
+                return
+            if path == "/v1/people":
+                self._require_admin()
+                self._add_person()
+                return
+            if path == "/v1/people/reset":
+                self._require_admin()
+                self._reset_person()
+                return
+            raise Rejected(404, "no such route")
+        except Rejected as exc:
+            self._reject(exc)
+        except registry_mod.RegistryError as exc:
+            self._reject(Rejected(400, str(exc)))
+        except Exception:                              # noqa: BLE001
+            log.exception("unhandled error on POST")
+            self._send(500, {"error": "internal error"})
+
+    def do_DELETE(self) -> None:   # noqa: N802
+        try:
+            parsed = urlparse(self.path)
+            if parsed.path != "/v1/people":
+                raise Rejected(404, "no such route")
+            self._require_admin()
+            email = (parse_qs(parsed.query).get("email") or [""])[0]
+            if not email:
+                raise Rejected(400, "email is required")
+            outcome = self.people.remove_person(email)
+            log.info(json.dumps({"event": "person_removed", "person": email,
+                                 "outcome": outcome}, sort_keys=True))
+            self._send(200 if outcome == "removed" else 404,
+                       {"email": email.lower(), "outcome": outcome,
+                        "detail": "bundles already stored are not deleted -- "
+                                  "that is a retention decision"})
+        except Rejected as exc:
+            self._reject(exc)
+        except registry_mod.RegistryError as exc:
+            self._reject(Rejected(400, str(exc)))
+        except Exception:                              # noqa: BLE001
+            log.exception("unhandled error on DELETE")
+            self._send(500, {"error": "internal error"})
+
+    def _json_body(self) -> Dict[str, Any]:
+        body = self._read_body()
+        if not body:
+            raise Rejected(400, "empty body")
+        try:
+            payload = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise Rejected(400, "body is not JSON")
+        if not isinstance(payload, dict):
+            raise Rejected(400, "body is not a JSON object")
+        return payload
+
+    def _enroll(self) -> None:
+        """A laptop registering its own fingerprint. No admin in the loop.
+
+        Two callers, told apart by whether they can already prove who they are.
+        A machine holding a working secret is rotating, and needs no roster
+        check. A machine with no secret yet is enrolling for the first time,
+        and is only accepted for an address somebody put on the roster.
+        """
+        payload = self._json_body()
+        email = str(payload.get("email") or "").strip().lower()
+        fingerprint = str(payload.get("fingerprint") or "").strip().lower()
+        if not email or not fingerprint:
+            raise Rejected(400, "email and fingerprint are required")
+
+        known = self.people.identify(_bearer(self._headers()))
+        if known:
+            if known != email:
+                raise Rejected(403, "that secret belongs to a different person")
+            outcome = self.people.rotate(email, fingerprint)
+            log.info(json.dumps({"event": "enrolled", "person": email,
+                                 "outcome": outcome}, sort_keys=True))
+            self._send(200, {"email": email, "outcome": outcome})
+            return
+
+        outcome = self.people.enroll(email, fingerprint)
+        log.info(json.dumps({"event": "enrolled", "person": email,
+                             "outcome": outcome}, sort_keys=True))
+        if outcome == "not_rostered":
+            raise Rejected(403,
+                           "{} is not expected by this endpoint. Whoever runs "
+                           "the pipeline adds an address once, and then any "
+                           "machine of theirs enrols itself.".format(email))
+        if outcome == "taken":
+            raise Rejected(409,
+                           "{} is already enrolled with a different machine. A "
+                           "replacement laptop needs that entry reset.".format(
+                               email))
+        self._send(201 if outcome == "created" else 200,
+                   {"email": email, "outcome": outcome})
+
+    def _add_person(self) -> None:
+        payload = self._json_body()
+        emails = payload.get("emails")
+        if not emails:
+            emails = [payload.get("email")]
+        results = []
+        for raw in emails:
+            outcome = self.people.add_person(str(raw or ""))
+            results.append({"email": str(raw).strip().lower(),
+                            "outcome": outcome})
+        log.info(json.dumps({"event": "people_added", "results": results},
+                            sort_keys=True))
+        self._send(201, {"results": results,
+                         "detail": "their machines enrol themselves on the "
+                                   "next collection run"})
+
+    def _reset_person(self) -> None:
+        payload = self._json_body()
+        email = str(payload.get("email") or "").strip().lower()
+        if not email:
+            raise Rejected(400, "email is required")
+        outcome = self.people.reset(email)
+        log.info(json.dumps({"event": "person_reset", "person": email,
+                             "outcome": outcome}, sort_keys=True))
+        self._send(200 if outcome == "reset" else 404,
+                   {"email": email, "outcome": outcome})
+
     def do_GET(self) -> None:      # noqa: N802
         try:
             parsed = urlparse(self.path)
@@ -450,7 +581,7 @@ class Handler(BaseHTTPRequestHandler):
                 # disclosure: KNOWN_SCHEMAS is protocol, published in
                 # docs/OPERATE.md, and worth nothing to anyone who cannot
                 # already authenticate.
-                self._send(200, {"ok": True, "people": len(self.allowed),
+                self._send(200, {"ok": True, "people": self.people.count(),
                                  "schemas": sorted(KNOWN_SCHEMAS)})
                 return
 
@@ -517,6 +648,17 @@ class Handler(BaseHTTPRequestHandler):
 
             self._require_admin()
 
+            if parsed.path == "/v1/people":
+                self._require_admin()
+                people = self.people.people()
+                self._send(200, {
+                    "people": people,
+                    "expected": sum(1 for p in people if p["on_roster"]),
+                    "enrolled": sum(1 for p in people if p["enrolled"]),
+                    "waiting": [p["email"] for p in people
+                                if p["on_roster"] and not p["enrolled"]]})
+                return
+
             if parsed.path == "/v1/bundles":
                 week = (parse_qs(parsed.query).get("week") or [""])[0]
                 if not _is_week(week):
@@ -571,7 +713,7 @@ class Handler(BaseHTTPRequestHandler):
         lets `pull.py` say *missing: lan@...* instead of a hash nobody knows.
         """
         parts = key.split("/")
-        return self.by_person_key.get(parts[2]) if len(parts) > 2 else None
+        return self.people.email_for_person_key(parts[2]) if len(parts) > 2 else None
 
 
 def _machine_from(key: str) -> str:
@@ -608,15 +750,18 @@ def _now() -> str:
 
 # --------------------------------------------------------------------------
 
-def build_handler(store: Any, allowed: Dict[str, List[str]],
+def build_handler(store: Any, people: Any,
                   admin_token: str, read_routes: bool = True,
                   install_script: Optional[bytes] = None,
                   manifest: Optional[bytes] = None) -> type:
+    if isinstance(people, dict):
+        # A plain whitelist still works, for a deployment with no files to
+        # write to and no enrolment. It just cannot grow by itself.
+        people = registry_mod.Registry(allowed=people)
     return type("BoundHandler", (Handler,), {
         "store": store,
-        "allowed": allowed,
+        "people": people,
         "admin_token": admin_token,
-        "by_person_key": {identity.person_key(e): e for e in allowed},
         "read_routes": read_routes,
         "install_script": install_script,
         "install_manifest": manifest if manifest is not None
@@ -641,6 +786,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="a second listener serving uploads and /healthz "
                              "only. Publish this one when the reverse proxy is "
                              "on another machine and forwards every path")
+    parser.add_argument("--roster-file",
+                        default=os.environ.get("INSIGHT_ROSTER_FILE"),
+                        help="one work email per line: who is expected to "
+                             "report. A machine may enrol itself against an "
+                             "address on this list, which is what removes the "
+                             "fingerprint-by-chat step")
     parser.add_argument("--allowed-file", default=os.environ.get("INSIGHT_ALLOWED_FILE"),
                         help="file of email:fingerprint lines")
     parser.add_argument("--install-script",
@@ -666,7 +817,21 @@ def main(argv: Optional[List[str]] = None) -> int:
     install_script = load_install_script(args.install_script)
     manifest = install_manifest(install_script)
 
-    allowed = load_allowed(os.environ.get("INSIGHT_ALLOWED"), args.allowed_file)
+    # A roster makes the endpoint self-enrolling: an address on it accepts the
+    # first fingerprint offered for it, so nobody has to relay one by hand.
+    # Without a roster this behaves exactly as it did -- the whitelist is
+    # whatever the file says and enrolment 403s.
+    people = registry_mod.Registry(
+        allowed_path=args.allowed_file,
+        roster_path=args.roster_file,
+        allowed=(identity.parse_whitelist(os.environ["INSIGHT_ALLOWED"])
+                 if os.environ.get("INSIGHT_ALLOWED") and not args.allowed_file
+                 else None))
+    if not people.count() and not people.people():
+        raise SystemExit(
+            "no whitelist and no roster -- set INSIGHT_ALLOWED_FILE and "
+            "INSIGHT_ROSTER_FILE (one work email per line; machines enrol "
+            "themselves against it), or INSIGHT_ALLOWED for a fixed list.")
     try:
         store = store_mod.open_store(args.store)
     except store_mod.StoreError as exc:
@@ -679,11 +844,11 @@ def main(argv: Optional[List[str]] = None) -> int:
                       "designed to sit behind nginx on loopback"}))
 
     server = ThreadingHTTPServer((args.host, args.port), build_handler(
-        store, allowed, admin_token, install_script=install_script,
+        store, people, admin_token, install_script=install_script,
         manifest=manifest))
     log.info(json.dumps({"event": "listening", "host": args.host,
                          "port": args.port, "store": args.store,
-                         "people": len(allowed),
+                         "people": people.count(),
                          "install_script": bool(install_script),
                          "serving_version": json.loads(manifest)["version"]
                          if manifest else None},
@@ -709,7 +874,7 @@ def main(argv: Optional[List[str]] = None) -> int:
                 "one of them serves the read routes and the other does not")
         upload_server = ThreadingHTTPServer(
             (args.host, args.upload_port),
-            build_handler(store, allowed, admin_token, read_routes=False,
+            build_handler(store, people, admin_token, read_routes=False,
                           install_script=install_script, manifest=manifest))
         threading.Thread(target=upload_server.serve_forever, daemon=True).start()
         log.info(json.dumps({"event": "listening_upload_only",

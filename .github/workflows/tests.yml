@@ -139,6 +139,8 @@ jobs:
             echo "--- $suite"
             python3 -m unittest discover -s "$suite/tests"
           done
+          echo "--- admin"
+          python3 -m unittest discover -s tests
 
       # The client ships as one file, so the packaged form is the form that
       # runs on fourteen laptops -- and three of the ways it can break are

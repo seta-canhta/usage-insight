@@ -3,6 +3,39 @@
 Four stages: laptops collect, the endpoint receives, importers pull a week, the
 report and the warehouse read it.
 
+## 0. The admin CLI
+
+Everything below is reachable through one command. Put the endpoint's admin
+token in `.admin.env` beside the repo (`chmod 600`; it is gitignored):
+
+```
+INSIGHT_ADMIN_TOKEN=...
+INSIGHT_ENDPOINT=http://127.0.0.1:8479
+```
+
+```bash
+./admin.py people                        # who is expected, who has arrived
+./admin.py add ngoc@seta-international.vn
+./admin.py reset ngoc@...                # replacement laptop
+./admin.py remove ngoc@...               # revoke
+./admin.py pull --week 2026-W35          # or --month 2026-08
+```
+
+**Nobody relays a fingerprint and nobody restarts the service.** `add` puts an
+address on the roster; that person's machine registers itself on its next
+collection run and can upload immediately. The whitelist and roster are still
+files, and a hand edit to either is picked up without a restart.
+
+`pull` writes `reports/<name>/exports/*.ndjson`, a `roster.txt` of who was
+expected, and an empty `reports/<name>/daily/` to drop the daily report into.
+Then write the report with the `weekly-report` skill.
+
+The read routes are not public, so open the tunnel first:
+
+```bash
+ssh -N -L 8479:127.0.0.1:8479 <host> &
+```
+
 ## 1. The endpoint
 
 ```bash
@@ -17,7 +50,8 @@ prints.
 |---|---|
 | `INSIGHT_STORE` | `s3://bucket/prefix` or `file:///path` |
 | `INSIGHT_ADMIN_TOKEN` | required, no default; guards the read routes |
-| `INSIGHT_ALLOWED_FILE` | the whitelist, one line per engineer |
+| `INSIGHT_ALLOWED_FILE` | the whitelist, one line per engineer. Written by the endpoint on enrolment, so it must be writable |
+| `INSIGHT_ROSTER_FILE` | one work email per line: who is expected. A machine may enrol itself against an address on this list. Without it, enrolment is off and the whitelist is whatever the file says |
 | `INSIGHT_HOST` / `INSIGHT_PORT` | default `127.0.0.1:8479` |
 | `INSIGHT_UPLOAD_PORT` | optional second listener: uploads and `/healthz` only |
 | `AWS_REGION` and credentials | standard boto3 resolution; prefer an instance role |
@@ -153,4 +187,5 @@ Three things that will otherwise produce a wrong number:
 for s in pollers report collector cli importers server; do
   python3 -m unittest discover -s $s/tests
 done
+python3 -m unittest discover -s tests
 ```

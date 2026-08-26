@@ -30,6 +30,7 @@ for _p in (_SERVER, os.path.join(_ROOT, "cli")):
 
 import identity  # noqa: E402
 import proxy as proxy_mod  # noqa: E402
+import registry as registry_mod
 import store as store_mod  # noqa: E402
 
 ADMIN = "admin-token-for-tests"
@@ -655,3 +656,166 @@ class TraversalTests(ProxyTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EnrolmentTests(unittest.TestCase):
+    """A laptop registers itself. Nobody relays a fingerprint over chat."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="insight-enroll-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+        self.allowed_path = os.path.join(self.tmp, "allowed.env")
+        self.roster_path = os.path.join(self.tmp, "roster.txt")
+        with open(self.roster_path, "w", encoding="utf-8") as handle:
+            handle.write("# who is expected\n{}\n".format(CANH))
+        self.people = registry_mod.Registry(
+            allowed_path=self.allowed_path, roster_path=self.roster_path)
+        self.store = store_mod.FileStore(os.path.join(self.tmp, "store"))
+        handler = proxy_mod.build_handler(self.store, self.people, ADMIN)
+        self.httpd = ThreadingHTTPServer(("127.0.0.1", 0), handler)
+        self.base = "http://127.0.0.1:{}".format(self.httpd.server_address[1])
+        threading.Thread(target=self.httpd.serve_forever, daemon=True).start()
+        self.addCleanup(self.httpd.server_close)
+        self.addCleanup(self.httpd.shutdown)
+
+    def call(self, method, path, payload=None, token=None):
+        headers = {"Content-Type": "application/json"}
+        if token:
+            headers["Authorization"] = "Bearer " + token
+        body = json.dumps(payload).encode() if payload is not None else None
+        request = urllib.request.Request(
+            self.base + path, data=body, headers=headers, method=method)
+        try:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.status, json.loads(response.read() or b"{}")
+        except urllib.error.HTTPError as exc:
+            return exc.code, json.loads(exc.read() or b"{}")
+
+    def enroll(self, email, secret, token=None):
+        return self.call("POST", "/v1/enroll",
+                         {"email": email,
+                          "fingerprint": identity.fingerprint(secret)},
+                         token=token)
+
+    # -- the path that replaces a person ----------------------------------
+
+    def test_someone_on_the_roster_enrols_and_can_upload_immediately(self):
+        secret = identity.mint_secret()
+        status, body = self.enroll(CANH, secret)
+        self.assertEqual(status, 201)
+        self.assertEqual(body["outcome"], "created")
+        # No restart, no reload command: the upload path sees it at once.
+        self.assertEqual(self.people.identify(secret), CANH)
+
+    def test_it_is_written_down_so_a_restart_does_not_forget(self):
+        secret = identity.mint_secret()
+        self.enroll(CANH, secret)
+        reopened = registry_mod.Registry(allowed_path=self.allowed_path,
+                                         roster_path=self.roster_path)
+        self.assertEqual(reopened.identify(secret), CANH)
+
+    def test_re_running_setup_is_not_an_error(self):
+        secret = identity.mint_secret()
+        self.enroll(CANH, secret)
+        status, body = self.enroll(CANH, secret)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["outcome"], "known")
+
+    # -- what it refuses ---------------------------------------------------
+
+    def test_an_address_nobody_expects_is_refused(self):
+        status, body = self.enroll(MINH, identity.mint_secret())
+        self.assertEqual(status, 403)
+        self.assertIn("not expected", body["error"])
+
+    def test_knowing_a_colleagues_address_is_not_enough_to_upload_as_them(self):
+        # Trust on first use. Once an entry exists, a second fingerprint for
+        # the same person needs an admin -- otherwise the roster alone would
+        # be the credential.
+        theirs = identity.mint_secret()
+        self.enroll(CANH, theirs)
+        impostor = identity.mint_secret()
+        status, _ = self.enroll(CANH, impostor)
+        self.assertEqual(status, 409)
+        self.assertIsNone(self.people.identify(impostor))
+        self.assertEqual(self.people.identify(theirs), CANH)
+
+    def test_a_fingerprint_that_is_not_a_digest_is_refused(self):
+        status, _ = self.call("POST", "/v1/enroll",
+                              {"email": CANH, "fingerprint": "../../etc/passwd"})
+        self.assertEqual(status, 400)
+
+    # -- rotation ----------------------------------------------------------
+
+    def test_a_machine_holding_a_working_secret_may_rotate_itself(self):
+        first = identity.mint_secret()
+        self.enroll(CANH, first)
+        second = identity.mint_secret()
+        status, body = self.enroll(CANH, second, token=first)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["outcome"], "rotated")
+        # Both work through the window, which is what lets a rotation finish
+        # without the two sides changing in the same minute.
+        self.assertEqual(self.people.identify(second), CANH)
+        self.assertEqual(self.people.identify(first), CANH)
+
+    def test_a_secret_cannot_rotate_somebody_else(self):
+        mine = identity.mint_secret()
+        self.enroll(CANH, mine)
+        self.people.add_person(MINH)
+        status, _ = self.enroll(MINH, identity.mint_secret(), token=mine)
+        self.assertEqual(status, 403)
+
+    # -- the admin routes --------------------------------------------------
+
+    def test_an_admin_adds_a_person_over_http_not_by_editing_a_file(self):
+        status, body = self.call("POST", "/v1/people", {"email": MINH},
+                                 token=ADMIN)
+        self.assertEqual(status, 201)
+        self.assertEqual(body["results"][0]["outcome"], "added")
+        self.assertEqual(self.enroll(MINH, identity.mint_secret())[0], 201)
+
+    def test_adding_people_needs_the_admin_token(self):
+        status, _ = self.call("POST", "/v1/people", {"email": MINH})
+        self.assertEqual(status, 401)
+
+    def test_listing_says_who_is_expected_and_has_not_arrived(self):
+        self.call("POST", "/v1/people", {"email": MINH}, token=ADMIN)
+        self.enroll(CANH, identity.mint_secret())
+        status, body = self.call("GET", "/v1/people", token=ADMIN)
+        self.assertEqual(status, 200)
+        self.assertEqual(body["expected"], 2)
+        self.assertEqual(body["enrolled"], 1)
+        self.assertEqual(body["waiting"], [MINH])
+
+    def test_listing_needs_the_admin_token(self):
+        self.assertEqual(self.call("GET", "/v1/people")[0], 401)
+
+    def test_a_replacement_laptop_is_a_reset_not_a_fingerprint(self):
+        old = identity.mint_secret()
+        self.enroll(CANH, old)
+        status, _ = self.call("POST", "/v1/people/reset", {"email": CANH},
+                              token=ADMIN)
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.people.identify(old))
+        new = identity.mint_secret()
+        self.assertEqual(self.enroll(CANH, new)[0], 201)
+
+    def test_removing_someone_stops_uploads_and_says_data_is_not_deleted(self):
+        secret = identity.mint_secret()
+        self.enroll(CANH, secret)
+        status, body = self.call(
+            "DELETE", "/v1/people?email=" + CANH, token=ADMIN)
+        self.assertEqual(status, 200)
+        self.assertIsNone(self.people.identify(secret))
+        self.assertIn("not deleted", body["detail"])
+        # Off the roster too, so they cannot simply enrol again.
+        self.assertEqual(self.enroll(CANH, identity.mint_secret())[0], 403)
+
+    def test_a_hand_edited_file_is_still_obeyed_without_a_restart(self):
+        # The whole point of keeping these as files: an operator who edits one
+        # does not have to be told about an API.
+        secret = identity.mint_secret()
+        with open(self.allowed_path, "w", encoding="utf-8") as handle:
+            handle.write(identity.whitelist_line(MINH, secret) + "\n")
+        self.assertEqual(self.people.identify(secret), MINH)

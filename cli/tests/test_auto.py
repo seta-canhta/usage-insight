@@ -43,6 +43,16 @@ class AutoTestCase(unittest.TestCase):
         for name in ("SETA_INSIGHT_HOME", "SETA_INSIGHT_ENDPOINT",
                      "COPILOT_HOME", "VSCODE_HOME"):
             self.addCleanup(os.environ.pop, name, None)
+        # `auto` registers with the endpoint until it sticks. endpoint.test
+        # does not exist, so left alone every test here would wait out a DNS
+        # failure -- and on a machine where it *did* resolve, worse.
+        self.enrolments = []
+        patcher = unittest.mock.patch.object(
+            insight, "enroll_identity",
+            lambda config, timeout=15: (self.enrolments.append(config) or
+                                        {"ok": True, "outcome": "created"}))
+        patcher.start()
+        self.addCleanup(patcher.stop)
 
     def run_cli(self, *argv):
         buffer = io.StringIO()

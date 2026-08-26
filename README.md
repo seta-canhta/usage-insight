@@ -4,8 +4,9 @@ Measures how much AI assistance contributes to QA test automation, by reading
 systems that already record the work: Copilot's own journals on the laptop,
 Jira, Bitbucket, and AIO TCMS.
 
-Output is one Markdown report a week. Sample:
-[`reports/2026-W34/weekly-2026-W34.md`](reports/2026-W34/weekly-2026-W34.md).
+Output is one Markdown report a week, written to `reports/<week>/`. That
+directory is gitignored -- the reports name individuals and carry live issue
+keys.
 
 The ten metrics it exists to produce, and which ones are actually live today,
 are in [`docs/METRICS.md`](docs/METRICS.md). Read that before quoting a number.
@@ -18,11 +19,10 @@ On an engineer's laptop, one command:
 curl -fsSL https://aeris-insight.seta-international.com/install | sh
 ```
 
-It installs, then asks for a work email and nothing else. Automatic collection,
-self-update and the commit hook are on by default; each has a flag to turn it
-off and each is reversible later. It ends by printing one `email:fingerprint`
-line to send to whoever runs the pipeline. That line is a hash; the secret stays
-on the machine.
+It installs, then asks for a work email and nothing else. The machine registers
+itself with the endpoint -- no fingerprint to relay, no admin to wait for, as
+long as the address is on the roster. Automatic collection, self-update and the
+commit hook are on by default; each has a flag to turn it off.
 
 Python 3.9+, standard library only. The whole client is one zipapp.
 
@@ -87,4 +87,5 @@ so those fields stay NULL.
 for s in pollers report collector cli importers server; do
   python3 -m unittest discover -s $s/tests
 done
+python3 -m unittest discover -s tests
 ```
