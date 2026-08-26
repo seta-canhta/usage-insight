@@ -842,3 +842,89 @@ class DockerfileTests(unittest.TestCase):
                 continue
             self.assertIn("server/" + name, text,
                           "{} is not COPYd into the image".format(name))
+
+
+class ProjectTests(unittest.TestCase):
+    """A project is a team and the Jira boards its work lives on.
+
+    It exists for one reason: a laptop cannot know which project keys are real,
+    and a reader that does not know invents them. Measured 2026-08-26,
+    `fix/AUG-25` became ticket "AUG-25" on 28 of 28 events from one machine.
+    """
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp(prefix="registry-projects-")
+        self.addCleanup(shutil.rmtree, self.dir, ignore_errors=True)
+        self.allowed = os.path.join(self.dir, "allowed.env")
+        self.roster = os.path.join(self.dir, "roster.txt")
+        self.projects = os.path.join(self.dir, "projects.env")
+        with open(self.roster, "w", encoding="utf-8") as handle:
+            handle.write("ngoc.nguyen@aeris.net\nlinh.hoang@aeris.net\n")
+        self.registry = registry_mod.Registry(
+            allowed_path=self.allowed, roster_path=self.roster,
+            projects_path=self.projects)
+
+    def test_a_member_is_told_their_boards(self):
+        self.registry.set_project(
+            "WatchtowerQD", ["IML", "APR", "AERLABS"],
+            ["ngoc.nguyen@aeris.net", "linh.hoang@aeris.net"])
+        self.assertEqual(self.registry.boards_for("ngoc.nguyen@aeris.net"),
+                         ["AERLABS", "APR", "IML"])
+
+    def test_someone_on_no_project_is_told_nothing_not_everything(self):
+        """Empty is safe: an empty allow-list emits no key rather than any."""
+        self.registry.set_project("WatchtowerQD", ["IML"],
+                                  ["ngoc.nguyen@aeris.net"])
+        self.assertEqual(self.registry.boards_for("stranger@aeris.net"), [])
+
+    def test_boards_are_upper_cased_and_members_lower_cased(self):
+        self.registry.set_project("WatchtowerQD", ["iml", "Apr"],
+                                  ["Ngoc.Nguyen@Aeris.net"])
+        self.assertEqual(self.registry.boards_for("ngoc.nguyen@aeris.net"),
+                         ["APR", "IML"])
+
+    def test_a_second_project_onboards_without_touching_the_first(self):
+        self.registry.set_project("WatchtowerQD", ["IML"],
+                                  ["ngoc.nguyen@aeris.net"])
+        self.registry.set_project("Nightwatch", ["AERLABS"],
+                                  ["linh.hoang@aeris.net"])
+        self.assertEqual(self.registry.boards_for("ngoc.nguyen@aeris.net"),
+                         ["IML"])
+        self.assertEqual(self.registry.boards_for("linh.hoang@aeris.net"),
+                         ["AERLABS"])
+        self.assertEqual(sorted(self.registry.projects()),
+                         ["Nightwatch", "WatchtowerQD"])
+
+    def test_someone_on_two_projects_gets_the_union(self):
+        """A person really can work across teams. Narrowing would drop keys."""
+        self.registry.set_project("WatchtowerQD", ["IML"],
+                                  ["ngoc.nguyen@aeris.net"])
+        self.registry.set_project("Nightwatch", ["AERLABS"],
+                                  ["ngoc.nguyen@aeris.net"])
+        self.assertEqual(self.registry.boards_for("ngoc.nguyen@aeris.net"),
+                         ["AERLABS", "IML"])
+
+    def test_setting_a_project_replaces_rather_than_merges(self):
+        """An admin removing a board means it."""
+        self.registry.set_project("WatchtowerQD", ["IML", "APR"],
+                                  ["ngoc.nguyen@aeris.net"])
+        self.registry.set_project("WatchtowerQD", ["IML"],
+                                  ["ngoc.nguyen@aeris.net"])
+        self.assertEqual(self.registry.boards_for("ngoc.nguyen@aeris.net"),
+                         ["IML"])
+
+    def test_a_hand_edit_is_picked_up_without_a_restart(self):
+        self.registry.set_project("WatchtowerQD", ["IML"],
+                                  ["ngoc.nguyen@aeris.net"])
+        with open(self.projects, "w", encoding="utf-8") as handle:
+            handle.write("WatchtowerQD:IML,APR:ngoc.nguyen@aeris.net\n")
+        self.assertEqual(self.registry.boards_for("ngoc.nguyen@aeris.net"),
+                         ["APR", "IML"])
+
+    def test_no_projects_file_at_all_is_not_an_error(self):
+        """Deployments that have not defined one keep working, telling nobody
+        anything -- which is the safe direction."""
+        bare = registry_mod.Registry(allowed_path=self.allowed,
+                                 roster_path=self.roster)
+        self.assertEqual(bare.boards_for("ngoc.nguyen@aeris.net"), [])
+        self.assertEqual(bare.projects(), {})

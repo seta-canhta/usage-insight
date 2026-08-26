@@ -458,6 +458,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._require_admin()
                 self._reset_person()
                 return
+            if path == "/v1/projects":
+                self._require_admin()
+                self._set_project()
+                return
             raise Rejected(404, "no such route")
         except Rejected as exc:
             self._reject(exc)
@@ -524,7 +528,8 @@ class Handler(BaseHTTPRequestHandler):
             outcome = self.people.rotate(email, fingerprint)
             log.info(json.dumps({"event": "enrolled", "person": email,
                                  "outcome": outcome}, sort_keys=True))
-            self._send(200, {"email": email, "outcome": outcome})
+            self._send(200, {"email": email, "outcome": outcome,
+                             "jira_projects": self.people.boards_for(email)})
             return
 
         outcome = self.people.enroll(email, fingerprint)
@@ -540,8 +545,33 @@ class Handler(BaseHTTPRequestHandler):
                            "{} is already enrolled with a different machine. A "
                            "replacement laptop needs that entry reset.".format(
                                email))
+        # The boards ride back on the enrolment response, which is the only
+        # moment every machine is guaranteed to talk to us. A laptop that does
+        # not know its real project keys runs `extract_jira_key` permissive and
+        # invents them -- `fix/AUG-25` became ticket "AUG-25" on 28 of 28
+        # events from a machine enrolled the morning of 2026-08-26. Telling it
+        # here costs nothing and is re-answered on every later enrol.
         self._send(201 if outcome == "created" else 200,
-                   {"email": email, "outcome": outcome})
+                   {"email": email, "outcome": outcome,
+                    "jira_projects": self.people.boards_for(email)})
+
+    def _set_project(self) -> None:
+        """Create or replace a project: its boards, and who is on it."""
+        payload = self._json_body()
+        name = str(payload.get("name") or "").strip()
+        boards = payload.get("boards") or []
+        members = payload.get("members") or []
+        if not name:
+            raise Rejected(400, "name is required")
+        if not isinstance(boards, list) or not isinstance(members, list):
+            raise Rejected(400, "boards and members must be lists")
+        outcome = self.people.set_project(name, [str(b) for b in boards],
+                                          [str(m) for m in members])
+        log.info(json.dumps({"event": "project", "name": name,
+                             "outcome": outcome}, sort_keys=True))
+        self._send(201 if outcome == "created" else 200,
+                   {"name": name, "outcome": outcome,
+                    "projects": self.people.projects()})
 
     def _add_person(self) -> None:
         payload = self._json_body()
@@ -657,6 +687,11 @@ class Handler(BaseHTTPRequestHandler):
                     "enrolled": sum(1 for p in people if p["enrolled"]),
                     "waiting": [p["email"] for p in people
                                 if p["on_roster"] and not p["enrolled"]]})
+                return
+
+            if parsed.path == "/v1/projects":
+                self._require_admin()
+                self._send(200, {"projects": self.people.projects()})
                 return
 
             if parsed.path == "/v1/bundles":
@@ -794,6 +829,12 @@ def main(argv: Optional[List[str]] = None) -> int:
                              "fingerprint-by-chat step")
     parser.add_argument("--allowed-file", default=os.environ.get("INSIGHT_ALLOWED_FILE"),
                         help="file of email:fingerprint lines")
+    parser.add_argument("--projects-file",
+                        default=os.environ.get("INSIGHT_PROJECTS_FILE"),
+                        help="<project>:<BOARD,BOARD>:<member,member> per "
+                             "line. An enrolling laptop is told its own "
+                             "project's boards, which is what stops every "
+                             "reader running permissive and inventing keys")
     parser.add_argument("--install-script",
                         default=os.environ.get("INSIGHT_INSTALL_SCRIPT"),
                         help="the install.sh served at GET /install. Read once "
@@ -824,6 +865,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     people = registry_mod.Registry(
         allowed_path=args.allowed_file,
         roster_path=args.roster_file,
+        projects_path=args.projects_file,
         allowed=(identity.parse_whitelist(os.environ["INSIGHT_ALLOWED"])
                  if os.environ.get("INSIGHT_ALLOWED") and not args.allowed_file
                  else None))

@@ -232,13 +232,76 @@ def run(step: str, argv: List[str], out: str, log: List[Dict[str, Any]]) -> None
         cwd=_ROOT)
     entry: Dict[str, Any] = {"step": step, "ok": result.returncode == 0,
                              "exit": result.returncode}
-    if os.path.exists(out):
+    if os.path.isfile(out):
         with open(out, "r", encoding="utf-8") as handle:
             entry["events"] = sum(1 for _ in handle)
     tail = (result.stderr or result.stdout or "").strip().splitlines()
     if tail:
         entry["detail"] = tail[-1][:300]
     log.append(entry)
+
+
+def cmd_project(args: argparse.Namespace) -> int:
+    """List projects, or define one.
+
+    A project is a team and the Jira boards its work lives on. Defining it is
+    what lets an enrolling laptop be *told* which project keys are real --
+    without that, every reader on every machine runs `extract_jira_key` with no
+    allow-list and invents keys from anything key-shaped. Measured 2026-08-26:
+    `fix/AUG-25` became ticket "AUG-25" on 28 of 28 events from one laptop, and
+    45 fabricated keys against 9 real ones in a Bitbucket export.
+
+    Members are added to the roster as a side effect. Being on a project and
+    being expected to report are the same statement, and requiring both to be
+    typed separately is how one of them ends up stale.
+    """
+    if not args.name:
+        status, body = call("GET", "/v1/projects")
+        if status != 200:
+            raise SystemExit("{}: {}".format(status, body.get("error") or body))
+        projects = body.get("projects") or {}
+        if args.json:
+            print(json.dumps(body, indent=2, sort_keys=True))
+            return 0
+        if not projects:
+            print("No projects yet. "
+                  "`./admin.py project WatchtowerQD --boards IML,APR,AERLABS "
+                  "--members a@x.com,b@x.com`")
+            return 0
+        for name in sorted(projects):
+            entry = projects[name]
+            print("{}".format(name))
+            print("  boards   {}".format(", ".join(entry["boards"]) or "none"))
+            print("  members  {}".format(", ".join(entry["members"]) or "none"))
+        return 0
+
+    boards = [b.strip() for b in (args.boards or "").split(",") if b.strip()]
+    members = [m.strip() for m in (args.members or "").split(",") if m.strip()]
+    if not boards:
+        raise SystemExit(
+            "--boards is required. With no boards the laptops on this project "
+            "are told nothing, and a reader told nothing invents keys (AR-1).")
+    status, body = call("POST", "/v1/projects",
+                        {"name": args.name, "boards": boards,
+                         "members": members})
+    if status not in (200, 201):
+        raise SystemExit("{}: {}".format(status, body.get("error") or body))
+    print("{} {}".format(args.name, body.get("outcome")))
+    print("  boards   {}".format(", ".join(sorted(b.upper() for b in boards))))
+
+    for email in members:
+        add_status, add_body = call("POST", "/v1/people", {"email": email})
+        if add_status not in (200, 201):
+            print("  roster   {}: {} {}".format(
+                email, add_status, add_body.get("error") or ""),
+                file=sys.stderr)
+        else:
+            print("  member   {} ({})".format(email,
+                                              add_body.get("outcome", "on roster")))
+    print()
+    print("Their next `insight enroll` picks the boards up. A machine already "
+          "collecting refreshes them on its next enrolment.")
+    return 0
 
 
 def cmd_pull(args: argparse.Namespace) -> int:
@@ -365,6 +428,15 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("reset", help="forget a fingerprint (replacement laptop)")
     p.add_argument("email", nargs="+")
     p.set_defaults(func=cmd_reset)
+
+    p = sub.add_parser("project",
+                       help="a team and the Jira boards its work lives on")
+    p.add_argument("name", nargs="?",
+                   help="omit to list; give a name to create or replace")
+    p.add_argument("--boards", help="IML,APR,AERLABS -- the real Jira keys")
+    p.add_argument("--members", help="work emails, comma separated")
+    p.add_argument("--json", action="store_true")
+    p.set_defaults(func=cmd_project)
 
     p = sub.add_parser("pull", help="a week or a month, into reports/<name>/")
     p.add_argument("--week", help="YYYY-Www (default: the last complete week)")

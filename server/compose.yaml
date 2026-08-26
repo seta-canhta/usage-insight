@@ -58,6 +58,12 @@ services:
       # which is what removes the fingerprint-by-chat step. Without it the
       # whitelist is fixed and enrolment 403s -- so this is opt-in.
       INSIGHT_ROSTER_FILE: /var/lib/insight-registry/roster.txt
+      # A team and the Jira boards its work lives on. An enrolling laptop is
+      # told its own project's boards, and a laptop that knows them emits a
+      # real key or none -- one that does not know them invents one. Same
+      # writable mount as the roster: the endpoint rewrites it when an admin
+      # defines a project, and it must not sit beside the admin token.
+      INSIGHT_PROJECTS_FILE: /var/lib/insight-registry/projects.env
       INSIGHT_ADMIN_TOKEN_FILE: /etc/insight/admin.token
       # The installer served at GET /install, so onboarding is one curl instead
       # of a git clone. Copy the install.sh from the release into ./etc beside

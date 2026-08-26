@@ -68,6 +68,44 @@ def _atomic_write(path: str, text: str) -> None:
         raise
 
 
+def parse_projects(text: str) -> Dict[str, Dict[str, List[str]]]:
+    """``name:BOARD,BOARD:member,member`` per line.
+
+    A *project* is a team and the Jira boards its work lives on. It exists to
+    answer one question a laptop cannot: which project keys are real. Without
+    that answer `extract_jira_key` runs permissive and invents them -- measured
+    2026-08-26, a branch called `fix/AUG-25` became ticket "AUG-25" on 28 of 28
+    events from a machine enrolled that morning, because `insight setup` had no
+    way to learn that the real boards are `IML`, `APR` and `AERLABS`.
+
+    Boards are upper-cased and members lower-cased, because Jira keys are
+    conventionally upper and email is case-insensitive; storing them as typed
+    would make `IML` and `iml` two different boards.
+
+    More than one project is the expected case, not a future one. Membership is
+    what routes an enrolling laptop to its board list, so onboarding a second
+    team is a line in this file rather than a change here.
+    """
+    projects: Dict[str, Dict[str, List[str]]] = {}
+    for line in (text or "").splitlines():
+        line = line.split("#", 1)[0].strip()
+        if not line:
+            continue
+        parts = line.split(":")
+        if len(parts) < 2:
+            continue
+        name = parts[0].strip()
+        if not name:
+            continue
+        boards = [b.strip().upper() for b in parts[1].split(",") if b.strip()]
+        members = [m.strip().lower()
+                   for m in (parts[2] if len(parts) > 2 else "").split(",")
+                   if m.strip()]
+        projects[name] = {"boards": sorted(set(boards)),
+                          "members": sorted(set(members))}
+    return projects
+
+
 def read_roster(path: Optional[str]) -> List[str]:
     """One address per line, ``#`` comments, blank lines ignored."""
     if not path or not os.path.exists(path):
@@ -93,12 +131,15 @@ class Registry:
 
     def __init__(self, allowed_path: Optional[str] = None,
                  roster_path: Optional[str] = None,
-                 allowed: Optional[Dict[str, List[str]]] = None) -> None:
+                 allowed: Optional[Dict[str, List[str]]] = None,
+                 projects_path: Optional[str] = None) -> None:
         self.allowed_path = allowed_path
         self.roster_path = roster_path
+        self.projects_path = projects_path
         self._lock = threading.Lock()
         self._allowed: Dict[str, List[str]] = dict(allowed or {})
         self._roster: List[str] = []
+        self._projects: Dict[str, Dict[str, List[str]]] = {}
         self._stamps: Dict[str, object] = {}
         self._reload(force=True)
 
@@ -123,7 +164,8 @@ class Registry:
 
     def _reload(self, force: bool = False) -> None:
         for kind, path in (("allowed", self.allowed_path),
-                           ("roster", self.roster_path)):
+                           ("roster", self.roster_path),
+                           ("projects", self.projects_path)):
             if not path:
                 continue
             stamp = self._mtime(path)
@@ -135,6 +177,9 @@ class Registry:
                     self._allowed = identity.parse_whitelist(handle.read())
             elif kind == "roster":
                 self._roster = read_roster(path)
+            elif kind == "projects" and os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as handle:
+                    self._projects = parse_projects(handle.read())
 
     def _persist(self) -> None:
         if not self.allowed_path:
@@ -168,6 +213,38 @@ class Registry:
                 if identity.person_key(email) == person_key:
                     return email
         return None
+
+    def boards_for(self, email: str) -> List[str]:
+        """The Jira boards of the project this address belongs to.
+
+        This is what an enrolling laptop is told, and it is the whole point of
+        the projects file: a client that knows its real boards emits a key or
+        emits nothing, and a client that does not know them invents one.
+
+        An address in two projects gets the union. That is deliberate -- a
+        person really can work across teams, and narrowing it by picking one
+        would silently drop keys from the other. The failure mode of a union is
+        a key that is real but belongs to a board this person rarely touches;
+        the failure mode of guessing is a fabricated ticket, which is worse.
+
+        Empty for an address in no project, and empty is safe: `extract_jira_key`
+        with an empty allow-list emits nothing rather than anything key-shaped.
+        """
+        email = identity.normalise_email(email)
+        with self._lock:
+            self._reload()
+            boards: List[str] = []
+            for project in self._projects.values():
+                if email in project["members"]:
+                    boards.extend(project["boards"])
+            return sorted(set(boards))
+
+    def projects(self) -> Dict[str, Dict[str, List[str]]]:
+        with self._lock:
+            self._reload()
+            return {name: {"boards": list(value["boards"]),
+                           "members": list(value["members"])}
+                    for name, value in self._projects.items()}
 
     def count(self) -> int:
         with self._lock:
@@ -239,6 +316,51 @@ class Registry:
             self._allowed[email] = [fingerprint] + current[:1]
             self._persist()
             return "rotated"
+
+    def _persist_projects(self) -> None:
+        if not self.projects_path:
+            raise RegistryError(
+                "no projects file configured -- set INSIGHT_PROJECTS_FILE")
+        lines = ["# <project>:<BOARD,BOARD>:<member,member>",
+                 "# The boards a laptop is told are real. Without them every",
+                 "# reader runs permissive and invents keys (AR-1).",
+                 ""]
+        for name in sorted(self._projects):
+            entry = self._projects[name]
+            lines.append("{}:{}:{}".format(name, ",".join(entry["boards"]),
+                                           ",".join(entry["members"])))
+        _atomic_write(self.projects_path, "\n".join(lines) + "\n")
+        self._stamps["projects"] = self._mtime(self.projects_path)
+
+    def set_project(self, name: str, boards: List[str],
+                    members: List[str]) -> str:
+        """Create or replace one project. Other projects are untouched.
+
+        Replace rather than merge: an admin removing a board from the list
+        means it, and a merge would make removal impossible through this route.
+        """
+        name = (name or "").strip()
+        if not name or ":" in name:
+            raise RegistryError("project name is required and cannot hold ':'")
+        with self._lock:
+            self._reload()
+            existed = name in self._projects
+            self._projects[name] = {
+                "boards": sorted({b.strip().upper() for b in boards if b.strip()}),
+                "members": sorted({identity.normalise_email(m)
+                                   for m in members if m and m.strip()}),
+            }
+            self._persist_projects()
+            return "updated" if existed else "created"
+
+    def remove_project(self, name: str) -> str:
+        with self._lock:
+            self._reload()
+            if name not in self._projects:
+                return "unknown"
+            del self._projects[name]
+            self._persist_projects()
+            return "removed"
 
     def add_person(self, email: str) -> str:
         email = identity.normalise_email(email)
