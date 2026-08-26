@@ -18,8 +18,25 @@ INSIGHT_ENDPOINT=http://127.0.0.1:8479
 ./admin.py add ngoc@seta-international.vn
 ./admin.py reset ngoc@...                # replacement laptop
 ./admin.py remove ngoc@...               # revoke
+./admin.py project                       # list projects
+./admin.py project WatchtowerQD \
+  --boards IML,APR,AERLABS \
+  --members ngoc.nguyen@aeris.net,linh.hoang@aeris.net
 ./admin.py pull --week 2026-W35          # or --month 2026-08
 ```
+
+**Define a project before anyone installs.** A project is a team and the Jira
+boards its work lives on, and it is the only way a laptop learns which project
+keys are real. A client that has not been told runs `extract_jira_key` with no
+allow-list and invents keys from anything key-shaped -- measured 2026-08-26,
+`fix/AUG-25` became ticket "AUG-25" on 28 of 28 events from one machine, and a
+Bitbucket export carried 45 fabricated keys against 9 real ones.
+
+The boards ride back on the enrolment response and the client writes them down.
+`project` also puts its members on the roster, because being on a project and
+being expected to report are the same statement. A machine already enrolled
+without a board list re-enrols hourly until it has one, so an existing fleet
+repairs itself; nobody reinstalls.
 
 **Nobody relays a fingerprint and nobody restarts the service.** `add` puts an
 address on the roster; that person's machine registers itself on its next
@@ -52,6 +69,7 @@ prints.
 | `INSIGHT_ADMIN_TOKEN` | required, no default; guards the read routes |
 | `INSIGHT_ALLOWED_FILE` | the whitelist, one line per engineer. Written by the endpoint on enrolment, so it must be writable |
 | `INSIGHT_ROSTER_FILE` | one work email per line: who is expected. A machine may enrol itself against an address on this list. Without it, enrolment is off and the whitelist is whatever the file says |
+| `INSIGHT_PROJECTS_FILE` | `<project>:<BOARD,BOARD>:<member,member>` per line. The boards an enrolling laptop is told are real. Written by the endpoint when an admin defines a project, so it lives in the same writable mount as the roster -- never beside the admin token. Unset means no laptop is told anything, which is safe but leaves every reader emitting no key |
 | `INSIGHT_HOST` / `INSIGHT_PORT` | default `127.0.0.1:8479` |
 | `INSIGHT_UPLOAD_PORT` | optional second listener: uploads and `/healthz` only |
 | `AWS_REGION` and credentials | standard boto3 resolution; prefer an instance role |
