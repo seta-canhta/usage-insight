@@ -365,10 +365,16 @@ class WeekAggregate:
         self.run_duration_ms: List[float] = []
         self.input_tokens = 0
         self.output_tokens = 0
-        self.cached_tokens = 0
-        self.cache_write_tokens = 0
+        # NULL, not 0, for the same reason as `reasoning_tokens` below: a
+        # source that never reports the field must not render as a source that
+        # measured zero. VS Code Copilot Chat carries none of these three --
+        # measured 2026-W34, `premium_requests` NULL on 75 of 75 model calls --
+        # and seeding them at 0 printed "Premium requests 0 | measured" and
+        # "cache reads 0 (0.0%)" for a week nobody had measured at all.
+        self.cached_tokens: Optional[int] = None
+        self.cache_write_tokens: Optional[int] = None
         self.reasoning_tokens: Optional[int] = None
-        self.premium_requests = 0
+        self.premium_requests: Optional[int] = None
         self.api_requests = 0
         self.nano_aiu: Optional[int] = None
         self.model_latency_ms: List[float] = []
@@ -514,11 +520,11 @@ class WeekAggregate:
             # CONTRACT §3 row 5: input_tokens = cacheRead + cacheWrite + fresh,
             # exactly. The cached share is therefore a share OF input_tokens and
             # `total_tokens = in + out` does not double-count.
-            self.cached_tokens += int(attrs.get("cached_input_tokens") or 0)
-            self.cache_write_tokens += int(attrs.get("cache_write_tokens") or 0)
-            self.premium_requests += int(attrs.get("premium_requests") or 0)
             self.api_requests += int(attrs.get("request_count") or 0)
-            for field, name in (("reasoning_tokens", "reasoning_tokens"),
+            for field, name in (("cached_input_tokens", "cached_tokens"),
+                                ("cache_write_tokens", "cache_write_tokens"),
+                                ("premium_requests", "premium_requests"),
+                                ("reasoning_tokens", "reasoning_tokens"),
                                 ("nano_aiu", "nano_aiu")):
                 value = attrs.get(field)
                 # NULL where the model reports none. Seeding these at 0 would
@@ -756,7 +762,7 @@ class WeekAggregate:
 
     @property
     def cached_share(self) -> Optional[float]:
-        if not self.input_tokens:
+        if not self.input_tokens or self.cached_tokens is None:
             return None
         return 100.0 * self.cached_tokens / self.input_tokens
 
@@ -1217,17 +1223,21 @@ def render_markdown(
     if current.total_tokens or current.premium_requests:
         add("| Metric | Value | Basis |")
         add("|---|---:|---|")
-        add(f"| **Premium requests** | {current.premium_requests:,} "
-            f"| measured — the unit Copilot bills |")
+        add(f"| **Premium requests** | "
+            f"{f'{current.premium_requests:,}' if current.premium_requests is not None else '—'} "
+            f"| measured — the unit Copilot bills; `—` = this source does not carry it |")
         add(f"| Sessions with usage | {len(current.sessions_with_usage):,} of "
             f"{len(current.sessions):,} | the rest ended without a `session.shutdown` |")
         add(f"| API requests | {current.api_requests:,} "
             f"| `requests.count` — **not** the billed unit |")
         add(f"| Input tokens | {current.input_tokens:,} "
             f"| economic weight, not spend |")
-        add(f"| ...of which cache reads | {current.cached_tokens:,} "
+        add(f"| ...of which cache reads | "
+            f"{f'{current.cached_tokens:,}' if current.cached_tokens is not None else '—'} "
             f"({fmt_num(current.cached_share, '%', 1)}) | higher is better |")
-        add(f"| ...of which cache writes | {current.cache_write_tokens:,} | |")
+        add(f"| ...of which cache writes | "
+            f"{f'{current.cache_write_tokens:,}' if current.cache_write_tokens is not None else '—'} "
+            f"| |")
         add(f"| Output tokens | {current.output_tokens:,} | |")
         add(f"| Reasoning tokens | "
             f"{f'{current.reasoning_tokens:,}' if current.reasoning_tokens is not None else '—'} "

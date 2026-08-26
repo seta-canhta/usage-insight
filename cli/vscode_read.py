@@ -73,9 +73,27 @@ every tool call. None of it may be stored.
 
 So this module names what it keeps, exactly as `copilot_read.py` does, and
 never inspects the rest. `KEEP` below is the whole surface. A field that is not
-named there is not read -- not read and dropped, *not read*. An exclusion list
-would have to keep pace with a format that gains keys without asking; there is
-no version of that which stays correct.
+named there is not stored -- and with one exception, named below, not read
+either. An exclusion list would have to keep pace with a format that gains keys
+without asking; there is no version of that which stays correct.
+
+**The one exception, and why it is drawn this narrowly.** `SCAN` names a single
+path, `message.text`, that is *read* and never *kept*. It exists because a
+session with no ticket cannot be joined to anything: measured 2026-08-26 on a
+live laptop, all 877 events carried `jira_issue_key=null`, because this team
+names branches `feature/26.8` and a release train is not a ticket.
+
+What leaves `scan_for_key` is at most one string of the form `IML-1234`, and
+only when a real project claims the prefix. The prompt is matched and dropped
+inside that function; it is never returned, never stored, never logged, and
+never reaches an event. With no allow-list the function reads nothing at all
+and returns None -- AR-1's fabricated `AUG-25` came from exactly the permissive
+path, and prose contains far more key-shaped noise than a branch name does.
+
+A key found this way is `heuristic` at 0.5, not 0.9: naming a ticket in a
+prompt is weaker evidence than working on its branch, and *mentioning* is not
+*working on*. It is used only where the branch yielded nothing, so this can
+turn a null into a key and can never change a key that was already there.
 
 Tool names are the one dimension taken from inside a tool call, and they are
 taken because they are bounded: 12 distinct values across 603 calls on the
@@ -92,7 +110,8 @@ import re
 import subprocess
 import sys
 from datetime import datetime, timezone
-from typing import Any, Dict, Iterator, List, Optional, Tuple
+from typing import (Any, Collection, Dict, Iterator, List, Optional,
+                    Tuple)
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
 if _HERE not in sys.path:
@@ -173,6 +192,50 @@ def dig(data: Any, path: str) -> Any:
 def keep(request: Dict[str, Any]) -> Dict[str, Any]:
     """Project one request onto `KEEP`. Nothing else is looked at."""
     return {path: dig(request, path) for path in KEEP}
+
+
+#: Read, never kept. The counterpart to `KEEP`, and deliberately one path.
+#:
+#: `KEEP` is a projection: those values are stored. This is a match: the string
+#: is compared against the project allow-list inside `scan_for_key` and dropped
+#: there. Naming it separately is the point -- a reader of this module can see
+#: at a glance the complete list of paths whose *text* is ever looked at.
+#:
+#: `message.text` is the human's own prompt. The model's `response`, the
+#: rendered context, the code blocks and every tool argument stay unread: they
+#: are larger, they are not the person's statement of intent, and they carry
+#: far more incidental key-shaped noise -- pasted logs, stack traces, another
+#: system's ticket references.
+SCAN: Tuple[str, ...] = ("message.text",)
+
+
+def scan_for_key(request: Dict[str, Any],
+                 projects: Collection[str]) -> Optional[str]:
+    """A Jira key named in the prompt, or None. The prompt itself is discarded.
+
+    The allow-list is not optional here, and an empty one short-circuits before
+    anything is read. `extract_jira_key(projects=None)` accepts anything
+    key-shaped, which on a branch name already produced `AUG-25` -- a date --
+    on 28 of 28 events from a live machine. Prose is a far richer source of
+    that mistake than a branch name: a prompt quoting `ERR-500`, `CVE-2024`,
+    `PY-311` or a colleague's `TC-12018` would mint all four. Constrained to
+    the projects Jira says exist, the same regex is safe.
+
+    What this cannot know is whether naming a ticket means working on it.
+    "this is like IML-200 was" reads identically to "fix IML-200". That is why
+    the caller records the result at confidence 0.5 and only where the branch
+    gave nothing -- see CONTRACT.md §2.4, and note that `heuristic` rows are
+    already barred from the cost metrics.
+    """
+    if not projects:
+        return None
+    for path in SCAN:
+        text = dig(request, path)
+        if isinstance(text, str) and text:
+            key = common.extract_jira_key(text, projects=projects)
+            if key:
+                return key
+    return None
 
 
 def stamp(epoch_ms: Any) -> Optional[str]:
@@ -272,6 +335,46 @@ def repo_of(folder: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     return name, git("rev-parse", "--abbrev-ref", "HEAD")
 
 
+def discover_repos(root: Optional[str] = None) -> List[str]:
+    """Every git work tree a chat session was held in, deduplicated.
+
+    `insight scan` learned repositories from the Copilot CLI journal alone, so
+    a machine used only through the chat panel discovered none. Measured
+    2026-08-26 on a live laptop: 512 chat events in `aeriscom/wt-playwrite-taf`
+    and a bundle reporting `repos: 0`. No commits were scanned, so no
+    `AI-Run-Id` trailer was ever read -- and CONTRACT.md §2.4 makes that
+    trailer the only thing that earns `method='explicit'`, which is in turn the
+    only thing the cost metrics may be computed from. A discovery gap was
+    quietly holding two metrics shut.
+
+    This module already resolves the folder for every session it reads, so the
+    information was present and simply never asked for.
+
+    Only directories that still exist and still hold a `.git` are returned.
+    Evidence here perishes -- CLAUDE.md records 24 of 27 workspace folders
+    already deleted when read after the fact -- and a path that has gone is
+    left out rather than reported as a repository that cannot be scanned.
+    """
+    root = root or default_root()
+    if not root:
+        return []
+    base = os.path.join(root, "workspaceStorage")
+    if not os.path.isdir(base):
+        return []
+    found: List[str] = []
+    seen = set()
+    for storage, _session_id, _path in iter_sessions(root):
+        if storage in seen:
+            continue
+        seen.add(storage)
+        folder = workspace_folder(storage)
+        if not folder or folder in found:
+            continue
+        if os.path.isdir(os.path.join(folder, ".git")):
+            found.append(folder)
+    return sorted(found)
+
+
 def iter_sessions(root: str) -> Iterator[Tuple[str, str, str]]:
     """``(storage_dir, session_id, path)`` for every chat session under root."""
     base = os.path.join(root, "workspaceStorage")
@@ -367,9 +470,13 @@ def session_events(path: str, session_id: str,
     if not requests:
         return []
 
+    # validated_projects, never the raw argument: a caller that passes None
+    # would otherwise turn branch `fix/AUG-25` into ticket "AUG-25" -- a date.
+    # Measured on a live machine 2026-08-26, 28 of 28 events. AR-1.
+    projects = common.validated_projects(jira_projects, source="jira_projects")
+    branch_key = common.extract_jira_key(branch, projects=projects)
     context = common.make_context(
-        jira_issue_key=common.extract_jira_key(None, branch,
-                                               projects=jira_projects),
+        jira_issue_key=branch_key,
         repo_full_name=repo,
         branch_name=branch,
     )
@@ -381,6 +488,13 @@ def session_events(path: str, session_id: str,
 
     events: List[Dict[str, Any]] = []
 
+    #: Rebound once per request. The branch belongs to the session, but a
+    #: prompt-derived key belongs to the request that named it -- a session that
+    #: touches two tickets should not have both events attributed to whichever
+    #: was mentioned first. `context` is per-event in the schema, so this costs
+    #: nothing to represent honestly.
+    current = {"context": context, "confidence": 0.9}
+
     def emit(event_type: str, when: Optional[str], attributes: Dict[str, Any],
              suffix: str) -> None:
         events.append(common.build_event(
@@ -389,12 +503,13 @@ def session_events(path: str, session_id: str,
             natural_key=(session_id, suffix),
             attributes=attributes,
             actor=actor,
-            context=context,
+            context=current["context"],
             agent=agent,
             # `heuristic` 0.9, not `explicit`: the request is a real record,
             # but nothing in it names a run, and the repository is resolved
-            # from where the window happened to be open.
-            link=common.make_link("heuristic", 0.9),
+            # from where the window happened to be open. 0.5 where the ticket
+            # came from the prompt rather than the branch -- see `scan_for_key`.
+            link=common.make_link("heuristic", current["confidence"]),
             trace_id=session_id,
             # No run: VS Code chat has no run concept, and inventing one to
             # satisfy a column would manufacture a join key (AR-1). Null is
@@ -408,6 +523,21 @@ def session_events(path: str, session_id: str,
         attrs = keep(request)
         request_id = attrs.get("requestId") or "req-{}".format(index)
         when = stamp(attrs.get("timestamp"))
+
+        # The branch wins where it has an answer, and the prompt is consulted
+        # only where it does not. So this can turn a null into a key and can
+        # never overwrite one -- no figure that exists today moves because of
+        # it, which is the only safe way to introduce a weaker signal.
+        if branch_key:
+            current["context"], current["confidence"] = context, 0.9
+        else:
+            prompt_key = scan_for_key(request, projects)
+            current["context"] = common.make_context(
+                jira_issue_key=prompt_key,
+                repo_full_name=repo,
+                branch_name=branch,
+            ) if prompt_key else context
+            current["confidence"] = 0.5 if prompt_key else 0.9
 
         # -- the human turn -------------------------------------------------
         # `chars` is deliberately NOT taken. It would require measuring the
@@ -582,13 +712,13 @@ def main(argv: Optional[List[str]] = None) -> int:
                         help="Comma-separated real Jira project keys")
     args = parser.parse_args(argv)
 
-    projects = None
-    if args.jira_projects:
-        projects = tuple(sorted({p.strip().upper()
-                                 for p in args.jira_projects.split(",")
-                                 if p.strip()})) or None
-
-    result = to_events(args.root, jira_projects=projects)
+    projects = tuple(sorted({p.strip().upper()
+                             for p in (args.jira_projects or "").split(",")
+                             if p.strip()}))
+    # Never None: without --jira-projects this reader used to accept anything
+    # key-shaped and turned branch `fix/AUG-25` into ticket "AUG-25" (AR-1).
+    result = to_events(args.root, jira_projects=common.validated_projects(
+        projects, source="--jira-projects"))
     problems = verify_no_content(result["events"])
     if problems:
         for problem in problems[:5]:

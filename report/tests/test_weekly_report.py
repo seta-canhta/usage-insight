@@ -586,6 +586,46 @@ class TestFalseZeros(unittest.TestCase):
         # 107 / 2 = 53.5 must appear nowhere.
         self.assertNotIn("53.5", body)
 
+    def test_a_source_that_never_reports_a_field_renders_a_dash_not_zero(self):
+        """VS Code Copilot Chat carries no premium/cache counters at all.
+
+        Measured 2026-W34: `premium_requests` NULL on 75 of 75 model calls,
+        `cached_input_tokens` and `cache_write_tokens` likewise. Seeded at 0
+        these printed "Premium requests | 0 | measured" and "cache reads |
+        0 (0.0%)" -- a measured zero for a week nobody had measured, and the
+        cache line is the one §6 calls the live cost lever. Absent is not zero.
+        """
+        vscode = {"model_id": "claude-sonnet-4.6", "input_tokens": 645_452,
+                  "output_tokens": 2_681, "request_count": 75}
+        evs = [event("model.call", self.T, vscode, event_id="m1")]
+        agg = wr.aggregate(evs, 5)["2026-W33"]
+        self.assertIsNone(agg.premium_requests)
+        self.assertIsNone(agg.cached_tokens)
+        self.assertIsNone(agg.cache_write_tokens)
+        self.assertIsNone(agg.cached_share)
+        body = self.report(evs)
+        self.assertIn("| **Premium requests** | — |", body)
+        self.assertIn("| ...of which cache reads | — (—)", body)
+        self.assertIn("| ...of which cache writes | — |", body)
+        self.assertNotIn("| **Premium requests** | 0 |", body)
+        self.assertNotIn("0 (0.0%)", body)
+        # and the JSON carries null, not 0, for the same three
+        payload = json.loads(self.report(evs, fmt="json"))
+        self.assertIsNone(payload["cost"]["premium_requests"])
+        self.assertIsNone(payload["cost"]["cached_input_tokens"])
+        self.assertIsNone(payload["cost"]["cache_write_tokens"])
+
+    def test_a_measured_zero_still_renders_as_zero(self):
+        """The counterpart: 0 reported is a measurement and must survive."""
+        evs = [event("model.call", self.T,
+                     self.usage(premium_requests=0, cached_input_tokens=0,
+                                cache_write_tokens=0), event_id="m1")]
+        agg = wr.aggregate(evs, 5)["2026-W33"]
+        self.assertEqual(agg.premium_requests, 0)
+        self.assertEqual(agg.cached_tokens, 0)
+        self.assertEqual(agg.cached_share, 0.0)
+        self.assertIn("| **Premium requests** | 0 |", self.report(evs))
+
     def test_cache_share_is_a_share_of_input_tokens(self):
         evs = [event("model.call", self.T, self.usage(
             input_tokens=1000, cached_input_tokens=940, cache_write_tokens=10,

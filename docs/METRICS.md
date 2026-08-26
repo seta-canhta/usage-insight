@@ -31,7 +31,7 @@ Window: August 2026 onward. Measured 2026-08-26.
 | 6 | out of scope | — | counterfactual; needs a controlled manual arm |
 | 7 | **live** | 66.6% (8,653 / 12,983) | 13 cycles, 8,028 automated, 557 defects |
 | 8 | not measurable | — | AIO keeps one run per case per cycle and overwrites on re-execution. Verified: 0 case+cycle pairs have more than one run. Comparing across cycles counts fixes and regressions as flakes |
-| 9 | blocked | — | 0 `AI-Run-Id` events, 0 AI telemetry in August |
+| 9 | blocked | — | 0 `AI-Run-Id` events. AI telemetry now exists (935 laptop events, 16 August days, measured 2026-08-26) but carries no cost input: `premium_requests` is NULL on 427 of 427 model calls |
 | 10 | out of scope | — | "value" is not observable |
 
 **One is live. One is reportable with a caveat. Two are permanently out of
@@ -42,17 +42,26 @@ this file exists separately from the code.
 
 ## What blocks the rest
 
-**No AI telemetry in August, from any source.** Not thin, zero.
+**AI telemetry now arrives, and still has no cost input.** Superseded
+2026-08-26: this section previously read "No AI telemetry in August, from any
+source. Not thin, zero." That was measured before collection reached any QA
+machine, and it is no longer true.
 
-| Source | Newest data |
+Measured 2026-08-26 from the collection endpoint, `reports/2026-W34/exports/`:
+
+| | Measured |
 |---|---|
-| `~/.copilot/session-state` on the reference machine | 2026-06-26 |
-| VS Code `chatSessions` on the reference machine | 2026-02-05 |
-| the two sampled QA machines | no `session-state` at all |
+| Laptop events, August 2026 | 935 |
+| Distinct August days with activity | 16 |
+| Machines reporting | 7 |
+| Surfaces | `vscode-copilot-chat` (913), `headless` (22) |
 
-Verified against file mtimes. The cause is that no Copilot CLI session has been
-run on those machines, not that the journal is unwritable. Every metric with AI
-in its numerator therefore has no numerator.
+What has *not* changed is the numerator for metric 9. Of 427 August
+`model.call` events, `premium_requests` is NULL on **427** and `input_tokens`
+on **371** — VS Code Copilot Chat does not record either. `run.*` events,
+populated `run_id`s and AI commit markers remain at **0**, so there is still no
+`AI-Run-Id` and no admissible cost input. Absent is not zero: a report that
+renders these as 0 is claiming a measurement nobody made.
 
 **Scope is one repository out of 32 active in August**, and the Jira project
 with the most AI attribution is not the one being polled:

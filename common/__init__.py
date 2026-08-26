@@ -385,6 +385,48 @@ def extract_jira_key(*candidates: Optional[str],
     return None
 
 
+_UNVALIDATED_WARNED = False
+
+
+def validated_projects(
+        configured: Optional[Collection[str]],
+        source: str = "JIRA_PROJECT_KEYS") -> Collection[str]:
+    """The allow-list an *emitter* hands `extract_jira_key`. Never None.
+
+    `extract_jira_key(projects=None)` means "no allow-list, accept anything
+    key-shaped", which is a reasonable default for a caller that genuinely
+    cannot supply one. Nothing that emits an event is that caller, and the
+    difference is not theoretical: the setting is unset by default, so
+    `projects=config...` passes None, every guard switches off silently, and
+    the emitter fabricates.
+
+    Measured 2026-08-26 in `reports/2026-W34/exports/bitbucket.ndjson`, emitted
+    by a poller that *did* pass `projects=` at every call site: fabricated keys
+    (`JUL` 20, `AUG` 11, `JUN` 9, `TC` 3, `CY` 2 -- month abbreviations parsed
+    out of `fix/AUG-20`, `UI-JUN-30`) outnumbered real ones (`IML` 7, `APR` 2)
+    **45 to 9**. The call sites looked correct; the configuration turned them
+    off.
+
+    And on the client, measured 2026-08-26 on a laptop enrolled that morning:
+    all 28 events from a session on branch `fix/AUG-25` carried
+    `jira_issue_key="AUG-25"`. That is August 25. `insight setup` does not set
+    `jira_projects`, so every reader on a fresh machine ran permissive.
+
+    So an unconfigured emitter emits no key rather than an invented one. Absent
+    is honest and visible; `AUG-25` is neither -- it attributes real
+    engineering work to a ticket that does not exist. AR-1.
+    """
+    global _UNVALIDATED_WARNED
+    if configured:
+        return configured
+    if not _UNVALIDATED_WARNED:
+        _UNVALIDATED_WARNED = True
+        log("jira_key_extraction_disabled", reason="no allow-list configured",
+            fix="set {}=IML,APR,AERLABS".format(source),
+            effect="jira_issue_key will be null rather than guessed (AR-1)")
+    return ()
+
+
 def jira_project_key(issue_key: Optional[str]) -> Optional[str]:
     if not issue_key or "-" not in issue_key:
         return None
@@ -807,7 +849,12 @@ def _urllib_transport() -> Transport:
         for key, value in headers.items():
             request.add_header(key, value)
         try:
-            with urllib.request.urlopen(request, timeout=timeout) as resp:
+            # ssl_context(), not the default: a stock macOS python has an empty
+            # trust store, and leaving this one caller out is exactly the
+            # "uploads fine, pull cannot reach the same host" split that
+            # ssl_context()'s docstring warns about.
+            with urllib.request.urlopen(
+                    request, timeout=timeout, context=ssl_context()) as resp:
                 return (
                     resp.getcode(),
                     {k.lower(): v for k, v in resp.headers.items()},

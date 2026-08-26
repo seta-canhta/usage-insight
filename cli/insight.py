@@ -529,6 +529,12 @@ def write_json(path: str, payload: Dict[str, Any]) -> None:
 COPILOT_ROOT = os.environ.get("COPILOT_HOME") or os.path.join(
     os.path.expanduser("~"), ".copilot")
 
+#: The VS Code user directory, or None to let `vscode_read` find it. Named here
+#: for the same reason `COPILOT_ROOT` is: discovery reads a real directory on a
+#: real machine, so anything testing it has to be able to point it somewhere
+#: empty. Leaving it None is production behaviour on all four supported paths.
+VSCODE_ROOT: Optional[str] = os.environ.get("VSCODE_HOME") or None
+
 
 def buffer_path(day: Optional[str] = None) -> str:
     return os.path.join(BUFFER_DIR, "{}.ndjson".format(day or now()[:10]))
@@ -842,7 +848,14 @@ def cmd_setup(args: argparse.Namespace) -> int:
         # name was the one that silently reported nothing; not having to ask
         # removes the failure rather than warning about it.
         import copilot_read
-        discovered = copilot_read.discover_repos(COPILOT_ROOT)
+        import vscode_read
+        # Both surfaces. A QA engineer who works entirely in the VS Code chat
+        # panel has no Copilot CLI journal at all, and asking only that one
+        # told them "none yet" on a machine with a repository open.
+        discovered = list(copilot_read.discover_repos(COPILOT_ROOT))
+        for path in vscode_read.discover_repos(VSCODE_ROOT):
+            if path not in discovered:
+                discovered.append(path)
         steps.append({
             "step": "repos", "ok": True,
             "detail": "{} found in Copilot's session history".format(
@@ -1245,7 +1258,9 @@ def scan_commits(repo: str, since_days: int, config: Dict[str, Any]) -> List[Dic
         trailers = common.parse_ai_trailers(message)
         run_id = trailers.get("ai-run-id")
         jira_key = common.extract_jira_key(
-            subject, branch, projects=config.get("jira_projects") or None)
+            subject, branch,
+            projects=common.validated_projects(config.get("jira_projects"),
+                                               source="jira_projects"))
         marker = common.has_ai_commit_marker(subject)
 
         # Artifacts only for commits AI had a hand in. Emitting them for every
@@ -1296,13 +1311,20 @@ def cmd_scan(args: argparse.Namespace) -> int:
         # Asking somebody to list them was never the point -- and the one they
         # forgot was the one that silently reported nothing.
         targets = list(known_repos())
-        try:
-            import copilot_read
-            for path in copilot_read.discover_repos(COPILOT_ROOT):
-                if path not in targets:
-                    targets.append(path)
-        except (ImportError, OSError):
-            pass
+        # Both surfaces, because a machine can have either. Asking only the
+        # Copilot CLI journal is how a VS Code-only laptop came to report
+        # `repos: 0` while holding 512 chat events in a git tree -- measured
+        # 2026-08-26. No commits scanned means no `AI-Run-Id` trailer read,
+        # and that trailer is the only evidence earning `method='explicit'`.
+        for module, discover in (
+                ("copilot_read", lambda m: m.discover_repos(COPILOT_ROOT)),
+                ("vscode_read", lambda m: m.discover_repos(VSCODE_ROOT))):
+            try:
+                for path in discover(__import__(module)):
+                    if path not in targets:
+                        targets.append(path)
+            except (ImportError, OSError):
+                continue
         if not targets:
             # Not an error. A machine where Copilot has not run in a git tree
             # has nothing to scan, and saying so beats failing hourly.
@@ -1449,7 +1471,8 @@ def cmd_copilot(args: argparse.Namespace) -> int:
 
     result = copilot_read.to_events(
         root, since=args.since, actor=actor,
-        jira_projects=tuple(config.get("jira_projects") or ()) or None)
+        jira_projects=common.validated_projects(
+            config.get("jira_projects"), source="jira_projects"))
     problems = copilot_read.verify_no_content(result["events"])
     if problems:
         for problem in problems[:5]:
@@ -1490,7 +1513,8 @@ def cmd_vscode(args: argparse.Namespace) -> int:
 
     result = vscode_read.to_events(
         args.root, actor=actor,
-        jira_projects=tuple(config.get("jira_projects") or ()) or None)
+        jira_projects=common.validated_projects(
+            config.get("jira_projects"), source="jira_projects"))
     if not result["present"]:
         print(json.dumps({"present": False, "events": 0}, sort_keys=True))
         return 0
@@ -1931,7 +1955,15 @@ def cmd_auto(args: argparse.Namespace) -> int:
         # Until it sticks. A laptop set up before the admin added the address
         # would otherwise 401 forever with nobody watching; retrying here costs
         # one request an hour and turns that into a wait.
-        if not config.get("enrolled_at"):
+        #
+        # Also when the machine is enrolled but holds no board list. That is
+        # not a hypothetical: every laptop enrolled before projects existed is
+        # in exactly that state, and a machine with no allow-list does not fail
+        # quietly -- it invents Jira keys from anything key-shaped, which is
+        # the AR-1 fabrication this project has already shipped twice. One
+        # request an hour until it has an answer is the cheapest way to reach
+        # a fleet nobody can log into.
+        if not config.get("enrolled_at") or not config.get("jira_projects"):
             outcome = enroll_identity(config)
             record_enrolment(outcome)
             if outcome.get("ok"):
@@ -2188,8 +2220,16 @@ def enroll_identity(config: Dict[str, Any], timeout: int = 15) -> Dict[str, Any]
                 request, timeout=timeout,
                 context=common.ssl_context()) as response:
             body = json.loads(response.read().decode("utf-8") or "{}")
+            boards = body.get("jira_projects")
             return {"ok": True, "status": response.status,
-                    "outcome": body.get("outcome") or "enrolled"}
+                    "outcome": body.get("outcome") or "enrolled",
+                    # The endpoint knows which Jira boards are real; this
+                    # machine cannot. Without them every reader here runs with
+                    # no allow-list and mints keys from anything key-shaped --
+                    # `fix/AUG-25` became ticket "AUG-25" on 28 of 28 events
+                    # from a laptop enrolled the morning of 2026-08-26.
+                    "jira_projects": [str(b) for b in boards]
+                    if isinstance(boards, list) else None}
     except urllib.error.HTTPError as exc:
         detail = ""
         try:
@@ -2208,6 +2248,13 @@ def record_enrolment(result: Dict[str, Any]) -> None:
     if config is None or not result.get("ok"):
         return
     config["enrolled_at"] = now()
+    # Refreshed on every successful enrolment, so an admin adding a board does
+    # not need anyone to reinstall. A response that carries no list at all
+    # leaves whatever is configured alone -- an older endpoint saying nothing
+    # must not silently disarm a machine that already knows its boards.
+    boards = result.get("jira_projects")
+    if isinstance(boards, list):
+        config["jira_projects"] = boards
     write_json(CONFIG_PATH, config)
     os.chmod(CONFIG_PATH, 0o600)
 

@@ -107,6 +107,32 @@ class ReaderTestCase(unittest.TestCase):
     def read(self, **kw):
         return vscode_read.to_events(self.root, **kw)
 
+    def test_an_unconfigured_reader_does_not_turn_a_date_into_a_ticket(self):
+        """`fix/AUG-25` is August 25, not ticket AUG-25. AR-1.
+
+        Measured 2026-08-26 on a laptop enrolled that morning: all 28 events
+        from a session on branch `fix/AUG-25` carried
+        `jira_issue_key="AUG-25"`. `insight setup` never sets `jira_projects`,
+        so the reader ran with no allow-list and accepted anything key-shaped.
+        """
+        events = vscode_read.session_events(
+            self._one_session(), "s1", "acme/repo", "fix/AUG-25")
+        self.assertTrue(events)
+        for event in events:
+            self.assertIsNone(event["context"]["jira_issue_key"])
+            self.assertEqual(event["context"]["branch_name"], "fix/AUG-25")
+
+    def test_a_configured_reader_keeps_a_real_key(self):
+        events = vscode_read.session_events(
+            self._one_session(), "s1", "acme/repo", "IML-6500/release/26.8",
+            jira_projects=("IML", "APR", "AERLABS"))
+        self.assertTrue(events)
+        self.assertEqual(events[0]["context"]["jira_issue_key"], "IML-6500")
+
+    def _one_session(self):
+        storage = self.workspace(name="wsk", requests=[a_request(0)])
+        return os.path.join(storage, "chatSessions", "s1.json")
+
 
 # ---------------------------------------------------------------------------
 # 1. Content. The whole reason the module is written the way it is.
@@ -358,3 +384,111 @@ class TestTheAppendOnlyFormat(ReaderTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# ---------------------------------------------------------------------------
+# 8. The prompt is matched, never kept.
+#
+# `branch` and a pull request are work records and are read whole. A prompt is
+# not, so exactly one path is read and only a key that a real project claims
+# escapes. These tests are as much about what must NOT happen.
+# ---------------------------------------------------------------------------
+
+class TestPromptDerivedKey(ReaderTestCase):
+    PROJECTS = ("IML", "APR", "AERLABS")
+
+    def _session(self, text, name="wsp"):
+        request = a_request(0)
+        request["message"] = {"text": text}
+        storage = self.workspace(name=name, requests=[request])
+        return os.path.join(storage, "chatSessions", "s1.json")
+
+    def test_a_ticket_named_in_the_prompt_is_found(self):
+        events = vscode_read.session_events(
+            self._session("please fix IML-6500, the grid does not sort"),
+            "s1", "acme/repo", "feature/26.8", jira_projects=self.PROJECTS)
+        self.assertTrue(events)
+        self.assertEqual(events[0]["context"]["jira_issue_key"], "IML-6500")
+
+    def test_it_is_weaker_evidence_and_says_so(self):
+        """0.5, not 0.9. Mentioning a ticket is not working on it."""
+        events = vscode_read.session_events(
+            self._session("look at IML-6500"), "s1", "acme/repo",
+            "feature/26.8", jira_projects=self.PROJECTS)
+        self.assertEqual(events[0]["link"]["confidence"], 0.5)
+        self.assertEqual(events[0]["link"]["method"], "heuristic")
+
+    def test_the_branch_wins_and_keeps_its_confidence(self):
+        """A weaker signal may fill a null. It may never overwrite a value."""
+        events = vscode_read.session_events(
+            self._session("but first look at APR-1"), "s1", "acme/repo",
+            "IML-6500-sorting", jira_projects=self.PROJECTS)
+        self.assertEqual(events[0]["context"]["jira_issue_key"], "IML-6500")
+        self.assertEqual(events[0]["link"]["confidence"], 0.9)
+
+    def test_without_an_allow_list_nothing_is_read_at_all(self):
+        """AR-1. The permissive path is what minted `AUG-25`; prose is worse."""
+        self.assertIsNone(vscode_read.scan_for_key(
+            {"message": {"text": "fix IML-6500"}}, ()))
+        events = vscode_read.session_events(
+            self._session("fix IML-6500"), "s1", "acme/repo", "feature/26.8")
+        self.assertIsNone(events[0]["context"]["jira_issue_key"])
+
+    def test_key_shaped_noise_from_another_system_is_refused(self):
+        for text in ("ERR-500 on startup", "see CVE-2024 advisory",
+                     "colleague filed TC-12018", "released in PY-311"):
+            self.assertIsNone(
+                vscode_read.scan_for_key({"message": {"text": text}},
+                                         self.PROJECTS), text)
+
+    def test_the_prompt_itself_never_reaches_an_event(self):
+        secret = "IML-6500 and the password is hunter2"
+        events = vscode_read.session_events(
+            self._session(secret), "s1", "acme/repo", "feature/26.8",
+            jira_projects=self.PROJECTS)
+        blob = json.dumps(events)
+        self.assertNotIn("hunter2", blob)
+        self.assertNotIn("password", blob)
+        self.assertIn("IML-6500", blob)
+
+    def test_only_message_text_is_ever_read(self):
+        """The response, the code blocks and tool arguments stay unread."""
+        self.assertEqual(vscode_read.SCAN, ("message.text",))
+        self.assertIsNone(vscode_read.scan_for_key(
+            {"response": [{"value": "IML-6500"}],
+             "metadata": {"codeBlocks": ["IML-6500"]}}, self.PROJECTS))
+
+    def test_two_requests_naming_two_tickets_are_not_merged(self):
+        """Context is per-event, so a session may span tickets honestly."""
+        first, second = a_request(0), a_request(1)
+        first["message"] = {"text": "start on IML-6500"}
+        second["message"] = {"text": "now APR-42 instead"}
+        storage = self.workspace(name="wstwo", requests=[first, second])
+        events = vscode_read.session_events(
+            os.path.join(storage, "chatSessions", "s1.json"), "s1",
+            "acme/repo", "feature/26.8", jira_projects=self.PROJECTS)
+        keys = [e["context"]["jira_issue_key"] for e in events]
+        self.assertIn("IML-6500", keys)
+        self.assertIn("APR-42", keys)
+
+
+class TestRepoDiscovery(ReaderTestCase):
+    """A VS Code-only machine reported `repos: 0` while holding 512 events."""
+
+    def test_a_workspace_with_a_git_dir_is_discovered(self):
+        repo = os.path.join(self.root, "tree")
+        os.makedirs(os.path.join(repo, ".git"))
+        self.workspace(name="wsg", folder=repo, requests=[a_request(0)])
+        self.assertEqual(vscode_read.discover_repos(self.root), [repo])
+
+    def test_a_folder_that_is_not_a_repository_is_not_reported(self):
+        plain = os.path.join(self.root, "notes")
+        os.makedirs(plain)
+        self.workspace(name="wsn", folder=plain, requests=[a_request(0)])
+        self.assertEqual(vscode_read.discover_repos(self.root), [])
+
+    def test_a_deleted_folder_is_left_out_rather_than_reported(self):
+        """Evidence perishes: 24 of 27 workspace folders were already gone."""
+        self.workspace(name="wsd", folder=os.path.join(self.root, "gone"),
+                       requests=[a_request(0)])
+        self.assertEqual(vscode_read.discover_repos(self.root), [])

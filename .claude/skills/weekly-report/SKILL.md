@@ -24,6 +24,42 @@ cat reports/<name>/roster.txt       # who was expected
 
 If `exports/` is empty, stop and say so. Do not write a report from nothing.
 
+**An empty `exports/` does not mean the source was empty.** `admin.py cmd_pull`
+builds its work list from `BITBUCKET_REPOS`, `JIRA_PROJECT_KEYS` and
+`AIO_PROJECTS` (falling back to the Jira keys). Unset means *silently skipped*,
+never *failed* — no file, no error, nothing in the run log. Check `.env` for the
+variable before concluding a source had no data, and name which of the two it
+was in the report. Measured 2026-W34: all three unset, so every poller was
+skipped including AIO, which had a working token the whole time.
+
+**Bundles are filed by `window_start`, not by the days their events cover.** A
+backfill lands in the folder of the week it *started*, so
+`pull --week <name>` alone silently misses it. Measured 2026-W34:
+`insight backfill --since 2026-08-01` put that engineer's whole month —
+including every W34 event — in `bundles/2026-W31/`, and pulling W34 returned
+zero bundles for a week that had three days of activity. Pull a span into one
+inbox, run `importers/bundle.py` over it, and let the generator filter:
+
+```bash
+for n in 28 29 30 31 32 33 34 35 36; do
+  python3 importers/pull.py --week 2026-W$n \
+    --inbox reports/<name>/inbox --roster reports/<name>/roster.txt
+done
+python3 importers/bundle.py --inbox reports/<name>/inbox \
+  --out reports/<name>/exports/laptops.ndjson --state reports/<name>/bundles.json
+```
+
+`weekly_report.py` filters on `event_time` against `--week`, so the extra weeks
+drop out harmlessly.
+
+**Everything you fetch lands under `reports/<name>/`** — poller NDJSON and
+`laptops.ndjson` in `exports/`, raw bundles in `inbox/`, and the
+`GET /v1/people` and `GET /v1/bundles?week=` responses you cite as
+`exports/people.json` and `exports/bundles-<week>.json`. The report asserts who
+was expected and what arrived; that evidence belongs on disk beside it. A
+re-run should not have to re-hit the network, and `reports/` is gitignored,
+which is what makes it the right home.
+
 ## 2. Generate
 
 ```bash
@@ -48,6 +84,8 @@ Open the output and check these, in order. Each has been wrong before.
 | **n=** | Any median over fewer than 5 samples is noise. The generator suppresses percentages below 5; do not quote the raw count as a rate |
 | **Link completeness** | `Explicit-link completeness 0.0%` means no cost metric is admissible. Say it |
 | **Trend** | A dash is "the source produced nothing", never zero |
+| **Enrolled but silent** | "Machine enrolled, no bundle received" is its own state — distinct from "not on the roster" and from "sent a bundle containing zero events". Report which one. Never render it as no AI usage |
+| **A surface that omits a record type** | `AI runs 0` next to 75 `model.call` events means `vscode-copilot-chat` emits no `run.*` at all, not that nobody ran anything. Check whether the event type exists in the stream before reading its count as a measurement |
 
 ## 4. Fold in the daily report
 
@@ -59,7 +97,25 @@ read `None` on 20 of 21 entries. Counting from it would rank people by how
 carefully they fill in forms. Mapping only, and say that in the report if you
 use it at all.
 
-## 5. Say what is missing
+## 5. Check the keys before you quote anything joined to a ticket
+
+`extract_jira_key` accepts anything key-shaped when it gets no allow-list, and
+"passes `projects=`" is not proof the guard was on — the value passed can be
+`None`. Measured 2026-W34, from call sites that all looked correct:
+`fix/AUG-20` → `AUG-20` (a date), `UI-JUN-30` → `JUN-30`, and fabricated keys
+outnumbered real ones **45 to 9** in a live export. Count the project prefixes
+in any export you did not pull yourself:
+
+```bash
+python3 -c "import json,sys,collections; print(collections.Counter(
+  (json.loads(l).get('context') or {}).get('jira_project_key')
+  for l in open(sys.argv[1]) if l.strip()))" reports/<name>/exports/<file>.ndjson
+```
+
+Real keys are `IML`, `APR`, `AERLABS`. Anything else — month abbreviations
+especially — is fabricated and must be NULLed, with the original kept. AR-1.
+
+## 6. Say what is missing
 
 End with what could not be measured and why, naming the source. `docs/METRICS.md`
 holds the current status of all ten metrics — one live, one with a caveat, two

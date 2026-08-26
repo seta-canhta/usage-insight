@@ -498,7 +498,9 @@ class Session:
             # yields "AUG-25", which is a date. `run.bound` carries the commit
             # range instead, and the warehouse resolves that to a ticket.
             jira_issue_key=common.extract_jira_key(
-                None, self.branch, projects=self.jira_projects),
+                None, self.branch,
+                projects=common.validated_projects(self.jira_projects,
+                                                   source="jira_projects")),
             repo_full_name=self.repo,
             branch_name=self.branch,
         )

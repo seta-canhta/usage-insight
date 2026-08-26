@@ -1341,14 +1341,19 @@ class TestMultipleRepos(TestScan):
     commands — the one they forget is the one that silently reports nothing.
 
     Registration is now a fallback rather than the mechanism: `scan` reads the
-    registered list *and* every git tree Copilot's journals name. These tests
-    cover the registered half, so they point discovery at an empty directory —
-    otherwise the result depends on what is in the developer's own ~/.copilot.
+    registered list *and* every git tree either surface names. These tests
+    cover the registered half, so they point both discoveries at empty
+    directories — otherwise the result depends on what is in the developer's
+    own ~/.copilot and VS Code storage. Both, because a VS Code-only machine
+    discovering nothing is exactly the gap `vscode_read.discover_repos` closes,
+    and a test that leaves it pointed at the real one passes or fails according
+    to which repositories the developer happens to have open.
     """
 
     def setUp(self):
         super().setUp()
         self.insight.COPILOT_ROOT = os.path.join(self.home, "no-copilot")
+        self.insight.VSCODE_ROOT = os.path.join(self.home, "no-vscode")
 
     def second_repo(self):
         other = tempfile.mkdtemp(prefix="insight-repo2-")

@@ -18,9 +18,26 @@ _SPEC = importlib.util.spec_from_file_location(
 )
 pw = importlib.util.module_from_spec(_SPEC)
 sys.modules["people_workbook"] = pw
-_SPEC.loader.exec_module(pw)
 
-from openpyxl import load_workbook  # noqa: E402
+# openpyxl is an optional dependency: `people_workbook.py` guards its import and
+# exits when it is missing, so importing this module on a machine without it
+# aborts the whole `report` suite rather than reporting one absent tool. A tool
+# that is not installed is a skip, not a failure -- and rendering it as a
+# failure is the same mistake this project refuses to make with data.
+#
+#     python3 -m pip install openpyxl     # to actually run them
+try:
+    _SPEC.loader.exec_module(pw)
+    from openpyxl import load_workbook  # noqa: E402
+    HAS_OPENPYXL = True
+except (ImportError, SystemExit):
+    HAS_OPENPYXL = False
+    load_workbook = None
+
+
+def load_tests(loader, tests, pattern):     # noqa: D103 -- unittest protocol
+    return tests if HAS_OPENPYXL else unittest.TestSuite()
+
 
 # Synthetic account ids in both Atlassian shapes -- the legacy 24-hex form and
 # the newer "712020:<uuid>" form -- because the code slices and compares them.
