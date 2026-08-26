@@ -69,6 +69,14 @@ jobs:
           local = set()
           for d in ("cli", "pollers", "collector"):
               local |= {p.stem for p in pathlib.Path(d).rglob("*.py")}
+          # The shared library is a package, so its stem is `__init__`, not
+          # `common`. Without this the guard reports the one import every
+          # module in cli/ makes as a third-party dependency -- which it did,
+          # and it failed the first release after common/ moved to the root.
+          # The same line is in tests.yml; this copy is why a green `tests`
+          # run is not proof that `release` will build.
+          local |= {p.parent.name
+                    for p in pathlib.Path(".").glob("*/__init__.py")}
           bad = []
           for path in sorted(pathlib.Path("cli").rglob("*.py")):
               tree = ast.parse(path.read_text(encoding="utf-8"), str(path))
