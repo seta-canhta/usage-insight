@@ -52,6 +52,32 @@ checks it with the same function, so the two cannot disagree about what
 The admin token is required with no default. The read routes expose every
 engineer at once and are never left open by accident.
 
+### Reading from outside the office
+
+The read routes are not published by default, because they expose every
+engineer at once and `INSIGHT_ADMIN_TOKEN` would be the only thing in the way.
+`server/compose.yaml` publishes the upload-only listener; the full one is
+reached over SSH.
+
+Where that is not workable — the weekly pull is done from a laptop that is
+often not on the office network, and no identity proxy is available in front —
+set `INSIGHT_PUBLISHED_PORT=8479` and restart. **This was chosen deliberately
+for this deployment, 2026-08-26.** What it means, stated plainly so nobody has
+to rediscover it:
+
+- The admin token becomes the single credential protecting the whole team's
+  telemetry and their work email addresses.
+- It travels in shell history and in whatever `.env` the puller keeps. Treat it
+  the way you would treat a production database password.
+- Rotate it whenever it has been echoed, pasted or logged — `python3 -c "import
+  secrets;print(secrets.token_urlsafe(32))" > /etc/insight/admin.token` and
+  restart. Nothing else needs changing; upload secrets are unaffected.
+- Reversible at any time: set it back to `8480` and restart.
+
+The better answer, when it becomes available, is an identity proxy on the read
+paths — Cloudflare Access or equivalent — which puts a real login in front and
+leaves the admin token as a second layer rather than the only one.
+
 `INSIGHT_UPLOAD_PORT` is for the case where the thing terminating TLS is on
 **another machine**. It cannot reach a container network, so it has to be given
 a host port — and its configuration, not yours, decides which paths it

@@ -55,13 +55,23 @@ services:
     # port. INSIGHT_PUBLISH is that address; set it to the LAN interface only
     # (192.168.x.y:8479), never to a bare 8479, which binds every interface.
     #
-    # It maps to the **upload-only** listener, never to 8479 inside the
-    # container. That gateway's config decides which paths it forwards, and if
-    # it forwards all of them the read routes -- every engineer in one response
-    # -- become internet-reachable behind nothing but the admin token. The
-    # process enforces the split the network is not enforcing.
+    # INSIGHT_PUBLISHED_PORT decides which listener is behind it:
+    #
+    #   8480  uploads and /healthz only. The default, and the safe one: that
+    #         gateway's config decides which paths it forwards, and if it
+    #         forwards all of them the read routes -- every engineer in one
+    #         response -- would be internet-reachable behind nothing but the
+    #         admin token. The process enforces the split the network cannot.
+    #
+    #   8479  the read routes too. A deliberate choice, not a default: it makes
+    #         the admin token the only thing between the internet and the whole
+    #         team's telemetry and work addresses. Take it when pulling has to
+    #         work from outside the office and an identity proxy in front is not
+    #         available -- and then treat that token as the credential it has
+    #         become: rotate it on exposure, never in a shared channel, never
+    #         committed. Reversible by setting this back to 8480 and restarting.
     ports:
-      - "${INSIGHT_PUBLISH:-127.0.0.1:8479}:8480"
+      - "${INSIGHT_PUBLISH:-127.0.0.1:8479}:${INSIGHT_PUBLISHED_PORT:-8480}"
 
     volumes:
       - "${INSIGHT_CONF:-./etc}:/etc/insight:ro"
