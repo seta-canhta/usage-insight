@@ -206,11 +206,16 @@ def missed_streak(reported: Set[date], expected: Sequence[date]) -> int:
 def _post(url: str, body: bytes, headers: Dict[str, str], timeout: int) -> int:
     request = urllib.request.Request(url, data=body, headers=headers)
     try:
-        with urllib.request.urlopen(request, timeout=timeout) as response:
+        with urllib.request.urlopen(request, timeout=timeout,
+                                    context=common.ssl_context()) as response:
             return response.status
     except urllib.error.HTTPError as exc:
         return exc.code
     except (urllib.error.URLError, OSError) as exc:
+        if common.is_certificate_error(exc):
+            # An alert that cannot be delivered is the failure this whole file
+            # exists to prevent, so it says why rather than "unreachable".
+            raise WatchError("{}: {}".format(url, common.CERT_ADVICE))
         raise WatchError("{} unreachable: {}".format(url, exc))
 
 

@@ -571,13 +571,19 @@ second credential, and does not blame the whitelist.
 
 ### One more thing that is not the network
 
-`ship` uploads over HTTPS with `urllib`, and a stock python.org build on macOS
+Everything here talks HTTPS with `urllib`, and a stock python.org build on macOS
 has an **empty** trust store until somebody runs `Install Certificates.command`
-— which nobody does. Every upload then fails with `unable to get local issuer
+— which nobody does. Calls then fail with `unable to get local issuer
 certificate`, on a machine where `curl` to the same URL works, because `curl`
-reads the system bundle. `ship` now falls back to that same bundle, and never
-falls back to not verifying: an unverified upload of a sealed bundle is worse
-than a failed one, because it looks like it worked.
+reads the system bundle.
+
+`pollers/common.ssl_context()` falls back to that same bundle, and every caller
+uses it — the uploader, the puller, and the watchdog posting to ntfy. It lives
+in one place because the bug is per-machine, not per-tool: fixing it in the
+uploader alone gives you a client that ships fine and a weekly pull that cannot
+reach the same host, which is exactly what happened. It never falls back to not
+verifying: an unverified transfer of a sealed bundle is worse than a failed one,
+because it looks like it worked.
 
 ### Turning it on
 

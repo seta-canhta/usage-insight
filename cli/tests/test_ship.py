@@ -296,27 +296,11 @@ class TrustStoreTests(unittest.TestCase):
     A python.org build ships with an empty trust store until somebody runs
     `Install Certificates.command`, which nobody does -- so every upload fails
     with "unable to get local issuer certificate" on a machine where `curl` to
-    the same URL works.
+    the same URL works. The context is shared with `pull.py` and `watch.py`:
+    the bug is per-machine, not per-tool, and fixing it in one caller is how
+    you get a client that uploads fine and a weekly pull that cannot reach the
+    same host.
     """
-
-    def test_the_context_has_certificates_to_verify_against(self):
-        self.assertTrue(ship_mod._ssl_context().get_ca_certs())
-
-    def test_verification_is_never_switched_off(self):
-        # The tempting fix. An unverified upload of a sealed bundle is worse
-        # than a failed one, because it looks like it worked.
-        context = ship_mod._ssl_context()
-        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
-        self.assertTrue(context.check_hostname)
-
-    def test_an_empty_default_store_falls_back_to_the_system_bundle(self):
-        self.addCleanup(setattr, ssl, "create_default_context",
-                        ssl.create_default_context)
-        ssl.create_default_context = lambda *a, **k: ssl.SSLContext(
-            ssl.PROTOCOL_TLS_CLIENT)          # loads nothing
-        context = ship_mod._ssl_context()
-        self.assertTrue(context.get_ca_certs(),
-                        "no CA bundle found on this machine to fall back to")
 
     def test_a_certificate_failure_is_not_retried(self):
         # It will not verify on the third attempt either, and the retries only

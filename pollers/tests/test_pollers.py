@@ -2073,5 +2073,52 @@ class TestAioReleaseAndPriorityScope(unittest.TestCase):
         self.assertEqual(poll_aio.priority_name(case), "High")
 
 
+class TrustStoreTests(unittest.TestCase):
+    """Every part of this talks HTTPS, and the trust store is per-machine.
+
+    A stock python.org build on macOS has an empty one until somebody runs
+    `Install Certificates.command`, which nobody does. Fixing it in the
+    uploader alone is how you get a client that ships fine and a weekly pull
+    that cannot reach the same host -- so it lives here, shared.
+    """
+
+    def test_the_context_has_certificates_to_verify_against(self):
+        self.assertTrue(common.ssl_context().get_ca_certs())
+
+    def test_verification_is_never_switched_off(self):
+        # The tempting fix. An unverified transfer of a sealed bundle is worse
+        # than a failed one, because it looks like it worked.
+        import ssl
+        context = common.ssl_context()
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    def test_an_empty_default_store_falls_back_to_the_system_bundle(self):
+        import ssl
+        self.addCleanup(setattr, ssl, "create_default_context",
+                        ssl.create_default_context)
+        ssl.create_default_context = lambda *a, **k: ssl.SSLContext(
+            ssl.PROTOCOL_TLS_CLIENT)          # loads nothing
+        self.assertTrue(common.ssl_context().get_ca_certs(),
+                        "no CA bundle on this machine to fall back to")
+
+    def test_a_wrapped_certificate_error_is_recognised(self):
+        # urlopen raises URLError with the SSL error as `.reason`; a caller
+        # checking isinstance on the outer exception sees nothing.
+        import ssl
+        import urllib.error
+        inner = ssl.SSLCertVerificationError("unable to get local issuer")
+        self.assertTrue(common.is_certificate_error(inner))
+        self.assertTrue(common.is_certificate_error(urllib.error.URLError(inner)))
+
+    def test_an_ordinary_network_error_is_not_one(self):
+        import urllib.error
+        self.assertFalse(
+            common.is_certificate_error(urllib.error.URLError("timed out")))
+
+    def test_the_advice_names_the_fix(self):
+        self.assertIn("Install Certificates", common.CERT_ADVICE)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

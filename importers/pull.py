@@ -35,12 +35,18 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import ssl
 import sys
 import urllib.error
 import urllib.parse
 import urllib.request
 from typing import Any, Dict, List, Optional, Tuple
+
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.join(_ROOT, "pollers"), os.path.join(_ROOT, "importers")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+
+import common  # noqa: E402  -- the shared trust store; see common.ssl_context
 
 USER_AGENT = "insight-pull/1"
 
@@ -60,11 +66,13 @@ def _get(url: str, token: str, timeout: int) -> Tuple[int, bytes]:
     })
     try:
         with urllib.request.urlopen(
-                request, timeout=timeout, context=ssl.create_default_context()) as response:
+                request, timeout=timeout, context=common.ssl_context()) as response:
             return response.status, response.read()
     except urllib.error.HTTPError as exc:
         return exc.code, exc.read()
     except (urllib.error.URLError, OSError) as exc:
+        if common.is_certificate_error(exc):
+            raise PullError("{}: {}".format(url, common.CERT_ADVICE))
         raise PullError("{} unreachable: {}".format(url, exc))
 
 

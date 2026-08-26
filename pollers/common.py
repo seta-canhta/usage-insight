@@ -1326,6 +1326,72 @@ def default_since(watermark: Optional[str], lookback_days: int = 30) -> str:
 
 
 # ---------------------------------------------------------------------------
+# TLS -- one trust store, shared, because every part of this talks HTTPS
+# ---------------------------------------------------------------------------
+
+#: Where to look for a CA bundle when Python's own trust store is empty, in the
+#: order they are tried. The first is macOS's system bundle -- the same one
+#: `curl` reads, which is why `curl` works on a machine where Python does not.
+CA_BUNDLES = (
+    "/etc/ssl/cert.pem",                        # macOS, FreeBSD
+    "/etc/ssl/certs/ca-certificates.crt",       # Debian, Ubuntu
+    "/etc/pki/tls/certs/ca-bundle.crt",         # Fedora, RHEL
+)
+
+
+def ssl_context() -> "ssl.SSLContext":
+    """A context that can actually verify a certificate.
+
+    A stock python.org build on macOS ships with an **empty** trust store until
+    somebody runs ``Install Certificates.command``, which nobody does. Every
+    HTTPS call then fails with ``unable to get local issuer certificate`` on a
+    machine where ``curl`` to the same URL works.
+
+    Lives here rather than in one caller because every part of this system
+    talks HTTPS eventually -- the uploader, the puller, the watchdog posting to
+    ntfy -- and the bug is per-machine, not per-tool. Fixing it in one place and
+    leaving the others is how you get a client that uploads fine and a weekly
+    pull that cannot reach the same host.
+
+    Verification is never turned off: an unverified transfer of a sealed bundle
+    is worse than a failed one, because it looks like it worked.
+    """
+    import ssl                                                   # noqa: PLC0415
+
+    context = ssl.create_default_context()
+    if context.get_ca_certs():
+        return context
+    for candidate in CA_BUNDLES:
+        if not os.path.exists(candidate):
+            continue
+        try:
+            context.load_verify_locations(cafile=candidate)
+        except (OSError, ssl.SSLError):
+            continue
+        if context.get_ca_certs():
+            return context
+    return context          # still empty: let it fail, and explain why
+
+
+def is_certificate_error(exc: BaseException) -> bool:
+    """``urlopen`` wraps the SSL error in a ``URLError``; unwrap one level."""
+    import ssl                                                   # noqa: PLC0415
+
+    for candidate in (exc, getattr(exc, "reason", None)):
+        if isinstance(candidate, ssl.SSLCertVerificationError):
+            return True
+    return False
+
+
+CERT_ADVICE = (
+    "this machine cannot verify the certificate -- Python's trust store is "
+    "empty, which is the default on a python.org install for macOS. Run "
+    "\"/Applications/Python 3.x/Install Certificates.command\", or point "
+    "SSL_CERT_FILE at a CA bundle"
+)
+
+
+# ---------------------------------------------------------------------------
 # Diagnostics -- stderr only, never event content, never credentials
 # ---------------------------------------------------------------------------
 
