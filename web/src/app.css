@@ -62,3 +62,11 @@ body {
   .ledger-cell { animation: none; }
   * { transition-duration: 1ms !important; }
 }
+
+/* The gate is the whole page when it is showing, so it centres against the
+   viewport rather than sitting at the top of an empty one. */
+.gate {
+  min-height: 100dvh;
+  display: grid;
+  place-items: center;
+}

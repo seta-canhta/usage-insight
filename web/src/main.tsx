@@ -2,7 +2,7 @@
 // there are exactly two destinations and neither takes a parameter, so a
 // routing library would be more moving parts than the problem has.
 
-import {StrictMode, useEffect, useState} from 'react';
+import {StrictMode, useCallback, useEffect, useState} from 'react';
 import {createRoot} from 'react-dom/client';
 
 import '@astryxdesign/core/reset.css';
@@ -33,10 +33,13 @@ import {Banner} from '@astryxdesign/core/Banner';
 
 import {Activities, ActivitiesHero} from './Activities';
 import {Insights, InsightsHero} from './Insights';
+import {Gate} from './Gate';
 import {Shell} from './shell';
 import type {Screen} from './shell';
 import type {Snapshot} from './data';
 import {fetchSnapshot} from './data';
+import {check, signOut} from './session';
+import type {SessionState} from './session';
 
 function screenOf(path: string): Screen {
   return path.startsWith('/activities') ? 'activities' : 'insights';
@@ -44,6 +47,7 @@ function screenOf(path: string): Screen {
 
 function App() {
   const [screen, setScreen] = useState<Screen>(() => screenOf(window.location.pathname));
+  const [session, setSession] = useState<SessionState>('unknown');
   const [snap, setSnap] = useState<Snapshot | null>(null);
   const [failed, setFailed] = useState<string | null>(null);
   const [picked, setPicked] = useState<string | null>(null);
@@ -54,11 +58,38 @@ function App() {
     return () => window.removeEventListener('popstate', onPop);
   }, []);
 
+  // Ask whether the cookie we already hold is good before fetching anything.
+  // Otherwise a signed-out visitor's first sight of the page is a failed
+  // request, and "not signed in" and "the figures are broken" look the same.
   useEffect(() => {
-    fetchSnapshot()
-      .then(setSnap)
-      .catch((error: Error) => setFailed(error.message));
+    check().then(setSession);
   }, []);
+
+  const load = useCallback(() => {
+    setFailed(null);
+    fetchSnapshot()
+      .then(payload => {
+        setSnap(payload);
+        setSession('in');
+      })
+      .catch((error: Error) => {
+        // A session can lapse while the page is open -- twelve hours, or a
+        // restart, which mints a new signing key. Drop back to the gate rather
+        // than showing an error about something the reader can just fix.
+        if (error.message === 'signed-out') {
+          setSession('out');
+          setSnap(null);
+          return;
+        }
+        setFailed(error.message);
+      });
+  }, []);
+
+  useEffect(() => {
+    if (session === 'in') {
+      load();
+    }
+  }, [session, load]);
 
   // The nav items are real links, so a middle-click or a bookmark still works.
   // A plain left-click is intercepted to swap the screen without a round trip.
@@ -80,18 +111,32 @@ function App() {
     return () => document.removeEventListener('click', onClick);
   }, []);
 
+  const leave = useCallback(async () => {
+    await signOut();
+    setSnap(null);
+    setSession('out');
+  }, []);
+
+  if (session === 'unknown') {
+    return (
+      <VStack gap={3} padding={6} vAlign="center">
+        <Spinner size="md" label="Checking your sign-in" />
+      </VStack>
+    );
+  }
+
+  if (session === 'out') {
+    return <Gate onOpen={() => setSession('in')} />;
+  }
+
   if (failed) {
     return (
       <VStack gap={4} padding={6}>
         <Heading level={2}>Nothing to show yet</Heading>
         <Banner
-          status={failed === 'signed-out' ? 'warning' : 'error'}
-          title={failed === 'signed-out' ? 'Sign in first' : 'The figures have not been generated'}
-          description={
-            failed === 'signed-out'
-              ? 'Open the daybook, sign in with the passcode, then come back to this page.'
-              : failed
-          }
+          status="error"
+          title="The figures have not been generated"
+          description={failed}
         />
         <Text type="supporting" color="secondary">
           Nothing here is a zero. Until the figures load there is simply nothing to read.
@@ -114,6 +159,7 @@ function App() {
       people={snap.people}
       picked={picked}
       onPick={setPicked}
+      onSignOut={leave}
       hero={screen === 'insights' ? <InsightsHero snap={snap} /> : <ActivitiesHero />}>
       {screen === 'insights' ? (
         <Insights snap={snap} picked={picked} />

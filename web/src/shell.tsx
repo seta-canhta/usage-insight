@@ -17,8 +17,10 @@ import {
   SegmentedControl,
   SegmentedControlItem,
 } from '@astryxdesign/core/SegmentedControl';
+import {Button} from '@astryxdesign/core/Button';
 import {
   ArrowDownIcon,
+  ArrowRightStartOnRectangleIcon,
   ArrowUpIcon,
   ArrowsUpDownIcon,
   ChartBarSquareIcon,
@@ -36,6 +38,7 @@ export function Shell({
   people,
   picked,
   onPick,
+  onSignOut,
   hero,
   children,
 }: {
@@ -43,6 +46,7 @@ export function Shell({
   people: Person[];
   picked: string | null;
   onPick: (name: string | null) => void;
+  onSignOut: () => void;
   /** Each screen opens with its own thesis. There is no shared page title:
    *  one would only repeat what the hero already says, and the nav already
    *  says which screen you are on. */
@@ -52,7 +56,19 @@ export function Shell({
   return (
     <AppShell
       sideNav={
-        <SideNav>
+        <SideNav
+          footerIcons={
+            // Signing out has to be reachable from here too. It lived only on
+            // the daybook, which made the session look like that page's
+            // property when it is one session across all three screens.
+            <Button
+              label="Sign out"
+              variant="ghost"
+              size="sm"
+              onClick={onSignOut}
+              icon={<Icon icon={ArrowRightStartOnRectangleIcon} size="sm" />}
+            />
+          }>
           <SideNavItem
             label="Insights"
             href="/insights"
