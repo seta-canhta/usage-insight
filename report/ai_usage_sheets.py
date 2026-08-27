@@ -47,10 +47,24 @@ import sys
 
 try:
     from openpyxl import load_workbook
+    from openpyxl.chart import BarChart, LineChart, Reference
+    from openpyxl.chart.label import DataLabelList
+    from openpyxl.chart.marker import Marker
     from openpyxl.styles import Alignment, Font, PatternFill
     from openpyxl.utils import get_column_letter
 except ImportError:  # pragma: no cover - dependency guard
     sys.exit("ai_usage_sheets.py needs openpyxl:  python3 -m pip install openpyxl")
+
+
+#: Categorical slots 1 and 2, validated together for colour-vision deficiency:
+#: worst adjacent pair dE 24.7 protan / 33.6 normal, against a target of 8.
+#: Two people, two hues, assigned in fixed order and never cycled -- a person
+#: keeps their colour on every chart in the file, so identity survives a glance
+#: from one chart to the next.
+SERIES = ["2A78D6", "EB6834"]
+#: One hue for magnitude. Coverage is a quantity, not an identity.
+MAGNITUDE = "1F6FB2"
+PT = 12700  # EMU per point
 
 
 def parse_person(value):
@@ -526,7 +540,10 @@ def render(wb, data, weeks, full_weeks, window_label):
         "A blank cell is a quantity with no denominator that week, never a zero.",
     ])
 
-    order = ["Summary", "Ten Metrics", "AI Usage", "Productivity"]
+    charts(wb, data, weeks, window_label)
+
+    order = ["Summary", "Charts", "Ten Metrics", "AI Usage",
+             "Productivity", "Chart Data"]
     wb._sheets = ([wb[t] for t in order if t in wb.sheetnames] +
                   [s for s in wb._sheets if s.title not in order])
 
@@ -551,6 +568,10 @@ def main(argv=None):
                    metavar="MODEL=IN/OUT",
                    help="Repeatable, per 1M tokens. A model with no price is "
                         "counted and left unpriced, never guessed.")
+    p.add_argument("--keep-generated-charts", action="store_true",
+                   help="Keep people_workbook.py's Trend Charts/Trend Data "
+                        "sheets. They are superseded by the Charts sheet and "
+                        "are dropped by default.")
     p.add_argument("--partial", action="append", default=[],
                    metavar="YYYY-Www=REASON",
                    help="Repeatable. Labels a week's Window column.")
@@ -576,6 +597,9 @@ def main(argv=None):
     data = collect(args.input, people, weeks, prices)
     wb = load_workbook(args.workbook)
     render(wb, data, weeks, full, labels)
+    if not args.keep_generated_charts:
+        drop_superseded(wb)
+    colour_tabs(wb)
     wb.save(args.workbook)
 
     print(json.dumps({
@@ -583,12 +607,260 @@ def main(argv=None):
         "people": sorted(people.values()), "weeks": len(weeks),
         "cycles": len(data["coverage_by_cycle"]),
         "priced_models": sorted(prices),
+        "superseded_dropped": not args.keep_generated_charts,
         "unpriced_calls": sum((data["cost"][n][w] or {}).get("unpriced", 0)
                               for n in data["names"] for w in weeks
                               if data["cost"][n].get(w)),
     }, sort_keys=True))
     return 0
 
+
+
+# --------------------------------------------------------------------------
+# charts
+# --------------------------------------------------------------------------
+#
+# The form is chosen by the data's job, not by habit. The sheet this replaces
+# carried eleven line charts of identical shape, several of them plotting
+# sequences like 0, 0, 1, 0 -- a line implies continuity between points, and
+# four discrete weekly counts have none. What each chart here is for:
+#
+#   coverage by cycle   magnitude across 7 named things   -> sorted bar, one hue
+#   prompts per week    change over time, 2 people        -> line, 2 hues
+#   action rate         a rate over time                  -> line, axis pinned
+#   scripts / cost      discrete weekly counts            -> grouped column
+#
+# Two people means two categorical hues in fixed order; a legend is always
+# present, so identity is never carried by colour alone.
+
+def _line(chart):
+    """Recessive chrome. Hairline axes, no gridline hatching, thin marks."""
+    chart.y_axis.majorGridlines = None
+    chart.x_axis.delete = False
+    chart.y_axis.delete = False
+    chart.height, chart.width = 7.5, 17
+    return chart
+
+
+def _paint(series, hex_colour, line=True, marker=False):
+    gp = series.graphicalProperties
+    if line:
+        gp.line.solidFill = hex_colour
+        gp.line.width = 2 * PT
+        series.smooth = False
+        if marker:
+            series.marker = Marker(symbol="circle", size=7)
+            series.marker.graphicalProperties.solidFill = hex_colour
+            series.marker.graphicalProperties.line.solidFill = hex_colour
+    else:
+        gp.solidFill = hex_colour
+        gp.line.noFill = True
+
+
+def charts(wb, data, weeks, window_label):
+    """A Charts sheet, plus the data blocks the charts read from."""
+    names = data["names"]
+    ai, bb, cost = data["ai"], data["bb"], data["cost"]
+    ws = fresh(wb, "Charts")
+    src = fresh(wb, "Chart Data")
+
+    ws.column_dimensions["A"].width = 2
+    ws.cell(row=1, column=2, value="Where the work is, and how the AI is being used"
+            ).font = Font(bold=True, size=14)
+    ws.cell(row=2, column=2,
+            value="Every chart reads from the Chart Data sheet, which is the "
+                  "table view of the same numbers.").font = NOTE
+
+    sr = 1
+
+    def block(title, categories, series_rows):
+        """Write a titled data block; return (first_data_row, cat_col, n)."""
+        nonlocal sr
+        src.cell(row=sr, column=1, value=title).font = GRP
+        sr += 1
+        head_row = sr
+        src.cell(row=sr, column=1, value="")
+        for i, (label, _) in enumerate(series_rows, 2):
+            src.cell(row=sr, column=i, value=label)
+        sr += 1
+        first = sr
+        for j, cat in enumerate(categories):
+            src.cell(row=sr, column=1, value=cat)
+            for i, (_, vals) in enumerate(series_rows, 2):
+                v = vals[j]
+                src.cell(row=sr, column=i, value=v if v is not None else None)
+            sr += 1
+        last = sr - 1
+        sr += 1
+        return head_row, first, last, len(series_rows)
+
+    # 1 -------------------------------------------------- coverage by cycle
+    cov = data["coverage_by_cycle"]
+    order = sorted(cov, key=lambda k: -(cov[k]["pct"] or 0))
+    labels = ["%s  (%d cases)" % (k, cov[k]["cases"]) for k in order]
+    hr, f, l, n = block("Automation coverage by cycle (%)", labels,
+                        [("Automated %", [cov[k]["pct"] for k in order])])
+    ch = _line(BarChart())
+    ch.type, ch.style = "bar", None            # horizontal: long category names
+    ch.title = "Automation coverage by cycle"
+    ch.y_axis.title = "% of the cycle's cases automated"
+    ch.y_axis.scaling.min, ch.y_axis.scaling.max = 0, 100
+    ch.add_data(Reference(src, min_col=2, min_row=hr, max_row=l), titles_from_data=True)
+    ch.set_categories(Reference(src, min_col=1, min_row=f, max_row=l))
+    _paint(ch.series[0], MAGNITUDE, line=False)
+    ch.dataLabels = DataLabelList()
+    ch.dataLabels.showVal = True
+    ch.legend = None                            # one series: the title names it
+    ch.height = 9
+    ws.add_chart(ch, "B4")
+
+    # 2 ------------------------------------------------------ prompts/week
+    shown = [w for w in weeks if any(ai[n][w]["human.turn"] for n in names)]
+    hr, f, l, n = block(
+        "AI prompts per week", [w[-3:] for w in shown],
+        [(nm, [ai[nm][w]["human.turn"] for w in shown]) for nm in names])
+    ch = _line(LineChart())
+    ch.title = "AI prompts per week"
+    ch.y_axis.title = "prompts"
+    ch.add_data(Reference(src, min_col=2, max_col=1 + n, min_row=hr, max_row=l),
+                titles_from_data=True)
+    ch.set_categories(Reference(src, min_col=1, min_row=f, max_row=l))
+    for i, s in enumerate(ch.series):
+        _paint(s, SERIES[i % len(SERIES)], marker=True)
+    ws.add_chart(ch, "B24")
+
+    # 3 -------------------------------------------------------- action rate
+    hr, f, l, n = block(
+        "Action rate % (tool calls / prompts)", [w[-3:] for w in shown],
+        [(nm, [pct(ai[nm][w]["tool.call"], ai[nm][w]["human.turn"])
+               for w in shown]) for nm in names])
+    ch = _line(LineChart())
+    ch.title = "Action rate: is the assistant doing work, or answering?"
+    ch.y_axis.title = "% of prompts that led to a tool call"
+    # Pinned. On an auto axis a 4-20% band fills the plot and reads as chaos.
+    ch.y_axis.scaling.min, ch.y_axis.scaling.max = 0, 30
+    ch.add_data(Reference(src, min_col=2, max_col=1 + n, min_row=hr, max_row=l),
+                titles_from_data=True)
+    ch.set_categories(Reference(src, min_col=1, min_row=f, max_row=l))
+    for i, s in enumerate(ch.series):
+        _paint(s, SERIES[i % len(SERIES)], marker=True)
+    ws.add_chart(ch, "B40")
+
+    # 4 --------------------------------------------------- scripts touched
+    hr, f, l, n = block(
+        "Automation scripts touched per week", [w[-3:] for w in shown],
+        [(nm, [bb[nm][w]["scripts_added"] + bb[nm][w]["scripts_modified"]
+               for w in shown]) for nm in names])
+    ch = _line(BarChart())
+    ch.type, ch.grouping, ch.style = "col", "clustered", None
+    ch.title = "Automation scripts touched per week"
+    ch.y_axis.title = "spec / step-definition files"
+    ch.add_data(Reference(src, min_col=2, max_col=1 + n, min_row=hr, max_row=l),
+                titles_from_data=True)
+    ch.set_categories(Reference(src, min_col=1, min_row=f, max_row=l))
+    for i, s in enumerate(ch.series):
+        _paint(s, SERIES[i % len(SERIES)], line=False)
+    ch.gapWidth = 60
+    ws.add_chart(ch, "B56")
+
+    # 5 ----------------------------------------------------------- cost
+    hr, f, l, n = block(
+        "Modelled token cost per week ($)", [w[-3:] for w in shown],
+        [(nm, [(cost[nm].get(w) or {}).get("modelled") for w in shown])
+         for nm in names])
+    ch = _line(BarChart())
+    ch.type, ch.grouping, ch.style = "col", "clustered", None
+    ch.title = "Modelled token cost per week (not the invoice)"
+    ch.y_axis.title = "USD, list price"
+    ch.add_data(Reference(src, min_col=2, max_col=1 + n, min_row=hr, max_row=l),
+                titles_from_data=True)
+    ch.set_categories(Reference(src, min_col=1, min_row=f, max_row=l))
+    for i, s in enumerate(ch.series):
+        _paint(s, SERIES[i % len(SERIES)], line=False)
+    ch.gapWidth = 60
+    ws.add_chart(ch, "B72")
+
+    r = 88
+    partials = [w for w in shown if w in window_label]
+    notes(ws, r, [
+        "Colour is fixed per person across every chart, so identity survives a "
+        "glance from one to the next. A legend is always present.",
+        "Coverage is per CYCLE. A cycle at 0%% is a manual suite, not a failure.",
+        "The action-rate axis is pinned 0-30%%: on an auto axis a 4-20%% band "
+        "fills the plot and reads as a crisis.",
+        "Partial windows, not comparable on volume: "
+        + ("; ".join("%s = %s" % (w[-3:], window_label[w]) for w in partials)
+           if partials else "none"),
+        "Token cost is modelled from a minority of priced calls, at list price, "
+        "and excludes the per-seat charge that is the actual bill.",
+    ])
+
+
+# --------------------------------------------------------------------------
+# tab colours: which sheets are the answer, which are the evidence
+# --------------------------------------------------------------------------
+#
+# Fifteen tabs with identical grey labels tell a reader nothing about where to
+# start, and the sheets that hold the answer look exactly like the ones that
+# hold six hundred rows of test runs. Three roles, three colours, stated on the
+# first sheet so the code is not folklore:
+#
+#   INSIGHT   read these        the accent, matching the header fill
+#   EVIDENCE  the rows behind   neutral grey, deliberately recessive
+#   CAVEATS   read before quoting  amber -- it says what is NOT measured
+#
+# The accent is the same hue as the charts' magnitude colour, so "this is the
+# point" looks the same everywhere in the file.
+
+INSIGHT_TAB = "1F3864"
+EVIDENCE_TAB = "A6A6A6"
+CAVEAT_TAB = "EDA100"
+
+INSIGHT = ("Summary", "Charts", "Ten Metrics", "AI Usage", "Productivity")
+CAVEATS = ("Coverage & Gaps",)
+
+
+#: Written by people_workbook.py and superseded by the Charts sheet: eleven
+#: line charts of identical shape, several plotting sequences like 0, 0, 1, 0.
+#: A line implies continuity between its points and four discrete weekly counts
+#: have none. Dropped by default so the file has one place to look; --keep-
+#: generated-charts puts them back.
+SUPERSEDED = ("Trend Charts", "Trend Data")
+
+
+def drop_superseded(wb):
+    for title in SUPERSEDED:
+        if title in wb.sheetnames:
+            del wb[title]
+
+
+def colour_tabs(wb):
+    """Colour every tab by its role, and legend it on the first sheet."""
+    for ws in wb.worksheets:
+        if ws.title in INSIGHT:
+            ws.sheet_properties.tabColor = INSIGHT_TAB
+        elif ws.title in CAVEATS:
+            ws.sheet_properties.tabColor = CAVEAT_TAB
+        else:
+            ws.sheet_properties.tabColor = EVIDENCE_TAB
+
+    if "Summary" not in wb.sheetnames:
+        return
+    ws = wb["Summary"]
+    ws.insert_rows(1, 4)
+    ws.cell(row=1, column=1,
+            value="Dark blue tabs are the answer. Grey tabs are the rows behind "
+                  "it. The amber tab says what is NOT measured -- read it before "
+                  "quoting a number."
+            ).font = Font(bold=True, size=11, color="1F3864")
+    ws.cell(row=2, column=1,
+            value="Start at Charts, then Ten Metrics. AI Usage and Productivity "
+                  "carry the per-week detail behind them."
+            ).font = NOTE
+    ws.cell(row=3, column=1,
+            value="Every figure is counted from events. A blank cell is a "
+                  "quantity nobody measured, never a zero."
+            ).font = NOTE
 
 if __name__ == "__main__":
     sys.exit(main())
