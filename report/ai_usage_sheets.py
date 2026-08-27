@@ -146,6 +146,13 @@ def collect(inputs, people, weeks, prices):
     sess = {n: {w: set() for w in weeks} for n in names}
     toks = {n: {w: [] for w in weeks} for n in names}
     merge = {n: {w: [] for w in weeks} for n in names}
+    #: Per ISO week, project-wide unless the field carries a person.
+    sp = collections.defaultdict(collections.Counter)
+    wk_cycles = collections.defaultdict(set)
+    wk_people = collections.defaultdict(lambda: collections.defaultdict(collections.Counter))
+    wk_folders = collections.defaultdict(collections.Counter)
+    case_history = collections.defaultdict(list)
+    seen_issues = set()
     cycles = collections.defaultdict(
         lambda: {"cases": set(), "auto": set(), "folders": collections.Counter(),
                  "first": None, "last": None, "runs": 0, "failed": 0,
@@ -158,6 +165,15 @@ def collect(inputs, people, weeks, prices):
         w = iso_week(e.get("event_time"))
 
         if t == "test.case.snapshot":
+            # created_at is a fact; updated_at is only the LAST edit, so a case
+            # touched three times in a week counts once and an earlier touch
+            # is overwritten. Stated on the sheet rather than smoothed over.
+            born = iso_week(a.get("created_at"))
+            if born:
+                sp[born]["cases_created"] += 1
+            touched = iso_week(a.get("updated_at"))
+            if touched:
+                sp[touched]["cases_updated"] += 1
             pri = a.get("priority") or "unset"
             st = a.get("automation_status")
             estate[pri]["total"] += 1
@@ -169,6 +185,28 @@ def collect(inputs, people, weeks, prices):
 
         if t == "test.run.completed":
             key, case = a.get("test_cycle_key"), a.get("test_case_key")
+            if case:
+                case_history[case].append(
+                    (a.get("executed_at") or "", a.get("status_category")))
+            spr = iso_week(a.get("executed_at"))
+            if spr:
+                sp[spr]["runs"] += 1
+                cat = (a.get("status_category") or "").lower()
+                if cat in ("passed", "failed", "blocked", "not_run"):
+                    sp[spr][cat] += 1
+                if a.get("is_automated"):
+                    sp[spr]["automated"] += 1
+                sp[spr]["defects"] += a.get("defect_count") or 0
+                if key:
+                    wk_cycles[spr].add(key)
+                if a.get("folder_name"):
+                    wk_folders[spr][a["folder_name"]] += 1
+                runner = people.get(a.get("executed_by_person_id"))
+                if runner:
+                    wk_people[spr][runner]["runs"] += 1
+                    if cat == "failed":
+                        wk_people[spr][runner]["failed"] += 1
+                    wk_people[spr][runner]["defects"] += a.get("defect_count") or 0
             if not key:
                 continue
             c = cycles[key]
@@ -190,6 +228,23 @@ def collect(inputs, people, weeks, prices):
                 c["first"] = min(c["first"] or when, when)
                 c["last"] = max(c["last"] or when, when)
             continue
+
+        if t == "jira.transition":
+            # A QA engineer's headline output is the bugs they raise. Counted
+            # once per issue by its reporter, not once per transition -- an
+            # issue emits one event per status change and counting those would
+            # rank people by how much a ticket moved.
+            iss = a.get("issue") or {}
+            ikey = iss.get("issue_key")
+            if ikey and ikey not in seen_issues:
+                seen_issues.add(ikey)
+                reporter = people.get(iss.get("reporter_person_id"))
+                spr = iso_week(iss.get("created_at"))
+                if reporter and spr:
+                    kind = (iss.get("issue_type") or "Other")
+                    wk_people[spr][reporter]["raised_" + kind.lower()] += 1
+                    if kind == "Bug":
+                        sp[spr]["bugs_raised"] += 1
 
         if not who or w not in weeks:
             continue
@@ -257,9 +312,26 @@ def collect(inputs, people, weeks, prices):
                 "n": len(priced), "calls": calls,
                 "unpriced": len(toks[n][w]) - len(priced)}
 
+    # A case that failed and later passed. The only "fixed" this source can
+    # support, and a thin one: AIO keeps one run per case per cycle and
+    # overwrites on re-run, so a fix inside a cycle leaves no trace at all.
+    for case, runs_ in case_history.items():
+        runs_.sort()
+        for i in range(1, len(runs_)):
+            if runs_[i - 1][1] == "failed" and runs_[i][1] == "passed":
+                spr = iso_week(runs_[i][0])
+                if spr:
+                    sp[spr]["fixed"] += 1
+                break
+
     return {"ai": ai, "bb": bb, "days": days, "sessions": sess, "tokens": toks,
             "merge": merge, "coverage_by_cycle": cov, "estate": dict(estate),
-            "cost": cost, "names": names}
+            "cost": cost, "names": names,
+            "week": {k: dict(v) for k, v in sp.items()},
+            "week_cycles": {k: sorted(v) for k, v in wk_cycles.items()},
+            "week_folders": {k: dict(v) for k, v in wk_folders.items()},
+            "week_people": {k: {p: dict(c) for p, c in v.items()}
+                              for k, v in wk_people.items()}}
 
 
 # --------------------------------------------------------------------------
@@ -547,9 +619,12 @@ def render(wb, data, weeks, full_weeks, window_label):
 
     charts(wb, data, weeks, window_label)
     pm_view(wb, data, weeks, full_weeks, window_label)
+    test_activity(wb, data, weeks, window_label)
+    person_tabs(wb, data, weeks, window_label)
 
-    order = ["Start Here", "Charts", "Summary", "Ten Metrics",
-             "AI Usage", "Productivity", "Chart Data"]
+    order = (["Start Here", "Charts", "Test Activity"] + list(data["names"])
+             + ["Summary", "Ten Metrics", "AI Usage", "Productivity",
+                "Chart Data"])
     wb._sheets = ([wb[t] for t in order if t in wb.sheetnames] +
                   [s for s in wb._sheets if s.title not in order])
 
@@ -605,7 +680,7 @@ def main(argv=None):
     render(wb, data, weeks, full, labels)
     if not args.keep_generated_charts:
         drop_superseded(wb)
-    colour_tabs(wb)
+    colour_tabs(wb, data["names"])
     wb.save(args.workbook)
 
     print(json.dumps({
@@ -1004,12 +1079,17 @@ def pm_view(wb, data, weeks, full_weeks, window_label):
     # ---- the person who runs the tests ------------------------------------
     runner = next((n for n in names if n != builder), None)
     if runner:
-        theirs = sum(c["ours"].get(runner, 0)
-                     for c in data["coverage_by_cycle"].values())
-        block(runner, "runs the tests and manages the tickets",
-              "Too early to say. Her AI use is not settling into a pattern yet, "
-              "and it is costing more per question than it did.", FLAT,
-              [("How often AI did the work, not just answered",
+        wkp = data["week_people"]
+        bugs = [wkp.get(w, {}).get(runner, {}).get("raised_bug", 0) for w in shown]
+        ran = [wkp.get(w, {}).get(runner, {}).get("runs", 0) for w in shown]
+        block(runner, "runs the tests and raises the bugs",
+              "Delivering. %d bugs raised and %d tests run this month. Her AI "
+              "use is not settling into a pattern yet, and it costs more per "
+              "question than it did."
+              % (sum(bugs), sum(ran)), FLAT,
+              [("Bugs she raised for the developers", bugs, True, "%d", False),
+               ("Tests she ran", ran, True, "%d", False),
+               ("How often AI did the work, not just answered",
                 rate(runner, "tool.call", "human.turn"), True, "%.0f%%", True),
                ("Times she asked AI for help",
                 [ai[runner][w]["human.turn"] for w in shown], False, "%d", False),
@@ -1018,11 +1098,10 @@ def pm_view(wb, data, weeks, full_weeks, window_label):
                        / ai[runner][w]["human.turn"], 2)
                  if ai[runner][w]["human.turn"] else None for w in shown],
                 False, "$%.2f", True)],
-              "She does a different job, so the test-script and delivery "
-              "numbers above are not hers to hit — judging her by them would be "
-              "measuring the wrong work. What she did deliver in August: %d test "
-              "runs, plus the tickets, both on the Summary tab. Worth asking "
-              "what she is using AI for, rather than concluding anything." % theirs)
+              "Finding bugs is the job, and she is the one finding them — most "
+              "of the team's bugs this month are hers. She writes little "
+              "automation code, so the test-script and delivery figures above "
+              "are not hers to hit. Her own tab has the week-by-week detail.")
 
     # ---- the estate --------------------------------------------------------
     cov = data["coverage_by_cycle"]
@@ -1084,6 +1163,194 @@ def pm_view(wb, data, weeks, full_weeks, window_label):
 
 
 # --------------------------------------------------------------------------
+# test activity, and one tab per person
+# --------------------------------------------------------------------------
+
+def test_activity(wb, data, weeks, window_label):
+    """Test-management work per week: cases, cycles, runs, bugs.
+
+    Weekly, to line up with every other sheet in the file.
+    """
+    wk, names = data["week"], data["names"]
+    live = [w for w in weeks if any(wk.get(w, {}).values())]
+    if not live:
+        return
+    ws = fresh(wb, "Test Activity")
+    head(ws, ["Week", "Dates", "Test cases created", "Test cases updated",
+              "Test runs", "Passed", "Failed", "Fixed", "Automated %",
+              "Cycles worked in", "Bugs raised by the team"],
+         [10, 18, 17, 17, 11, 9, 8, 8, 12, 15, 20])
+    r = 2
+    last_seen = max((d for n in names for w in weeks
+                     for d in data["days"][n][w]), default=None)
+    for w in live:
+        c = wk.get(w, {})
+        runs = c.get("runs", 0)
+        year, num = int(w[:4]), int(w[-2:])
+        mon = datetime.date.fromisocalendar(year, num, 1)
+        sun = mon + datetime.timedelta(days=6)
+        if last_seen and sun.isoformat() > last_seen:
+            sun = datetime.date.fromisoformat(last_seen)
+        for col, val in enumerate([
+                w[-3:], "%d %s – %d %s" % (mon.day, mon.strftime("%b"),
+                                           sun.day, sun.strftime("%b")),
+                c.get("cases_created", 0), c.get("cases_updated", 0),
+                runs, c.get("passed", 0), c.get("failed", 0), c.get("fixed", 0),
+                round(100.0 * c.get("automated", 0) / runs, 1) if runs else None,
+                len(data["week_cycles"].get(w, [])),
+                c.get("bugs_raised", 0)], 1):
+            ws.cell(row=r, column=col, value=val)
+        r += 1
+    r += 1
+    for line in [
+        "\"Test cases created\" is a real date. \"Test cases updated\" is the "
+        "LAST edit only — a case changed three times in a week counts once, and "
+        "an earlier change is overwritten by a later one.",
+        "\"Fixed\" counts a test that failed and later passed. It is a thin "
+        "number and always will be: the test tool keeps only the latest result "
+        "for each test in each cycle, so a fix made inside a cycle leaves no "
+        "trace at all.",
+        "Creating and updating a test case is not recorded against a person, so "
+        "those two columns are the whole team. Runs and bugs are per person — "
+        "see their own tabs.",
+    ]:
+        ws.cell(row=r, column=1, value=line).font = NOTE
+        r += 1
+
+
+def person_tabs(wb, data, weeks, window_label):
+    """One tab per person: their AI use, their delivery, what they worked on."""
+    names = data["names"]
+    ai, bb, cost = data["ai"], data["bb"], data["cost"]
+    shown = [w for w in weeks if any(ai[n][w]["human.turn"] for n in names)]
+
+    for n in names:
+        ws = fresh(wb, n[:31])
+        ws.sheet_view.showGridLines = False
+        ws.column_dimensions["A"].width = 3
+        ws.column_dimensions["B"].width = 38
+        for col in "CDEFGH":
+            ws.column_dimensions[col].width = 13
+        r = 2
+        ws.cell(row=r, column=2, value=n).font = TITLE
+        r += 2
+
+        def section(title):
+            nonlocal r
+            ws.cell(row=r, column=2, value=title).font = Font(bold=True, size=12)
+            r += 1
+
+        def head_row(cols):
+            nonlocal r
+            for i, c in enumerate(cols):
+                cell = ws.cell(row=r, column=2 + i, value=c)
+                cell.font = GRP
+                if i:
+                    cell.alignment = Alignment(horizontal="right", wrap_text=True)
+            ws.row_dimensions[r].height = 28
+            r += 1
+
+        def line(label, vals, fmt="%s"):
+            nonlocal r
+            ws.cell(row=r, column=2, value=label)
+            for i, v in enumerate(vals):
+                c = ws.cell(row=r, column=3 + i,
+                            value=(fmt % v) if isinstance(v, (int, float)) else "-")
+                c.alignment = Alignment(horizontal="right")
+            r += 1
+
+        # ---- how they used AI, by week -----------------------------------
+        section("How they used AI, week by week")
+        head_row(["Measure"] + [
+            ("%s%s" % (w[-3:].replace("W", "wk "),
+                       "\n(part week)" if w in window_label else ""))
+            for w in shown])
+        line("Times they asked AI for help",
+             [ai[n][w]["human.turn"] for w in shown], "%d")
+        line("Separate AI conversations",
+             [len(data["sessions"][n][w]) for w in shown], "%d")
+        line("Days they used AI",
+             [len(data["days"][n][w]) for w in shown], "%d")
+        line("How often AI did the work, not just answered",
+             [pct(ai[n][w]["tool.call"], ai[n][w]["human.turn"]) for w in shown],
+             "%.0f%%")
+        line("AI cost, estimated",
+             [(cost[n].get(w) or {}).get("modelled") for w in shown], "$%.2f")
+        line("Questions with a measured cost",
+             [(cost[n].get(w) or {}).get("n") for w in shown], "%d")
+        r += 1
+
+        # ---- what they delivered, by week ---------------------------------
+        section("What they delivered, week by week")
+        wk_people = data["week_people"]
+        live = [w for w in shown if wk_people.get(w, {}).get(n)]
+        if live:
+            head_row(["Measure"] + [
+                ("%s%s" % (w[-3:].replace("W", "wk "),
+                           "\n(part week)" if w in window_label else ""))
+                for w in live])
+            for key, label in (("raised_bug", "Bugs they raised"),
+                               ("runs", "Tests they ran"),
+                               ("failed", "Of those, failures found"),
+                               ("defects", "Defects logged against their runs"),
+                               ("raised_task", "Tasks they raised")):
+                line(label, [wk_people[w][n].get(key, 0) for w in live], "%d")
+        else:
+            ws.cell(row=r, column=2,
+                    value="No test runs or tickets recorded against them in "
+                          "these weeks.").font = NOTE
+            r += 1
+        r += 1
+
+        # ---- code side, only where there is one ---------------------------
+        touched = sum(bb[n][w]["scripts_added"] + bb[n][w]["scripts_modified"]
+                      for w in shown)
+        section("Code they delivered, week by week")
+        if touched:
+            head_row(["Measure"] + [w[-3:].replace("W", "wk ") for w in shown])
+            line("Test scripts worked on",
+                 [bb[n][w]["scripts_added"] + bb[n][w]["scripts_modified"]
+                  for w in shown], "%d")
+            line("Changes delivered",
+                 [bb[n][w]["scm.pr.merged"] for w in shown], "%d")
+            line("Changes reviewed for others",
+                 [bb[n][w]["scm.pr.reviewed"] for w in shown], "%d")
+            line("Changes rolled back",
+                 [bb[n][w]["scm.revert"] for w in shown], "%d")
+            line("Lines of code changed",
+                 [bb[n][w]["lines_added"] + bb[n][w]["lines_removed"]
+                  for w in shown], "%d")
+        else:
+            ws.cell(row=r, column=2,
+                    value="They did not deliver code changes this month. That is "
+                          "their role, not a gap — their output is on the test "
+                          "table above.").font = NOTE
+            r += 1
+        r += 1
+
+        # ---- what they worked on ------------------------------------------
+        section("What they worked on")
+        cov = data["coverage_by_cycle"]
+        mine = [(k, c) for k, c in cov.items() if c["ours"].get(n)]
+        if mine:
+            head_row(["Test cycle", "Tests they ran", "Area", "Automated"])
+            for k, c in sorted(mine, key=lambda x: -x[1]["ours"][n]):
+                ws.cell(row=r, column=2, value=k)
+                ws.cell(row=r, column=3, value=c["ours"][n]).alignment = \
+                    Alignment(horizontal="right")
+                ws.cell(row=r, column=4, value=c["folder"] or "-")
+                ws.cell(row=r, column=5, value="%.0f%%" % c["pct"])
+                r += 1
+        else:
+            ws.cell(row=r, column=2, value="No test cycles recorded.").font = NOTE
+            r += 1
+        r += 1
+        ws.cell(row=r, column=2,
+                value="Counted automatically from Jira, AIO test, Bitbucket and "
+                      "Copilot. A dash means nothing was measured, not zero.").font = NOTE
+
+
+# --------------------------------------------------------------------------
 # tab colours: which sheets are the answer, which are the evidence
 # --------------------------------------------------------------------------
 #
@@ -1103,8 +1370,8 @@ INSIGHT_TAB = "1F3864"
 EVIDENCE_TAB = "A6A6A6"
 CAVEAT_TAB = "EDA100"
 
-INSIGHT = ("Start Here", "Summary", "Charts", "Ten Metrics", "AI Usage",
-           "Productivity")
+INSIGHT = ("Start Here", "Summary", "Charts", "Test Activity", "Ten Metrics",
+           "AI Usage", "Productivity")
 CAVEATS = ("Coverage & Gaps",)
 
 
@@ -1122,10 +1389,11 @@ def drop_superseded(wb):
             del wb[title]
 
 
-def colour_tabs(wb):
+def colour_tabs(wb, people=()):
     """Colour every tab by its role, and legend it on the first sheet."""
+    insight = set(INSIGHT) | {p[:31] for p in people}
     for ws in wb.worksheets:
-        if ws.title in INSIGHT:
+        if ws.title in insight:
             ws.sheet_properties.tabColor = INSIGHT_TAB
         elif ws.title in CAVEATS:
             ws.sheet_properties.tabColor = CAVEAT_TAB
