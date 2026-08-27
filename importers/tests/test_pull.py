@@ -298,3 +298,75 @@ class TestIdentityMapping(unittest.TestCase):
     def test_a_line_with_no_id_is_skipped_rather_than_half_read(self):
         self.assertEqual(
             pull_mod.read_identities(self._write("ngoc.nguyen@aeris.net\n")), {})
+
+
+class IdentityMapMergeTests(unittest.TestCase):
+    """One inbox holds several weeks, so the map has to accumulate.
+
+    `docs/OPERATE.md` and the weekly-report skill both say to pull a span into
+    one inbox and let the generator filter, because a bundle is filed under the
+    week its window *started*. Rewriting `_identities.json` per week left only
+    the last week's names in it. Measured 2026-08-27 on a five-week pull: the
+    map covered 24 of 58 bundles and 1,081 of 1,390 imported events came out
+    with `person_id: null` -- the exact failure `--identities` prevents,
+    arriving silently and looking like data that was never collected.
+    """
+
+    IDS = {"canh@seta-international.vn": "acct-canh",
+           "minh@seta-international.vn": "acct-minh"}
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.inbox = os.path.join(self.tmp, "inbox")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+
+    def week(self, week, machine, email):
+        return [{"key": "bundles/{}/{}/{}.ndjson".format(week, machine, week),
+                 "machine": machine, "email": email,
+                 "bytes": 10, "uploaded_at": "2026-08-24T09:00:00Z"}]
+
+    def read_map(self):
+        with open(os.path.join(self.inbox, "_identities.json"),
+                  encoding="utf-8") as handle:
+            return json.load(handle)
+
+    def test_a_second_week_does_not_erase_the_first(self):
+        pull_mod.pull_week(
+            "https://x.test", "2026-W33", "tok", self.inbox,
+            identities=self.IDS,
+            get=Endpoint(self.week("2026-W33", "a3f9c2b1",
+                                   "canh@seta-international.vn")))
+        pull_mod.pull_week(
+            "https://x.test", "2026-W34", "tok", self.inbox,
+            identities=self.IDS,
+            get=Endpoint(self.week("2026-W34", "7b1e0092",
+                                   "minh@seta-international.vn")))
+
+        found = self.read_map()
+        self.assertEqual(len(found), 2)
+        self.assertEqual(found["a3f9c2b1-2026-W33.ndjson"], "acct-canh")
+        self.assertEqual(found["7b1e0092-2026-W34.ndjson"], "acct-minh")
+
+    def test_a_re_pull_of_the_same_week_is_still_idempotent(self):
+        for _ in range(2):
+            pull_mod.pull_week(
+                "https://x.test", "2026-W33", "tok", self.inbox,
+                identities=self.IDS,
+                get=Endpoint(self.week("2026-W33", "a3f9c2b1",
+                                       "canh@seta-international.vn")))
+        self.assertEqual(len(self.read_map()), 1)
+
+    def test_a_corrupt_map_is_replaced_rather_than_fatal(self):
+        os.makedirs(self.inbox, exist_ok=True)
+        with open(os.path.join(self.inbox, "_identities.json"), "w",
+                  encoding="utf-8") as handle:
+            handle.write("{not json")
+
+        pull_mod.pull_week(
+            "https://x.test", "2026-W33", "tok", self.inbox,
+            identities=self.IDS,
+            get=Endpoint(self.week("2026-W33", "a3f9c2b1",
+                                   "canh@seta-international.vn")))
+
+        self.assertEqual(self.read_map(),
+                         {"a3f9c2b1-2026-W33.ndjson": "acct-canh"})

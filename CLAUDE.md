@@ -13,7 +13,7 @@ report, a schema decision, or a sprint.
 | # | Metric | Measures | Formula | Direction |
 |---|---|---|---|---|
 | 1 | **Automation Output** | automation scripts AI produced | scripts created & completed | ↑ |
-| 2 | **Automation Coverage** | share of eligible cases automated | automated / total eligible | ↑ |
+| 2 | **Automation Coverage** | share of eligible cases automated | automated / total eligible, **per test cycle** | ↑ |
 | 3 | **First-Pass Acceptance Rate** | script quality at first review | accepted on first review / total reviewed | ↑ |
 | 4 | **Rework Rate** | how much AI output must be fixed | scripts requiring rework / total scripts | ↓ |
 | 5 | **Automation Lead Time** | test case → working automation | ready − start | ↓ |
@@ -32,6 +32,21 @@ Measured figures live in [`docs/METRICS.md`](docs/METRICS.md) — one metric is
 live, one is reportable with a caveat, two are permanently out of scope, and the
 rest are blocked. Read it before quoting a number: two of those figures were
 marked live in an earlier draft of *this* file and were wrong.
+
+**Metric 2 is measured by cycle, never over the case estate.** "Eligible"
+means the cases in the test cycles actually being delivered — the cycle is the
+delivery record and the pull request is not (`schema/CONTRACT.md` §3 row 22).
+The two readings disagree enormously and the estate one is the misleading one.
+Measured 2026-08-27 on IML: across the seven cycles that ran, **7,976 of 8,564
+cases are automated — 93.1%**, with the two large regression cycles at 95.7%
+and 97.2%. Read over the whole 10,742-case estate the same data puts P3 at
+22.8%, which sounds like a crisis and is mostly a backlog nobody has triaged:
+3,695 of 5,183 P3 cases have no automation status set at all and appear in no
+cycle. Counting those as "not automated" measures how diligently a field is
+filled in, which is the same error as counting from the daily sync sheet.
+
+The estate view still answers a real question — *what is in the backlog* — and
+may be reported as that, clearly labelled, never as coverage.
 
 ## Rules that outrank convenience
 

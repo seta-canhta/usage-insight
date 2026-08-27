@@ -275,10 +275,33 @@ def pull_week(endpoint: str, week: str, token: str, inbox: str,
     # Written even when empty, so `bundle.py` can tell "nobody is mapped" from
     # "this pull predates identities" -- the same measured-zero rule the
     # manifests follow.
+    #
+    # **Merged, not replaced.** One inbox is meant to hold several weeks --
+    # `docs/OPERATE.md` and the weekly-report skill both say to pull a span
+    # into one and let the generator filter, because a backfill is filed under
+    # the week it *started*. Rewriting this file per week left only the last
+    # week's names in it, so `bundle.py` mapped that week and left every
+    # earlier one at `person_id: null`. Measured 2026-08-27: a five-week pull
+    # produced a map covering 24 of 58 bundles, and 1,081 of 1,390 imported
+    # events were unattributed -- the exact failure `--identities` exists to
+    # prevent, arriving silently and looking like missing data.
     if identities:
-        with open(os.path.join(inbox, "_identities.json"), "w",
-                  encoding="utf-8") as handle:
-            json.dump(stamped, handle, indent=2, sort_keys=True)
+        path = os.path.join(inbox, "_identities.json")
+        merged: Dict[str, str] = {}
+        if os.path.exists(path):
+            try:
+                with open(path, "r", encoding="utf-8") as handle:
+                    found = json.load(handle)
+                if isinstance(found, dict):
+                    merged = {str(k): str(v) for k, v in found.items()
+                              if isinstance(v, str)}
+            except (OSError, ValueError):
+                # A corrupt map is replaced rather than allowed to block the
+                # pull; the names it held are all rederivable from the listing.
+                merged = {}
+        merged.update(stamped)
+        with open(path, "w", encoding="utf-8") as handle:
+            json.dump(merged, handle, indent=2, sort_keys=True)
 
     result = {
         "week": week,
