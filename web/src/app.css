@@ -1,0 +1,64 @@
+/* The page ground. Without this nothing paints behind the shell, so the
+   browser default shows through -- invisible in light mode and a white gutter
+   in dark. The body face goes here too, so any text that ends up outside a
+   Text component still lands in the right one rather than in Times. */
+html,
+body {
+  background: var(--color-background-body);
+  font-family: var(--font-family-body);
+}
+
+/* The little that components cannot express: a keyframe, a hatch, and the
+   promise that neither runs for someone who asked for less motion.
+   Every value here is a token; the hatch pitch is px because a hatch pitch is
+   not on the spacing scale. */
+
+@keyframes ledger-in {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: none; }
+}
+
+/* A mark: a drawn rectangle, not a layout box. Astryx has no swatch
+   primitive, and this is the one place the page draws rather than composes. */
+.mark {
+  border: 1px solid var(--color-border-emphasized);
+  border-radius: var(--radius-sm, 2px);
+  background: var(--color-background-surface);
+}
+.mark--measured { background: var(--color-accent); }
+
+/* Partly measured: filled from the bottom, ruled above the line. An earlier
+   version drew it as a faint hatch on white, which read as empty rather than
+   as half-known -- the one thing this mark exists to say. */
+.mark--partial {
+  background-image:
+    linear-gradient(to top, var(--color-accent) 0 50%, transparent 50% 100%),
+    repeating-linear-gradient(45deg, var(--color-border-emphasized) 0 1px, transparent 1px 7px);
+}
+
+/* Not measurable: ruled through, nothing behind it. */
+.mark--unmeasured {
+  background-image:
+    repeating-linear-gradient(45deg, var(--color-border-emphasized) 0 1px, transparent 1px 6px);
+}
+
+.ledger-cell {
+  flex: 1 1 0;
+  min-width: 76px;
+  display: block;
+  text-decoration: none;
+  color: inherit;
+  animation: ledger-in var(--duration-medium, 240ms) both;
+}
+.ledger-cell:focus-visible {
+  outline: 2px solid var(--color-accent);
+  outline-offset: 3px;
+}
+.ledger-cell .mark { height: 46px; }
+.ledger-cell__name { min-height: 2.6em; }
+.ledger-cell:hover .mark { border-color: var(--color-accent); }
+
+@media (prefers-reduced-motion: reduce) {
+  .ledger-cell { animation: none; }
+  * { transition-duration: 1ms !important; }
+}

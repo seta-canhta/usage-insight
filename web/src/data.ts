@@ -63,7 +63,18 @@ export type Week = {
   full: boolean;
 };
 
-export type Person = {name: string; role: string | null; pronouns: string};
+export type Person = {
+  name: string;
+  /** What to call them in a narrow column. Set in the snapshot, never guessed
+   *  here from the shape of the name. */
+  short: string;
+  role: string | null;
+  pronouns: string;
+  /** A design-system categorical hue name, assigned by position in the member
+   *  list. Null past the end of the palette -- the snapshot refuses to invent
+   *  an eleventh colour and so does the page. */
+  hue: string | null;
+};
 
 export type Snapshot = {
   schema: number;

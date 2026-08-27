@@ -26,27 +26,14 @@ import {
   XAxis,
   YAxis,
 } from 'recharts';
-import type {Measure, Week} from './data';
+import type {Measure, Person, Week} from './data';
+import {hueOf} from './tokens';
 import {format, isAttributed} from './data';
 
-// The design system's own categorical hues, in fixed order and never cycled.
-// Validated as a pair for colour vision: dE 29.8 protan, 38.0 normal, both
-// clearing 3:1 against the surface. (The dark-mode lightness band flags the
-// orange as slightly bright; the token is the same hue in both modes and the
-// design system forbids overriding --color-*, so it stands -- separation and
-// contrast, the two that decide whether the series can be told apart, pass.)
-// A person keeps their hue when the filter changes, so colour follows the
-// person and never their position in the list.
-export const HUES = [
-  'var(--color-data-categorical-blue, #0171E3)',
-  'var(--color-data-categorical-orange, #EB6E00)',
-];
-
-export function hueFor(people: Array<{name: string}>, name: string): string {
-  const at = people.findIndex(p => p.name === name);
-  return HUES[(at < 0 ? 0 : at) % HUES.length];
-}
-
+// Colour comes from the snapshot, which assigns each member a design-system
+// categorical hue by their position in the member list. Nothing here picks a
+// colour, so a person keeps theirs when the filter changes and the palette is
+// never rotated to make a chart look better.
 const AXIS = {
   fontSize: 'var(--font-size-sm, 12px)',
   fill: 'var(--color-text-secondary, #4E606F)',
@@ -65,7 +52,7 @@ function rowsOf(measure: Measure, weeks: Week[], names: string[]): Row[] {
         row[name] = source[name]?.[i] ?? null;
       });
     } else {
-      row['All'] = source[i] ?? null;
+      row['Everyone'] = source[i] ?? null;
     }
     return row;
   });
@@ -107,7 +94,7 @@ function ChartTooltip({
   );
 }
 
-function Legend({entries}: {entries: Array<{name: string; colour: string}>}) {
+function Legend({entries}: {entries: Array<{label: string; colour: string}>}) {
   // Present whenever there are two or more series, so identity is never
   // carried by colour alone. One series needs none -- the title names it.
   if (entries.length < 2) {
@@ -116,10 +103,10 @@ function Legend({entries}: {entries: Array<{name: string; colour: string}>}) {
   return (
     <HStack gap={4} wrap="wrap">
       {entries.map(entry => (
-        <HStack key={entry.name} gap={2} vAlign="center">
+        <HStack key={entry.label} gap={2} vAlign="center">
           <Icon icon={StopIcon} size="xsm" style={{color: entry.colour}} />
           <Text type="supporting" color="secondary">
-            {entry.name}
+            {entry.label}
           </Text>
         </HStack>
       ))}
@@ -131,18 +118,24 @@ export function TrendChart({
   measure,
   weeks,
   people,
+  all,
   height = 200,
 }: {
   measure: Measure;
   weeks: Week[];
-  people: Array<{name: string}>;
+  /** The members to draw -- the filter's answer. */
+  people: Person[];
+  /** Every member, so a hue stays with its person when the filter narrows. */
+  all: Person[];
   height?: number;
 }) {
-  const names = isAttributed(measure.series) ? people.map(p => p.name) : ['All'];
+  const attributed = isAttributed(measure.series);
+  const names = attributed ? people.map(p => p.name) : ['Everyone'];
   const rows = rowsOf(measure, weeks, names);
   const entries = names.map(name => ({
     name,
-    colour: isAttributed(measure.series) ? hueFor(people, name) : HUES[0],
+    label: attributed ? (people.find(p => p.name === name)?.short ?? name) : name,
+    colour: attributed ? hueOf(all, name) : 'var(--color-accent)',
   }));
 
   // Rates are a ratio of two things measured in the same window, so a short
@@ -252,7 +245,15 @@ export function CoverageChart({
             );
           }}
         />
-        <Bar dataKey="pct" radius={[0, 4, 4, 0]} isAnimationActive={false}>
+        {/* minPointSize gives a measured zero a visible stub. Without it the
+            three cycles that are run by hand on purpose draw nothing at all,
+            and a reader cannot tell "0%" from "this row has no data" -- which
+            is the one distinction this whole page is built to make. */}
+        <Bar
+          dataKey="pct"
+          radius={[0, 4, 4, 0]}
+          minPointSize={3}
+          isAnimationActive={false}>
           {/* A 0% bar has no length, so without a label it reads as missing
               data. These cycles are run by hand on purpose -- a measured zero,
               and the one number on this chart that most needs saying out loud. */}
@@ -267,7 +268,7 @@ export function CoverageChart({
             // muted rather than alarming -- it is a scope decision, not a gap.
             <Cell
               key={row.name}
-              fill={row.pct === 0 ? 'var(--color-data-neutral, #8494A3)' : HUES[0]}
+              fill={row.pct === 0 ? 'var(--color-data-neutral, #8494A3)' : 'var(--color-accent)'}
             />
           ))}
         </Bar>

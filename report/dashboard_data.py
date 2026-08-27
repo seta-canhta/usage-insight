@@ -34,10 +34,19 @@ import ai_usage_sheets as sheets  # noqa: E402
 
 SCHEMA = 1
 
-#: Validated for colour vision as a pair -- dE 24.7 protan, 33.6 normal --
-#: which is why the pages take the hues from here rather than picking their
-#: own. Two people, two hues, assigned in fixed order and never cycled.
-SERIES = ("#2A78D6", "#EB6834")
+#: The design system's categorical hues, in ITS fixed order. A person's hue is
+#: their index in the member list, so it never changes when the filter does,
+#: and the order is never rotated to "use up" a nicer colour. Ten is what the
+#: palette holds; an eleventh member is a real decision about small multiples
+#: or an "everyone else" row, not a generated hue, so the builder says so
+#: rather than inventing one.
+#: Purple and orange lead because that pair separates furthest -- dE 36.7 for
+#: protanopia, 44.0 for normal vision -- and neither can be confused with the
+#: page's teal accent. Blue would have been the obvious first slot and sits at
+#: dE 17.4 from that teal, close enough for a person's line to read as the
+#: page's own colour.
+SERIES = ("purple", "orange", "blue", "green", "pink",
+          "cyan", "red", "teal", "brown", "indigo")
 
 
 def week_label(week, last_seen=None):
@@ -59,13 +68,44 @@ def week_label(week, last_seen=None):
     return span, monday.isoformat(), sunday.isoformat(), (sunday - monday).days + 1
 
 
+def note_for_coverage(estate):
+    """Why this is counted by cycle, with the other reading worked out here.
+
+    Both figures have to be the same shape or the contrast is a trick: this is
+    automated over every case on file, exactly as the cycle figure is
+    automated over every case in a cycle. An earlier draft divided by
+    automated-plus-to-be-automated instead, which compares two numbers built
+    two different ways -- the specific mistake this project keeps having to
+    catch.
+
+    The gap is worth naming rather than implying, so the count of cases with no
+    status at all goes in the sentence. That is what the estate reading is
+    actually measuring.
+    """
+    rows = (estate or {}).values()
+    auto = sum(v.get("automated", 0) for v in rows)
+    total = sum(v.get("total", 0) for v in rows)
+    unset = sum(v.get("unset", 0) for v in rows)
+    said = ("Counted across the test cycles actually being delivered, which is "
+            "the work in flight.")
+    if not total:
+        return said
+    return (said + " Counted the same way over every case on file it reads "
+            "%.1f%%, because %s cases have no automation status set at all and "
+            "appear in no cycle. That gap is an untriaged backlog \u2014 a "
+            "queue, not a score."
+            % (100.0 * auto / total, "{:,}".format(unset)))
+
+
 def series(data, weeks, names, get):
     """`{person: [v, ...]}` aligned to `weeks`, one entry per person."""
     return {n: [get(n, w) for w in weeks] for n in names}
 
 
-def build(data, weeks, full_weeks, window_label, roles, pronouns):
+def build(data, weeks, full_weeks, window_label, roles, pronouns,
+          shorts=None):
     """Everything both screens draw, in one object."""
+    shorts = shorts or {}
     names = data["names"]
     ai, bb, cost = data["ai"], data["bb"], data["cost"]
     wkp, wk = data["week_people"], data["week"]
@@ -85,11 +125,25 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
             # is how a part week ends up in a trend.
             "full": w in full_weeks})
 
-    people = [{"name": n,
-               "role": roles.get(n),
-               "pronouns": pronouns(n).subj,
-               "colour": SERIES[i % len(SERIES)]}
-              for i, n in enumerate(names)]
+    people = []
+    for i, n in enumerate(names):
+        people.append({
+            "name": n,
+            # What to call them in a narrow column. Defaults to the first
+            # word, which is a guess about name order that is wrong for plenty
+            # of people, so --short overrides it and the page never re-derives
+            # one of its own.
+            "short": shorts.get(n) or n.split()[0],
+            "role": roles.get(n),
+            "pronouns": pronouns(n).subj,
+            "hue": SERIES[i] if i < len(SERIES) else None,
+        })
+    if len(names) > len(SERIES):
+        raise SystemExit(
+            "%d people but only %d categorical hues. Adding an eleventh means "
+            "deciding what it looks like -- small multiples, or an 'everyone "
+            "else' series -- and this refuses to generate a colour nobody "
+            "chose." % (len(names), len(SERIES)))
 
     def per(key, source):
         return series(data, weeks, names, lambda n, w: source[n][w][key])
@@ -130,10 +184,7 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
         "pct": round(100.0 * auto / tot, 1) if tot else None,
         "cycles": cycles,
         "basis": "test cycles delivered",
-        "note": "Counted across the test cycles actually being run, which is "
-                "the work in flight. Read over every test case ever written "
-                "the same data says 22.8%, and most of that gap is a backlog "
-                "nobody has triaged -- a queue, not a score."}
+        "note": note_for_coverage(data["estate"])}
 
     estate = {k: dict(v) for k, v in (data["estate"] or {}).items()}
 
@@ -147,16 +198,14 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
          "measures": [
              {"label": "Automation scripts added", "unit": "count",
               "series": per("scripts_added", bb),
-              "note": "New test script files in the code changes they "
-                      "delivered"},
+              "note": "New test script files in the changes they shipped"},
              {"label": "Automation scripts modified", "unit": "count",
               "series": per("scripts_modified", bb)},
              {"label": "Changes delivered", "unit": "count",
               "series": per("scm.pr.merged", bb)},
              {"label": "AI outputs written", "unit": "count",
               "series": per("output.generated", ai),
-              "note": "Files AI wrote directly, rather than a person typing "
-                      "them"}]},
+              "note": "Files AI wrote itself, rather than a person typing them"}]},
         {"n": 2, "name": "Automation Coverage", "want": "up", "status": "live",
          "headline": {"value": coverage["pct"], "unit": "percent",
                       "of": "%d of %d cases in the cycles being run"
@@ -169,8 +218,8 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
          "measures": [
              {"label": "Reviews given", "unit": "count",
               "series": per("scm.pr.reviewed", bb)}],
-         "note": "Too few reviews to turn into a percentage. The counts are "
-                 "the honest answer; a rate off five reviews would not be."},
+         "note": "Too few reviews to make a percentage mean anything. The "
+                 "counts are the honest answer."},
         {"n": 4, "name": "Rework Rate", "want": "down", "status": "partial",
          "measures": [
              {"label": "Changes rolled back", "unit": "count",
@@ -190,14 +239,14 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
                   lambda n, w: round(
                       sheets.statistics.median(data["merge"][n][w])
                       / 3600000.0, 2) if data["merge"][n][w] else None)}],
-         "note": "The closest thing available. Nothing links a test to the "
-                 "change that automated it, so this is time-to-merge, not "
-                 "time-to-automate."},
+         "note": "The closest thing we have. Nothing links a test to the "
+                 "change that automated it, so this is time to merge, not "
+                 "time to automate."},
         {"n": 6, "name": "Productivity Gain", "want": "up",
          "status": "impossible", "measures": [],
          "note": "This needs the same work done without AI to compare "
-                 "against, and there is none. Anyone quoting a speed-up "
-                 "percentage is guessing."},
+                 "against, and no one did any. A speed-up percentage here "
+                 "would be a guess."},
         {"n": 7, "name": "Execution Rate", "want": "up", "status": "partial",
          "measures": [
              {"label": "Tests run", "unit": "count", "series": qa("runs")},
@@ -206,17 +255,17 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
              {"label": "Days they used AI", "unit": "count",
               "series": series(data, weeks, names,
                                lambda n, w: len(data["days"][n][w]))}],
-         "note": "Run volume follows cycle scheduling, not effort. There is "
-                 "no plan to divide by, so this is what was executed, not a "
-                 "share of what was planned."},
+         "note": "The number of runs follows the cycle schedule, not "
+                 "effort. Nothing records a plan to divide by, so this is "
+                 "what was run, not the share of what was meant to be."},
         {"n": 8, "name": "Flaky Test Rate", "want": "down",
          "status": "impossible",
          "measures": [
              {"label": "Failed runs", "unit": "count", "series": qa("failed")}],
          "note": "A failure count, not a flakiness rate. The test tool keeps "
-                 "only the latest result for each test in each cycle, so a "
-                 "test that fails then passes leaves no trace at all. "
-                 "Flakiness cannot be measured from this source."},
+                 "only the latest result for each test in a cycle, so a test "
+                 "that fails and then passes leaves no trace. Flakiness "
+                 "cannot be measured from this source."},
         {"n": 9, "name": "AI Cost per Accepted Output", "want": "down",
          "status": "partial",
          "measures": [
@@ -236,16 +285,14 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
                                       / bb[n][w]["scm.pr.merged"], 2)
                                 if (cost[n].get(w) or {}).get("modelled")
                                 and bb[n][w]["scm.pr.merged"] else None))}],
-         "note": "The cost is an estimate against published list prices, and "
-                 "it is not the bill -- Copilot charges a monthly fee per "
-                 "person plus usage, and neither is visible here. Nothing "
-                 "records which AI conversation produced which script, so "
-                 "cost splits by person and week but not by finished piece "
-                 "of work."},
+         "note": "An estimate at published list prices, not the bill. "
+                 "Nothing records which AI conversation produced which "
+                 "script, so cost splits by person and by week, but never "
+                 "by a finished piece of work."},
         {"n": 10, "name": "AI ROI", "want": "up", "status": "impossible",
          "measures": [],
-         "note": "The value of the work delivered is not recorded anywhere, "
-                 "so the numerator does not exist."},
+         "note": "Nothing records what the delivered work was worth, so "
+                 "there is no top half of this fraction."},
     ]
 
     # A measure with no direction of its own takes the metric's. Leaving it
@@ -284,14 +331,14 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
          "attributed": True,
          "measures": [
              m("raised_bug", "Bugs raised for developers", "up",
-               note="Counted once per issue by who reported it, not once per "
-                    "status change -- otherwise this ranks people by how much "
-                    "a ticket moved."),
+               note="Counted once per issue, by whoever reported it \u2014 not once per "
+                    "status change, which would rank people by how much a "
+                    "ticket moved."),
              m("raised_task", "Tasks raised", "up"),
-             m("defects", "Defects logged against their test runs"),
+             m("defects", "Defects raised from their runs"),
              m("failed", "Failures found while running tests",
-               note="A failure found is the job working, not a fault. It is "
-                    "not counted as a bad outcome anywhere on this screen."),
+               note="A failure found is the job working. Nothing on this "
+                    "screen counts it against anyone."),
          ]},
         {"id": "design",
          "name": "Designing the tests",
@@ -303,13 +350,13 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
               "series": [wk.get(w, {}).get("cases_created", 0) for w in weeks]},
              {"key": "cases_updated", "label": "Test cases edited",
               "unit": "count",
-              "note": "The LAST edit only -- a case changed three times in a "
+              "note": "The last edit only. A case changed three times in a "
                       "week counts once.",
               "series": [wk.get(w, {}).get("cases_updated", 0) for w in weeks]},
          ],
-         "note": "The test tool records no author on a test case, so this "
-                 "group is the whole project's work and the member filter "
-                 "does not apply to it. Splitting it would mean inventing an "
+         "note": "The test tool records no author on a test case. These "
+                 "are the whole project's, so picking a person changes "
+                 "nothing here \u2014 splitting them would mean inventing an "
                  "author."},
         {"id": "running",
          "name": "Running the tests",
@@ -320,8 +367,8 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
              m("passed", "Of those, passed"),
              m("failed", "Of those, failed"),
              m("automated", "Of those, run by automation", "up",
-               note="Manual against automated is the test tool's own flag, "
-                    "not a guess made here."),
+               note="Automated or by hand is the test tool's own flag, not a "
+                    "guess made here."),
              {"key": "manual_runs", "label": "Of those, run by hand",
               "unit": "count",
               "series": series(data, weeks, names,
@@ -338,8 +385,7 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
          "measures": [
              {"key": "scripts_added", "label": "Test scripts added", "unit":
               "count", "want": "up", "series": per("scripts_added", bb),
-              "note": "New test script files in the code changes they "
-                      "delivered."},
+              "note": "New test script files in the changes they shipped."},
              {"key": "scripts_modified", "label": "Test scripts modified",
               "unit": "count", "want": "up",
               "series": per("scripts_modified", bb)},
@@ -352,8 +398,7 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
          ]},
         {"id": "delivering",
          "name": "Getting the changes in",
-         "why": "Review and merge -- the part that is other people as much as "
-                "them.",
+         "why": "Review and merge. As much other people as them.",
          "attributed": True,
          "measures": [
              {"key": "merged", "label": "Changes delivered", "unit": "count",
@@ -363,7 +408,7 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
               "series": per("scm.pr.reviewed", bb)},
              {"key": "reverted", "label": "Changes rolled back", "unit":
               "count", "want": "down", "series": per("scm.revert", bb),
-              "note": "A rollback is a signal to read, not a defect count."},
+              "note": "A rollback is worth reading. It is not a defect count."},
              {"key": "lead_time", "label": "Median time to merge (hours)",
               "unit": "hours", "want": "down",
               "series": series(
@@ -392,12 +437,12 @@ def build(data, weeks, full_weeks, window_label, roles, pronouns):
               "unit": "percent", "want": "up",
               "series": rate("tool.call", "human.turn", ai),
               "note": "The share of questions where AI went and read, changed "
-                      "or ran something, rather than only replying."},
+                      "or ran something instead of only replying."},
              {"key": "cost", "label": "AI cost, estimated", "unit": "usd",
               "want": "down", "series": money("modelled"),
-              "note": "An estimate against published list prices, not the "
-                      "bill. Copilot charges a monthly fee per person plus "
-                      "usage and neither is visible here."},
+              "note": "An estimate at published list prices. It is not the "
+                      "bill \u2014 Copilot charges a monthly fee per person "
+                      "plus usage, and neither is visible here."},
          ]},
     ]
 
@@ -451,6 +496,10 @@ def main(argv=None):
     p.add_argument("--role", action="append", default=[], metavar="NAME=ROLE",
                    help="Repeatable. What this person does, in a reader's "
                         "words -- shown beside their name.")
+    p.add_argument("--short", action="append", default=[], metavar="NAME=SHORT",
+                   help="Repeatable. What to call this person in a narrow "
+                        "column. Defaults to the first word of their name, "
+                        "which is a guess -- set it where that guess is wrong.")
     p.add_argument("--pronouns", type=sheets.parse_pronouns, action="append",
                    default=[], metavar="NAME=she",
                    help="Repeatable. Never inferred from a name; anyone "
@@ -488,6 +537,14 @@ def main(argv=None):
     default = sheets.Pronouns()
     pron = lambda n: said.get(n, default)
 
+    shorts = {}
+    for item in args.short:
+        name, _, short = item.partition("=")
+        if name.strip() not in people.values():
+            raise SystemExit("--short names someone not in --person: %s"
+                             % name.strip())
+        shorts[name.strip()] = short.strip()
+
     roles = {}
     for item in args.role:
         name, _, role = item.partition("=")
@@ -502,7 +559,7 @@ def main(argv=None):
         labels[w.strip()] = why.strip() or "part week"
 
     data = sheets.collect(args.input, people, weeks, dict(args.price))
-    payload = build(data, weeks, full, labels, roles, pron)
+    payload = build(data, weeks, full, labels, roles, pron, shorts)
 
     tmp = args.out + ".tmp"
     with open(tmp, "w", encoding="utf-8") as handle:

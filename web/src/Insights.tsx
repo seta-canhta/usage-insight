@@ -13,10 +13,30 @@ import {Divider} from '@astryxdesign/core/Divider';
 import {Table, proportional, pixel} from '@astryxdesign/core/Table';
 import type {TableColumn} from '@astryxdesign/core/Table';
 import {CoverageChart, TrendChart} from './charts';
+import {Ledger} from './Ledger';
+import {shortOf} from './tokens';
 import {MeasureTable} from './MeasureTable';
 import {SectionHeading, StatCard, StatusBadge} from './shell';
 import type {Cycle, Person, Snapshot} from './data';
 import {format, isAttributed, visible} from './data';
+
+/** "27 Jul to 27 Aug · Jira · AIO test · Bitbucket · Copilot".
+ *
+ * Built from the ends of the window rather than from two week labels glued
+ * together, which read as two separate dates.
+ */
+function windowLabel(snap: Snapshot): string {
+  const first = snap.weeks[0];
+  const last = snap.weeks[snap.weeks.length - 1];
+  if (!first || !last) {
+    return snap.sources.join(' · ');
+  }
+  const day = (iso: string) => {
+    const date = new Date(`${iso}T00:00:00Z`);
+    return `${date.getUTCDate()} ${date.toLocaleString('en', {month: 'short', timeZone: 'UTC'})}`;
+  };
+  return `${day(first.from)} to ${day(last.to)} · ${snap.sources.join(' · ')}`;
+}
 
 function headline(snap: Snapshot, shown: Person[]) {
   const sum = (groupId: string, key: string) => {
@@ -41,6 +61,11 @@ function headline(snap: Snapshot, shown: Person[]) {
     merged: sum('delivering', 'merged'),
     cost: sum('ai', 'cost'),
   };
+}
+
+/** The thesis: what this page can and cannot stand behind. */
+export function InsightsHero({snap}: {snap: Snapshot}) {
+  return <Ledger metrics={snap.metrics} window={windowLabel(snap)} />;
 }
 
 export function Insights({
@@ -68,8 +93,8 @@ export function Insights({
        return (
          <Text type="supporting" color="secondary">
            {mine.length
-             ? mine.map(p => `${p.name.split(' ')[0]} ${row.ours[p.name]}`).join(' · ')
-             : 'neither'}
+             ? mine.map(p => `${shortOf(snap.people, p.name)} ${row.ours[p.name]}`).join(' · ')
+             : 'nobody here'}
          </Text>
        );
      }},
@@ -89,13 +114,13 @@ export function Insights({
           label="Testing automated"
           value={format(coverage.pct, 'percent')}
           meta={`${coverage.automated.toLocaleString()} of ${coverage.cases.toLocaleString()} tests`}
-          note="Across the cycles being delivered"
+          note="In the cycles being delivered"
         />
         <StatCard
           label="Bugs raised"
           value={totals.bugs?.toLocaleString() ?? '—'}
-          meta="Reported to the developers"
-          note={picked ? picked.split(' ')[0] : 'Both people'}
+          meta="Sent to the developers"
+          note={picked ? shortOf(snap.people, picked) : 'Everyone on the team'}
         />
         <StatCard
           label="Tests run"
@@ -103,17 +128,17 @@ export function Insights({
           meta="By hand and by automation"
         />
         <StatCard
-          label="AI cost, estimated"
+          label="AI spend, estimated"
           value={totals.cost != null ? `$${totals.cost.toFixed(2)}` : '—'}
-          meta="Against list prices"
-          note="Not the bill — see metric 9"
+          meta="At list prices"
+          note="An estimate, not the bill"
         />
       </Grid>
 
       {/* --- coverage, the one metric with a real headline ---------------- */}
       <VStack gap={4}>
         <SectionHeading
-          title="How much of the testing is automated"
+          title="How much of the testing runs itself"
           eyebrow="Metric 2 · Automation Coverage"
         />
         <Text type="body" color="secondary">
@@ -139,13 +164,16 @@ export function Insights({
 
       {/* --- the ten, in order ------------------------------------------- */}
       <VStack gap={6}>
-        <SectionHeading title="The ten metrics" eyebrow="All of them, measured or not" />
+        <SectionHeading
+          title="The ten, one by one"
+          eyebrow="Including the three that cannot be measured"
+        />
         {snap.metrics.map(metric => {
           const chartable = metric.measures.find(
             m => isAttributed(m.series) || Array.isArray(m.series),
           );
           return (
-            <Card key={metric.n}>
+            <Card key={metric.n} id={`metric-${metric.n}`}>
               <VStack gap={4}>
                 <HStack hAlign="between" vAlign="center" wrap="wrap" gap={3}>
                   <HStack gap={3} vAlign="center">
@@ -191,6 +219,7 @@ export function Insights({
                           measure={chartable}
                           weeks={snap.weeks}
                           people={shown}
+                          all={snap.people}
                           height={180}
                         />
                       </VStack>
@@ -204,8 +233,8 @@ export function Insights({
       </VStack>
 
       <Text type="supporting" color="secondary">
-        Counted from {snap.sources.join(', ')}. A dash means nothing was measured — it does not
-        mean zero. Volume trends span whole weeks only, so a short week never misreads as a fall.
+        Counted from {snap.sources.join(', ')}. A dash means nothing was measured; it does not mean
+        zero. Counts are compared across whole weeks only, so a short week never reads as a slump.
       </Text>
     </VStack>
   );

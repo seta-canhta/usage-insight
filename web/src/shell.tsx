@@ -27,6 +27,7 @@ import {
   MinusIcon,
 } from '@heroicons/react/24/outline';
 import type {Person, Trend} from './data';
+import {shortOf} from './tokens';
 
 export type Screen = 'insights' | 'activities';
 
@@ -35,16 +36,17 @@ export function Shell({
   people,
   picked,
   onPick,
-  title,
-  lede,
+  hero,
   children,
 }: {
   screen: Screen;
   people: Person[];
   picked: string | null;
   onPick: (name: string | null) => void;
-  title: string;
-  lede: string;
+  /** Each screen opens with its own thesis. There is no shared page title:
+   *  one would only repeat what the hero already says, and the nav already
+   *  says which screen you are on. */
+  hero: React.ReactNode;
   children: React.ReactNode;
 }) {
   return (
@@ -75,33 +77,33 @@ export function Shell({
         content={
           <LayoutContent padding={6}>
             <VStack gap={6}>
-              <VStack gap={2}>
-                <Heading level={2}>{title}</Heading>
-                <Text type="body" color="secondary">
-                  {lede}
-                </Text>
-              </VStack>
+              {hero}
+              <Divider />
+              {/* The filter sits under the hero, not over it. You decide whose
+                  figures to read after you know what the page can tell you,
+                  and on Insights the hero does not change with the choice. */}
               <HStack gap={3} vAlign="center" wrap="wrap">
                 <SegmentedControl
-                  label="Which people to show"
+                  label="Whose figures to show"
                   value={picked ?? 'both'}
                   onChange={value => onPick(value === 'both' ? null : value)}>
-                  <SegmentedControlItem value="both" label="Both" />
+                  <SegmentedControlItem value="both" label="Everyone" />
                   {people.map(person => (
                     <SegmentedControlItem
                       key={person.name}
                       value={person.name}
-                      label={person.name.split(' ')[0]}
+                      label={person.short}
                     />
                   ))}
                 </SegmentedControl>
                 <Text type="supporting" color="secondary">
                   {picked
                     ? people.find(p => p.name === picked)?.role ?? ''
-                    : people.map(p => `${p.name.split(' ')[0]} ${p.role ?? ''}`).join(' · ')}
+                    : people
+                        .map(p => [shortOf(people, p.name), p.role].filter(Boolean).join(' '))
+                        .join(' · ')}
                 </Text>
               </HStack>
-              <Divider />
               {children}
             </VStack>
           </LayoutContent>
@@ -192,7 +194,7 @@ export function StatusBadge({status}: {status: 'live' | 'partial' | 'impossible'
   const said = {
     live: {label: 'measured', variant: 'success' as const},
     partial: {label: 'partly measured', variant: 'warning' as const},
-    impossible: {label: 'cannot be measured', variant: 'neutral' as const},
+    impossible: {label: 'not measurable', variant: 'neutral' as const},
   }[status];
   return <Badge label={said.label} variant={said.variant} />;
 }

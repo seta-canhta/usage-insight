@@ -17,6 +17,7 @@ import type {TableColumn} from '@astryxdesign/core/Table';
 import {TrendChart} from './charts';
 import {MeasureTable} from './MeasureTable';
 import {SectionHeading} from './shell';
+import {shortOf} from './tokens';
 import type {Person, Snapshot} from './data';
 import {format, isAttributed, visible} from './data';
 
@@ -28,6 +29,23 @@ type CycleRow = Record<string, unknown> & {
   runs: number;
   pct: number | null;
 };
+
+/** Six kinds of work, named the way the people doing them would name them. */
+export function ActivitiesHero() {
+  return (
+    <VStack gap={2}>
+      <Text type="code" color="secondary">
+        Six kinds of work
+      </Text>
+      <Heading level={1}>Where the month went.</Heading>
+      <Text type="large" color="secondary">
+        Grouped the way the work happens: chase a problem and file it, write the case,
+        run it, automate it, get it merged. Nothing here is one of the ten metrics —
+        it is what the ten are made of.
+      </Text>
+    </VStack>
+  );
+}
 
 export function Activities({snap, picked}: {snap: Snapshot; picked: string | null}) {
   const shown = visible(snap.people, picked);
@@ -45,7 +63,7 @@ export function Activities({snap, picked}: {snap: Snapshot; picked: string | nul
 
   const cycleColumns: TableColumn<CycleRow>[] = [
     {key: 'who', header: 'Who', width: pixel(120),
-     renderCell: row => <Text type="body">{row.who.split(' ')[0]}</Text>},
+     renderCell: row => <Text type="body">{shortOf(snap.people, row.who)}</Text>},
     {key: 'key', header: 'Test cycle', width: pixel(130)},
     {key: 'area', header: 'Area', width: proportional(1),
      renderCell: row => <Text type="body">{row.area ?? '—'}</Text>},
@@ -57,7 +75,7 @@ export function Activities({snap, picked}: {snap: Snapshot; picked: string | nul
 
   return (
     <VStack gap={8}>
-      <Grid columns={{minWidth: 260, repeat: 'fit'}} gap={4}>
+      <Grid columns={{minWidth: 340, repeat: 'fit'}} gap={4}>
         {snap.activity.groups.map(group => {
           const total = group.measures[0];
           const sum = !total
@@ -79,7 +97,7 @@ export function Activities({snap, picked}: {snap: Snapshot; picked: string | nul
                 <Heading level={3}>{sum?.toLocaleString() ?? '—'}</Heading>
                 <Text type="supporting" color="secondary">
                   {total?.label ?? ''}
-                  {group.attributed ? '' : ' · whole project'}
+                  {group.attributed ? '' : ' · no names on these'}
                 </Text>
               </VStack>
             </Card>
@@ -94,7 +112,7 @@ export function Activities({snap, picked}: {snap: Snapshot; picked: string | nul
               // The member filter is real, so where it does not apply the
               // screen has to say so rather than silently showing the same
               // numbers for whichever person is selected.
-              <Badge label="whole project · filter does not apply" variant="warning" />
+              <Badge label="no names on these" variant="warning" />
             )}
           </SectionHeading>
 
@@ -123,6 +141,7 @@ export function Activities({snap, picked}: {snap: Snapshot; picked: string | nul
                       measure={group.measures[0]}
                       weeks={snap.weeks}
                       people={group.attributed ? shown : []}
+                      all={snap.people}
                       height={190}
                     />
                   </VStack>
@@ -134,7 +153,7 @@ export function Activities({snap, picked}: {snap: Snapshot; picked: string | nul
       ))}
 
       <VStack gap={4}>
-        <SectionHeading title="Which test cycles they worked in" eyebrow="Where the runs landed" />
+        <SectionHeading title="Which cycles the runs landed in" eyebrow="Test execution by cycle" />
         <Card>
           {cycleRows.length ? (
             <Table<CycleRow>
@@ -147,15 +166,15 @@ export function Activities({snap, picked}: {snap: Snapshot; picked: string | nul
             />
           ) : (
             <Text type="body" color="secondary">
-              No test cycles recorded for the selected people.
+              No test cycles recorded for who you have selected.
             </Text>
           )}
         </Card>
       </VStack>
 
       <Text type="supporting" color="secondary">
-        Counted from {snap.sources.join(', ')}. Every per-person figure counts only that person —
-        nobody else's work is in them. A dash means nothing was measured, not zero.
+        Counted from {snap.sources.join(', ')}. Every figure with a name against it counts only that
+        person. A dash means nothing was measured, not zero.
       </Text>
     </VStack>
   );

@@ -11,7 +11,7 @@ import {Text} from '@astryxdesign/core/Text';
 import {Icon} from '@astryxdesign/core/Icon';
 import {StopIcon} from '@heroicons/react/24/solid';
 import {TrendTag} from './shell';
-import {hueFor} from './charts';
+import {hueOf, shortOf} from './tokens';
 import type {Measure, Person, Week} from './data';
 import {format, isAttributed, trend} from './data';
 
@@ -92,12 +92,12 @@ export function MeasureTable({
       renderCell: row =>
         row.who ? (
           <HStack gap={2} vAlign="center">
-            <Icon icon={StopIcon} size="xsm" style={{color: hueFor(people, row.who)}} />
-            <Text type="body">{row.who.split(' ')[0]}</Text>
+            <Icon icon={StopIcon} size="xsm" style={{color: hueOf(people, row.who)}} />
+            <Text type="body">{shortOf(people, row.who)}</Text>
           </HStack>
         ) : (
           <Text type="supporting" color="secondary">
-            whole project
+            no name on it
           </Text>
         ),
     },
