@@ -175,7 +175,17 @@ from this file between 2026-08-19 and 2026-08-27.
 `lines_removed`, `files_changed`, `files_added`, `files_modified`,
 `files_removed`, `automation_scripts_added`, `automation_scripts_modified`,
 `automation_scripts_removed`, `automation_files_by_kind`, `commit_count`,
-`ai_commit_count`, `ai_run_ids`, `ai_model_ids`.
+`ai_commit_count`, `ai_run_ids`, `ai_model_ids`, `test_case_keys`.
+
+`test_case_keys` is a **list**, because a pull request touching twenty spec
+files is about twenty cases and picking one would be a choice nobody made. It
+is read from the *file names* of the changed scripts and is the only route from
+a repository to an AIO case that does not depend on somebody typing a key —
+measured 2026-08-26, the other three are empty: 0 of 82 branch names carry one,
+1 real prompt in 5,036 names any ticket, and `has_automation_key` is false on
+all 4,512 cases including the 4,165 marked "Automated". Only the key survives;
+`classify_path` already reads and drops these paths under §11.3 and that is
+unchanged.
 
 Every name is a count, a timestamp, a duration, a classification or an id. No
 path, no title, no message body, no valuation. `automation_files_by_kind` maps
@@ -476,3 +486,29 @@ AI-Trace-Id: trc_01hq8f3zk1aabbccddee
 AI-Agent: Platform Developer 2.0@a3f21c9
 AI-Model: GPT-5.3-Codex
 ```
+
+**Measured 2026-08-26: present on 0 of 121 pull requests.** Since §2.4 makes
+this trailer the only thing earning `link.method='explicit'`, and `explicit`
+the only method admissible to the cost metrics, that single zero held metrics
+9 and 10 shut. Two causes, both fixed 2026-08-27, and neither was a missing
+feature:
+
+1. **The hook searched a directory that does not exist on the pilot machines.**
+   It read `~/.aiep/telemetry`, the ai-engineering-platform's buffer, written
+   when a *platform agent* runs. These machines run no platform agents; their
+   runs come from the Copilot CLI journal, which `cli/copilot_read.py` turns
+   into real `run.started` events with real run ids — into insight's own
+   buffer, which the hook never looked at. It now reads both.
+2. **`MAX_AGE_SECONDS` was declared, commented and never read.** A run left
+   open on Friday would have stamped itself onto Monday's commit. The file says
+   twice that a wrong join is worse than a missing one; it is now enforced, and
+   a start time that cannot be parsed counts as stale.
+
+**What is still unreachable, and is not a bug.** VS Code Copilot Chat has no
+run concept — `cli/vscode_read.py` emits `run_id: null` and says so, because
+inventing one would manufacture a join key (AR-1). A person who works only in
+the chat panel therefore produces no `AI-Run-Id` however well the hook works,
+so **`explicit` linkage, and with it the cost metrics, are structurally out of
+reach for chat-only use.** That is a property of the surface, not a gap to be
+closed by parsing harder. It is recorded here so nobody spends another
+afternoon looking for the bug.

@@ -609,7 +609,11 @@ class TestHook(ClientTestCase):
         subprocess.run(["git", "-C", self.repo, "init", "-q", "-b", "main"],
                        check=True, stdout=subprocess.DEVNULL,
                        stderr=subprocess.DEVNULL)
-        self.emit = os.path.join(self.home, "aiep-buffer")
+        # `buffer/` under a scratch SETA_INSIGHT_HOME, which is where the hook
+        # looks. It used to be any directory, because the harness rewrote the
+        # hook's source to point at it -- see `run_hook`.
+        self.hook_home = os.path.join(self.home, "hook-home")
+        self.emit = os.path.join(self.hook_home, "buffer")
         os.makedirs(self.emit)
 
     def hook_path(self):
@@ -623,17 +627,22 @@ class TestHook(ClientTestCase):
         path = os.path.join(self.home, "COMMIT_EDITMSG")
         with open(path, "w", encoding="utf-8") as handle:
             handle.write(message)
-        script = self.hook_path()
-        patched = os.path.join(self.home, "hook.py")
-        with open(script, "r", encoding="utf-8") as handle:
-            body = handle.read()
-        body = body.replace(
-            'BUFFER = os.path.join(os.path.expanduser("~"), ".aiep", "telemetry")',
-            'BUFFER = {!r}'.format(self.emit))
-        with open(patched, "w", encoding="utf-8") as handle:
-            handle.write(body)
-        argv = [sys.executable, patched, path] + ([source] if source else [])
-        result = subprocess.run(argv, capture_output=True)
+        # The installed hook itself, not a rewritten copy of it.
+        #
+        # This used to string-replace the hook's `BUFFER = ...` line into a
+        # patched file and run that. When the hook learned to search a second
+        # buffer on 2026-08-27 that line stopped existing, the replace became a
+        # no-op, and the harness quietly went back to testing the real
+        # `~/.aiep/telemetry` -- absent, so every run looked like "no open
+        # run". A test harness that edits its subject's source can stop
+        # agreeing with it without failing.
+        #
+        # `SETA_INSIGHT_HOME` is the hook's own supported redirection, so
+        # nothing needs rewriting.
+        argv = [sys.executable, self.hook_path(), path] + (
+            [source] if source else [])
+        env = dict(os.environ, SETA_INSIGHT_HOME=self.hook_home)
+        result = subprocess.run(argv, capture_output=True, env=env)
         with open(path, "r", encoding="utf-8") as handle:
             return result.returncode, handle.read()
 
@@ -642,11 +651,26 @@ class TestHook(ClientTestCase):
             for event in events:
                 handle.write(json.dumps(event) + "\n")
 
-    def _run_started(self, run_id="run_abc", agent="developer.implementer"):
+    def _run_started(self, run_id="run_abc", agent="developer.implementer",
+                     at=None):
+        # A *recent* start, and it has to be computed rather than written down.
+        # The hook attaches a run only if it started inside MAX_AGE_SECONDS --
+        # a rule its own comment always claimed and nothing enforced until
+        # 2026-08-27. A fixed timestamp here passed for as long as the rule was
+        # dead and is stale the moment it is alive.
+        from datetime import datetime, timedelta, timezone
+        when = at or (datetime.now(timezone.utc) - timedelta(minutes=5)
+                      ).isoformat().replace("+00:00", "Z")
         return {"event_type": "run.started", "run_id": run_id,
-                "trace_id": "trc_1", "event_time": "2026-08-24T09:00:00Z",
+                "trace_id": "trc_1", "event_time": when,
                 "agent": {"agent_name": agent},
                 "attributes": {"model_declared_id": "claude-opus-5"}}
+
+    def test_a_run_left_open_yesterday_is_not_stamped_onto_todays_commit(self):
+        self.install()
+        self.write_run(self._run_started(at="2026-08-24T09:00:00Z"))
+        _code, message = self.run_hook("fix: something\n")
+        self.assertNotIn("AI-Run-Id", message)
 
     def test_install_refuses_to_clobber_someone_elses_hook(self):
         # Overwriting a hook silently would break whatever it does, and this is

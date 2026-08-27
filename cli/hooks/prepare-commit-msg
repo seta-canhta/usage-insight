@@ -23,8 +23,35 @@ hook at all:
 import json
 import os
 import sys
+from datetime import datetime, timezone
 
-BUFFER = os.path.join(os.path.expanduser("~"), ".aiep", "telemetry")
+
+def _buffers():
+    """Every place an open run might be recorded, most specific first.
+
+    It read only the first of these until 2026-08-27, and that is why
+    `AI-Run-Id` was present on **0 of 121** pull requests in the W34 export.
+    `~/.aiep/telemetry` is the ai-engineering-platform's buffer, written by its
+    `emit.py` when a *platform agent* runs. The pilot machines do not run
+    platform agents; their runs come from the Copilot CLI journal, which
+    `cli/copilot_read.py` turns into real `run.started` events with real run
+    ids -- into insight's own buffer, which this hook never looked at.
+
+    So the hook was correct, complete, installed by default, and searching a
+    directory that does not exist on the machines it was installed on.
+
+    CONTRACT.md §2.4 makes this trailer the only thing that earns
+    `link.method='explicit'`, and `explicit` the only method admissible to the
+    cost metrics. One unexamined path therefore held two metrics shut.
+    """
+    home = os.environ.get("SETA_INSIGHT_HOME") or os.path.join(
+        os.path.expanduser("~"), ".seta-insight")
+    return [
+        os.path.join(os.path.expanduser("~"), ".aiep", "telemetry"),
+        os.path.join(home, "buffer"),
+    ]
+
+
 #: Older than this and the run is stale -- someone left a terminal open rather
 #: than being mid-run. Attaching a day-old run to a fresh commit is a wrong
 #: join, and a wrong join is worse than a missing one.
@@ -32,26 +59,33 @@ MAX_AGE_SECONDS = 4 * 60 * 60
 
 
 def buffer_files():
-    """Walk the buffer. emit.py writes into pending/, not the top level.
+    """Walk every buffer. emit.py writes into pending/, not the top level.
 
     Listing only the top level finds the directories and none of the events,
     which produces "no run is open" on every commit -- correct-looking output
     from a search that never looked anywhere.
     """
     found = []
-    for root, _dirs, files in os.walk(BUFFER):
-        for name in sorted(files):
-            if name.endswith(".ndjson"):
-                found.append(os.path.join(root, name))
+    for buffer in _buffers():
+        if not os.path.isdir(buffer):
+            continue
+        for root, _dirs, files in os.walk(buffer):
+            for name in sorted(files):
+                if name.endswith(".ndjson"):
+                    found.append(os.path.join(root, name))
     return sorted(found)
 
 
 def latest_open_run():
-    if not os.path.isdir(BUFFER):
-        return None
     started, closed = {}, set()
     for path in buffer_files():
-        with open(path, "r", encoding="utf-8") as handle:
+        # One unreadable file must not cost the whole search: the buffers are
+        # written by other processes and a half-written line is normal.
+        try:
+            handle = open(path, "r", encoding="utf-8")
+        except OSError:
+            continue
+        with handle:
             for line in handle:
                 line = line.strip()
                 if not line:
@@ -72,7 +106,33 @@ def latest_open_run():
     open_runs = [e for run_id, e in started.items() if run_id not in closed]
     if not open_runs:
         return None
-    return max(open_runs, key=lambda e: e.get("event_time") or "")
+    newest = max(open_runs, key=lambda e: e.get("event_time") or "")
+
+    # `MAX_AGE_SECONDS` was declared with a comment explaining exactly why it
+    # matters and then never read -- so a run left open on Friday would stamp
+    # itself onto Monday's commit, which is the wrong join this file says twice
+    # is worse than no join. Enforced from 2026-08-27.
+    age = _age_seconds(newest.get("event_time"))
+    if age is None or age > MAX_AGE_SECONDS:
+        return None
+    return newest
+
+
+def _age_seconds(when):
+    """Seconds since ``when``, or None if it cannot be read.
+
+    None is treated as stale by the caller. A run whose start time cannot be
+    parsed is not evidence that it started recently.
+    """
+    if not isinstance(when, str) or not when:
+        return None
+    try:
+        moment = datetime.fromisoformat(when.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return (datetime.now(timezone.utc) - moment).total_seconds()
 
 
 def main(argv):

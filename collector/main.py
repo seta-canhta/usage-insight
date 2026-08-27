@@ -126,6 +126,10 @@ _PR_SHARED = frozenset({
     "automation_scripts_added", "automation_scripts_modified",
     "automation_scripts_removed", "automation_files_by_kind",
     "commit_count", "ai_commit_count", "ai_run_ids", "ai_model_ids",
+    # Test cases named by the file names of the scripts that changed -- the
+    # only route from a repository to an AIO case that does not depend on
+    # somebody typing a key. Keys only; the paths are read and dropped (§11.3).
+    "test_case_keys",
 })
 
 ATTRIBUTE_ALLOWLIST: Dict[str, frozenset] = {

@@ -35,7 +35,8 @@ import argparse
 import os
 import re
 import sys
-from typing import Any, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple
+from typing import (Any, Collection, Dict, Iterable, Iterator, List, Optional,
+                    Sequence, Tuple)
 
 # The shared library sits at the repository root, one level up: it is
 # depended on by `cli/`, `importers/` and `report/` too, so it cannot
@@ -378,7 +379,9 @@ def diffstat_path(entry: Dict[str, Any]) -> Optional[str]:
     return None
 
 
-def summarise_diffstat(entries: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
+def summarise_diffstat(entries: Iterable[Dict[str, Any]],
+                       projects: Optional[Collection[str]] = None
+                       ) -> Dict[str, Any]:
     """Sum a (fully paginated) diffstat collection.
 
     File *paths* are permitted by CONTRACT.md §1; file *contents* are not, and
@@ -392,6 +395,19 @@ def summarise_diffstat(entries: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
     files_changed = 0
     by_status: Dict[str, int] = {}
     by_kind: Dict[str, Dict[str, int]] = {}
+    #: Test cases named by the *file names* of the scripts that changed.
+    #:
+    #: The only route from a repository to an AIO test case that does not
+    #: depend on somebody typing a key. Measured 2026-08-26, the other three
+    #: are all empty: 0 of 82 branch names carry one, 1 real prompt in 5,036
+    #: names any ticket at all, and `has_automation_key` is false on all 4,512
+    #: cases including the 4,165 marked "Automated".
+    #:
+    #: Only the key survives. `classify_path` already reads these paths and
+    #: drops them -- §11.3 keeps them out because a test file name carries
+    #: customer and endpoint names -- and that is unchanged: this reads the
+    #: same string and keeps at most a key from it.
+    cases: set = set()
     for entry in entries or []:
         files_changed += 1
         lines_added += int(entry.get("lines_added") or 0)
@@ -399,7 +415,11 @@ def summarise_diffstat(entries: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         raw_status = str(entry.get("status") or "unknown").lower()
         status = _DIFFSTAT_STATUS.get(raw_status, "modified")
         by_status[status] = by_status.get(status, 0) + 1
-        kind = classify_path(diffstat_path(entry))
+        path = diffstat_path(entry)
+        found = extract_test_keys(path, projects=projects)["test_case_key"]
+        if found:
+            cases.add(found)
+        kind = classify_path(path)
         bucket = by_kind.setdefault(kind, {"added": 0, "modified": 0, "removed": 0})
         bucket[status] = bucket.get(status, 0) + 1
 
@@ -421,6 +441,7 @@ def summarise_diffstat(entries: Iterable[Dict[str, Any]]) -> Dict[str, Any]:
         "automation_scripts_modified": scripts_modified,
         "automation_scripts_removed": scripts_removed,
         "automation_files_by_kind": by_kind,
+        "test_case_keys": sorted(cases),
     }
 
 
@@ -805,7 +826,9 @@ class BitbucketPoller:
         activity = self.pr_activity(pr_id)
         timeline = derive_review_timeline(pull_request, activity)
         comments = summarise_comments(self.pr_comments(pr_id), author)
-        diffstat = summarise_diffstat(self.pr_diffstat(pr_id))
+        diffstat = summarise_diffstat(
+            self.pr_diffstat(pr_id),
+            projects=validated_projects(self.config.jira_project_keys))
         commits = self.pr_commits(pr_id) if self.fetch_pr_commits else []
         commit_summary = summarise_pr_commits(commits)
 
@@ -866,6 +889,9 @@ class BitbucketPoller:
             "automation_scripts_modified": diffstat["automation_scripts_modified"],
             "automation_scripts_removed": diffstat["automation_scripts_removed"],
             "automation_files_by_kind": diffstat["automation_files_by_kind"],
+            # A list, because a pull request touching twenty spec files is
+            # about twenty cases and picking one would be a choice nobody made.
+            "test_case_keys": diffstat["test_case_keys"],
             "commit_count": commit_summary["commit_count"],
             "ai_commit_count": commit_summary["ai_commit_count"],
             "ai_run_ids": commit_summary["ai_run_ids"],

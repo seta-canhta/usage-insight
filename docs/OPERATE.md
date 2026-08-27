@@ -204,6 +204,20 @@ one line in this file and nobody adds a line for a number.
 Get an accountId from Jira: profile URL, or the admin user list. Where a person
 has no entry, their events stay NULL rather than being guessed.
 
+The accountIds are already in the exports; what is missing is which is whose.
+`tools/diagnostics/who_is_who.py` ranks them by what they actually did — test
+runs executed, cycles touched, pull requests opened and reviewed — so the
+question narrows from "what are the accountIds" to "which of these is Ngoc":
+
+```bash
+python3 tools/diagnostics/who_is_who.py reports/2026-W34/exports/*.ndjson
+```
+
+It cannot tell you who is who and does not pretend to: this pipeline stores no
+names by design. Confirm each in Jira before writing the line. A wrong entry
+attributes one person's AI use to another, which is worse than the null it
+replaces.
+
 ## 4. Report
 
 ```bash

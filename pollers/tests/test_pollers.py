@@ -2571,3 +2571,54 @@ class TestAioEventsCarryTheirOwnKeys(unittest.TestCase):
         event = self._poller().build_case_event(
             {"key": "IML-TC-5", "updatedDate": 1787000000000})
         self.assertEqual(event["context"]["test_case_key"], "IML-TC-5")
+
+
+class TestTestCaseKeysFromScriptPaths(unittest.TestCase):
+    """The only route from a repo to an AIO case that needs nobody to type one.
+
+    Measured 2026-08-26, the other three routes are empty: 0 of 82 Watchtower
+    branch names carry a test key, 1 real prompt in 5,036 names any ticket, and
+    `has_automation_key` is false on all 4,512 AIO cases -- including the 4,165
+    marked "Automated". A spec file named after its case is the remaining one.
+
+    Keys only. `classify_path` already reads these paths and drops them,
+    because a test file name carries customer and endpoint names (§11.3), and
+    that is unchanged: this reads the same string and keeps at most a key.
+    """
+
+    REAL = ("IML", "APR", "AERLABS", "IOTA3")
+
+    def _entry(self, path, status="modified"):
+        return {"lines_added": 1, "lines_removed": 0, "status": status,
+                "new": {"path": path}}
+
+    def test_a_spec_named_after_its_case(self):
+        found = poll_bitbucket.summarise_diffstat(
+            [self._entry("tests/e2e/IML-TC-1234-login.spec.ts")],
+            projects=self.REAL)
+        self.assertEqual(found["test_case_keys"], ["IML-TC-1234"])
+
+    def test_several_files_give_several_cases_deduplicated(self):
+        found = poll_bitbucket.summarise_diffstat([
+            self._entry("tests/IML-TC-1.spec.ts"),
+            self._entry("tests/IML-TC-2.spec.ts"),
+            self._entry("tests/IML-TC-1-extra.spec.ts"),
+        ], projects=self.REAL)
+        self.assertEqual(found["test_case_keys"], ["IML-TC-1", "IML-TC-2"])
+
+    def test_a_path_naming_nothing_yields_nothing(self):
+        found = poll_bitbucket.summarise_diffstat(
+            [self._entry("tests/login.spec.ts")], projects=self.REAL)
+        self.assertEqual(found["test_case_keys"], [])
+
+    def test_the_allow_list_applies_to_paths_too(self):
+        found = poll_bitbucket.summarise_diffstat(
+            [self._entry("tests/NOPE-TC-9.spec.ts")], projects=self.REAL)
+        self.assertEqual(found["test_case_keys"], [])
+
+    def test_no_path_ever_reaches_the_result(self):
+        found = poll_bitbucket.summarise_diffstat(
+            [self._entry("tests/e2e/acme-bank/IML-TC-1234-login.spec.ts")],
+            projects=self.REAL)
+        self.assertNotIn("acme-bank", json.dumps(found))
+        self.assertNotIn("login", json.dumps(found))

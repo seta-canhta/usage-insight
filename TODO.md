@@ -30,29 +30,43 @@ have gone to W31.
       machine nobody opens stays behind. Watch `docker logs insight-proxy` for
       `"event": "enrolled"` from the two real addresses.
 
-## Attribution — what still cannot be joined
+## Attribution
 
-Fixed 2026-08-27 (0.7.0): AIO events carry their own case and cycle keys, the
-extractor can read that key space, prompts and PR fields are scanned for it,
-and `pull.py --identities` supplies the accountId. Verified end to end against
-the live release: a stamped laptop event joins to 7,836 real AIO test runs and
-to that person's pull requests. It joined to nothing the day before.
+0.8.0 (2026-08-27) closed the code half of this.
 
-- [ ] **Write `identities.txt`** — one `email accountId` line for Ngoc and
-      Linh, and pass `--identities` on every pull. Without it laptop events
-      keep `person_id: null` and join to nothing, however many arrive. Get the
-      accountIds from Jira; `pull.py` names anyone it could not map.
-- [ ] **Case-level attribution is out of reach, and is not a code problem.**
-      0 of 82 Watchtower branch names contain a test key; 1 real prompt in
-      5,036 names any ticket; `has_automation_key` is false on all 4,512 AIO
-      cases including the 4,165 marked "Automated". Until a test case can point
-      at its script — or branches/PRs name the case — no parser reaches a test
-      case from a laptop. Worth raising with the QA team; person-and-week
-      attribution works now, case-level does not.
-- [ ] **`AI-Run-Id` trailers: 0 of 121.** `link.method` is heuristic 112,
-      marker_only 9, explicit 0 — and CONTRACT.md §2.4 admits only `explicit`
-      rows to the cost metrics. Find out whether the commit hook is installed
-      on their machines and whether they commit from the machine they chat on.
+- [x] **`AI-Run-Id` on 0 of 121 PRs** — two bugs, neither a missing feature.
+      The hook read only `~/.aiep/telemetry`, the platform agent's buffer,
+      which does not exist on the pilot machines; their runs come from the
+      Copilot CLI journal into insight's own buffer, which it never looked at.
+      And `MAX_AGE_SECONDS` was declared, commented and never read, so a run
+      left open on Friday would stamp Monday's commit. Both fixed, both tested.
+      The test harness had been rewriting the hook's source to point at a test
+      buffer; that rewrite silently stopped matching, so it was testing the
+      unpatched hook. It now runs the real file via `SETA_INSIGHT_HOME`.
+- [x] **Test keys from script file names** — the only route from a repo to an
+      AIO case that needs nobody to type one. `test_case_keys` on the terminal
+      PR events, keys only, paths still dropped (§11.3).
+- [x] **`who_is_who.py`** ranks the accountIds in an export by what they did,
+      so `identities.txt` can be filled without guessing.
+
+- [ ] **Write `identities.txt`.** The one step nobody else can do:
+      `python3 tools/diagnostics/who_is_who.py reports/2026-W34/exports/*.ndjson`
+      lists six candidates with their activity. Confirm each in Jira, write
+      `email accountId` lines, pass `--identities` on every pull. Until then
+      laptop events keep `person_id: null` and join to nothing.
+- [ ] **Ask the QA team to name spec files after their cases**, or to fill
+      `automation_key` in AIO. Without one of those, case-level attribution
+      stays out of reach — 0 of 82 branches name a case, 1 prompt in 5,036
+      names any ticket, and `has_automation_key` is false on all 4,512 cases
+      including the 4,165 marked "Automated". Person-and-week attribution works
+      now; case-level does not, and no parser will change that.
+
+**Structurally unreachable, recorded so nobody hunts for the bug again:** VS
+Code Copilot Chat has no run concept — `vscode_read` emits `run_id: null`
+deliberately, because inventing one would manufacture a join key (AR-1). So
+chat-only use produces no `AI-Run-Id` however well the hook works, and
+`explicit` linkage — and with it the cost metrics — is out of reach for it.
+That is a property of the surface. See `CONTRACT.md` §9.
 
 ## Re-collect the laptop data
 
