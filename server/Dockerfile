@@ -38,14 +38,17 @@ COPY server/proxy.py server/store.py server/registry.py server/dashboard.py \
 # three routes; in the image because a page that ships separately from
 # the process that serves it is a page that will one day not ship.
 COPY server/assets/dashboard.html /app/server/assets/dashboard.html
-# The /insights and /activities bundle and its snapshot are deliberately
-# NOT copied here. `server/assets/app` is written by a frontend build that
-# is not part of a checkout, and a COPY of a directory that may not exist
-# fails the image build outright -- so an image would stop being buildable
-# from a clean tree. Both are mounted at deploy time, which is also what
-# lets a regenerated insights.json be picked up without a new image:
-# --insights-app and --insights-snapshot point at the mount, and their
-# absence is a 404 and a 503 that say so rather than a broken container.
+# The /insights and /activities bundle, for the same reason as the daybook
+# page above: it ships with the process that serves it. This was left out of
+# the image while the build output was untracked -- a COPY of a directory that
+# might not exist fails the build outright -- but the bundle is committed now,
+# so a clean checkout always has it and that objection is gone.
+COPY server/assets/app /app/server/assets/app
+# The snapshot is NOT copied, and that half stands. It names individuals and
+# carries issue keys, so it is gitignored and never in an image; it is
+# regenerated wherever the source credentials live and pushed to a mount. That
+# is also what lets a fresh one be picked up without a rebuild -- the server
+# re-stats it. Absent, it is a 503 that says so, never an empty object.
 COPY cli/identity.py /app/cli/identity.py
 
 # The watchdog, which runs from this same image with a different entrypoint

@@ -100,6 +100,11 @@ services:
       #
       # From then on the loud behaviour above applies and is what you want.
       INSIGHT_INSTALL_SCRIPT: "${INSIGHT_INSTALL_SCRIPT-}"
+      # The /insights and /activities snapshot. The bundle itself is in the
+      # image; this is the figures, which change daily and must not be. An
+      # absent file is a 503 with a sentence saying the snapshot has not been
+      # generated -- never zeros, which would read as a team that did nothing.
+      INSIGHT_INSIGHTS_SNAPSHOT: /var/lib/insight-insights/insights.json
       INSIGHT_HOST: "0.0.0.0"          # container-internal; see the note above
       INSIGHT_PORT: "8479"              # full: uploads and the read routes
       INSIGHT_UPLOAD_PORT: "8480"       # uploads and /healthz only -- published
@@ -133,6 +138,11 @@ services:
       - "${INSIGHT_CONF:-./etc}:/etc/insight:ro"
       - "${INSIGHT_REGISTRY:-./registry}:/var/lib/insight-registry"
       - "${INSIGHT_DATA:-./data}:/var/lib/insight"   # only the file:// store
+      # Read-only, and its own mount rather than a corner of ./etc: that
+      # directory is described as holding the one credential here, and a data
+      # file that a laptop pushes daily does not belong beside it. The
+      # endpoint only ever reads this.
+      - "${INSIGHT_INSIGHTS:-./insights}:/var/lib/insight-insights:ro"
 
     # It reads a whitelist and writes bundles. It needs nothing else.
     read_only: true
