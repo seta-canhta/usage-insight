@@ -316,7 +316,8 @@ def render(wb, data, weeks, full_weeks, window_label):
     ws = fresh(wb, "AI Usage")
     head(ws, ["Person", "Week", "Window", "Prompts", "Model calls", "Tool calls",
               "Sessions", "Active days", "Prompts/active day", "Action rate %",
-              "Priced calls", "Token cost $ (modelled)", "Cost/prompt $"],
+              "Questions with a measured cost", "AI cost, estimated ($)",
+            "Cost per question $"],
          [16, 10, 24, 9, 11, 10, 9, 11, 17, 12, 11, 20, 12])
     r = 2
     for n in names:
@@ -337,13 +338,14 @@ def render(wb, data, weeks, full_weeks, window_label):
                 ws.cell(row=r, column=col, value=val)
             r += 1
     notes(ws, r + 1, [
-        "Action rate = tool calls / prompts. It separates the assistant DOING "
-        "work (reading, editing, running) from ANSWERING questions.",
-        "Token cost is MODELLED, not measured: this surface records tokens on a "
-        "minority of calls, so the rest are projected from the per-week median "
-        "of the priced ones. List price, no cache discount.",
-        "It is NOT the invoice. Copilot bills per seat plus premium requests, "
-        "and premium_requests is NULL here. Read it as an economic weight.",
+        "\"How often AI did the work\" counts the questions where AI went and "
+        "read, changed or ran something, rather than only replying.",
+        "The cost is an ESTIMATE. Only a minority of AI questions record what "
+        "they used, so the rest are scaled from the typical question that week. "
+        "Published list prices, no discounts applied.",
+        "It is NOT the bill. Copilot charges a monthly fee per person plus "
+        "usage, and neither is visible here. Use it to compare weeks against "
+        "each other, not to forecast a budget.",
         "A blank cell is a quantity with no measurement, never a zero.",
     ])
 
@@ -388,14 +390,14 @@ def render(wb, data, weeks, full_weeks, window_label):
     for n in names:
         line("Automation scripts added", "up", n,
              [bb[n][w]["scripts_added"] for w in weeks],
-             "Spec / step-definition / feature files added in merged PRs")
+             "New test script files in the code changes they delivered")
         line("Automation scripts modified", "up", n,
              [bb[n][w]["scripts_modified"] for w in weeks])
         line("PRs merged", "up", n,
              [bb[n][w]["scm.pr.merged"] for w in weeks])
         line("AI outputs written (files)", "up", n,
              [ai[n][w]["output.generated"] for w in weeks],
-             "Files the assistant itself wrote, from the laptop stream")
+             "Files AI wrote directly, rather than a person typing them")
 
     group(2, "Automation Coverage  (BY CYCLE)")
     cov = data["coverage_by_cycle"]
@@ -406,9 +408,9 @@ def render(wb, data, weeks, full_weeks, window_label):
     ws.cell(row=r, column=5,
             value="%.1f%% (%d / %d)" % (100.0 * ta / tc, ta, tc) if tc else "no data")
     ws.cell(row=r, column=6 + len(weeks),
-            value="The cycle is the delivery record (CONTRACT.md 3 row 22), so "
-                  "'eligible' means the cases in the cycles actually being run "
-                  "-- not every case that has ever existed in the project.")
+            value="Counted across the test cycles actually being run, which is "
+                  "the work in flight -- not every test that has ever been "
+                  "written, most of which nobody has triaged.")
     r += 1
     for key in sorted(cov, key=lambda k: -cov[k]["cases"]):
         c = cov[key]
@@ -425,20 +427,22 @@ def render(wb, data, weeks, full_weeks, window_label):
     est = data["estate"]
     if est:
         free("Backlog view (whole case estate)",
-             "A DIFFERENT question, kept separate on purpose: "
+             "A different question, kept separate on purpose -- what is "
+             "still waiting to be automated: "
              + "; ".join("%s %d automated / %d to-be-automated / %d no status"
                          % (k, est[k].get("automated", 0),
                             est[k].get("to_be_automated", 0), est[k].get("unset", 0))
                          for k in ("High", "Medium", "Low") if k in est)
-             + ". Reading this as coverage makes an untriaged backlog look like "
-               "a delivery failure. Label it backlog, never coverage.")
+             + ". Read as coverage it makes an untouched backlog look like a "
+               "delivery failure. It is a queue, not a score.")
     r += 1
 
     group(3, "First-Pass Acceptance Rate")
     for n in names:
         line("Reviews given", "up", n,
              [bb[n][w]["scm.pr.reviewed"] for w in weeks],
-             "No rate is meaningful at this denominator -- state the counts")
+             "Too few reviews to turn into a percentage -- the counts are the "
+             "honest answer")
 
     group(4, "Rework Rate")
     for n in names:
@@ -454,19 +458,19 @@ def render(wb, data, weeks, full_weeks, window_label):
         line("Median PR merge lead time (h)", "down", n,
              [round(statistics.median(data["merge"][n][w]) / 3600000.0, 2)
               if data["merge"][n][w] else None for w in weeks],
-             "Nearest available proxy. The test-case -> merge link is not built, "
-             "so this is NOT Automation Lead Time as the metric defines it")
+             "The closest thing available. Nothing links a test to the change "
+             "that automated it, so this is time-to-merge, not time-to-automate")
 
     group(6, "Productivity Gain")
     free("excluded",
-         "The formula needs a manual control group. None exists and none is "
-         "planned. Do not report a number here.")
+         "This needs the same work done without AI to compare against, and "
+         "there is none. Anyone quoting a speed-up percentage is guessing.")
     r += 1
 
     group(7, "Execution Rate")
     for n in names:
         line("AI prompts", "up", n, [ai[n][w]["human.turn"] for w in weeks],
-             "Laptop stream -- the AI side of execution")
+             "How much they used AI -- the AI side of getting work done")
         line("Active days", "up", n,
              [len(data["days"][n][w]) for w in weeks])
     free("Test runs executed, per cycle",
@@ -479,26 +483,25 @@ def render(wb, data, weeks, full_weeks, window_label):
     free("Failed runs, per cycle",
          "; ".join("%s %d" % (k, cov[k]["failed"])
                    for k in sorted(cov, key=lambda x: -cov[x]["failed"]))
-         + ". NOT flakiness: AIO keeps one run per case per cycle and overwrites "
-           "on re-run, so an intermittent test leaves no trace. The metric as "
-           "defined is unmeasurable from this source.")
+         + ". This is a failure count, not a flakiness rate: the test tool "
+           "keeps only the latest result for each test, so a test that fails "
+           "then passes leaves no trace. Flakiness cannot be measured here.")
     r += 1
 
     group(9, "AI Cost per Accepted Output")
     for n in names:
-        line("Token cost $ (modelled)", "down", n,
+        line("AI cost, estimated ($)", "down", n,
              [(cost[n].get(w) or {}).get("modelled") for w in weeks],
-             "Numerator only. Method and caveats on the AI Usage sheet.")
-    free("Denominator: accepted outputs",
-         "Does not exist. CONTRACT.md 2.4 admits only link.method='explicit' to "
-         "the cost metrics, and this surface emits run_id null on every event, "
-         "so no row qualifies. The figures above are an economic weight, not "
-         "this metric.")
+             "The cost side only. How it is worked out is on the AI Usage tab.")
+    free("Cost per finished piece of work",
+         "Not available. Nothing records which AI conversation produced which "
+         "script, so cost can be split by person and week but not by finished "
+         "piece of work. The figures above are a weight, not a price per item.")
     r += 1
 
     group(10, "AI ROI")
     free("excluded",
-         "Value delivered is not observable from any source wired up here.")
+         "The value of the work delivered is not recorded anywhere.")
 
     # ------------------------------------------------------- Productivity
     ws = fresh(wb, "Productivity")
@@ -531,13 +534,15 @@ def render(wb, data, weeks, full_weeks, window_label):
                 ws.cell(row=r, column=col, value=val)
             r += 1
     notes(ws, r + 1, [
-        "These are RATIOS OF MEASURED THINGS. None of them is metric 6 "
-        "(Productivity Gain), which needs a control group and stays excluded.",
-        "Commits come from the laptop git scan and PR lines from the SCM "
-        "poller: different populations, deliberately never summed.",
-        "Cost per unit uses the modelled token cost -- a direction of travel, "
-        "not an invoice.",
-        "A blank cell is a quantity with no denominator that week, never a zero.",
+        "These compare two things we actually counted. None of them is a "
+        "speed-up figure -- that needs a group doing the same work without AI, "
+        "and there is none.",
+        "Commits and delivered code changes are counted from two different "
+        "places and measure different things, so they are never added together.",
+        "Cost per unit uses the estimated AI cost -- a direction of travel, "
+        "not a bill.",
+        "A blank cell means there was nothing to divide by that week -- it "
+        "does not mean zero.",
     ])
 
     charts(wb, data, weeks, window_label)
@@ -784,16 +789,17 @@ def charts(wb, data, weeks, window_label):
     r = 88
     partials = [w for w in shown if w in window_label]
     notes(ws, r, [
-        "Colour is fixed per person across every chart, so identity survives a "
-        "glance from one to the next. A legend is always present.",
-        "Coverage is per CYCLE. A cycle at 0%% is a manual suite, not a failure.",
-        "The action-rate axis is pinned 0-30%%: on an auto axis a 4-20%% band "
-        "fills the plot and reads as a crisis.",
+        "Each person keeps the same colour on every chart.",
+        "Automation is counted per test cycle. A cycle at 0%% is run by hand "
+        "on purpose, not a failure.",
+        "The middle chart's scale is fixed at 0-30%% on purpose: left to scale "
+        "itself, a 4-20%% range fills the chart and looks like a collapse.",
         "Partial windows, not comparable on volume: "
         + ("; ".join("%s = %s" % (w[-3:], window_label[w]) for w in partials)
            if partials else "none"),
-        "Token cost is modelled from a minority of priced calls, at list price, "
-        "and excludes the per-seat charge that is the actual bill.",
+        "AI cost is an estimate from the minority of questions that record "
+        "what they used, at list price, and leaves out the monthly per-person "
+        "fee that is most of the real bill.",
     ])
 
 
@@ -860,35 +866,66 @@ def _arrow(series, want_up, compare=None):
 
 
 def pm_view(wb, data, weeks, full_weeks, window_label):
-    """One sheet: is the AI working, and are they getting better."""
+    """One sheet, written for the person who signs things off.
+
+    Everything here is named the way the reader would say it, not the way the
+    system stores it. "Action rate" is a field name; "how often AI did the work
+    rather than just answering" is the thing it measures. A dagger footnote is
+    a typesetting convention; "(4-day week)" is what a reader needs to know.
+    Nothing internal appears -- no metric numbers, no contract sections, no
+    field names, no environment variables. If a limit matters it is stated in
+    the words a manager would use to repeat it to someone else.
+    """
     ai, bb, cost = data["ai"], data["bb"], data["cost"]
     names = data["names"]
     shown = [w for w in weeks if any(ai[n][w]["human.turn"] for n in names)]
     ws = fresh(wb, "Start Here")
     ws.column_dimensions["A"].width = 3
-    ws.column_dimensions["B"].width = 34
+    ws.column_dimensions["B"].width = 44
     for col in "CDEFG":
-        ws.column_dimensions[col].width = 11
-    ws.column_dimensions["H"].width = 20
+        ws.column_dimensions[col].width = 12
+    ws.column_dimensions["H"].width = 24
     ws.sheet_view.showGridLines = False
 
+    # A reader thinks in dates, not ISO week numbers. Show the actual days,
+    # capped at the last day anything was recorded so a part-week does not
+    # advertise dates nobody has data for.
+    last_seen = max((d for n in names for w in weeks
+                     for d in data["days"][n][w]), default=None)
+
+    def label_of(w):
+        year, num = int(w[:4]), int(w[-2:])
+        monday = datetime.date.fromisocalendar(year, num, 1)
+        sunday = monday + datetime.timedelta(days=6)
+        if last_seen and sunday.isoformat() > last_seen:
+            sunday = datetime.date.fromisoformat(last_seen)
+        span = ("%d–%d %s" % (monday.day, sunday.day, sunday.strftime("%b"))
+                if monday.month == sunday.month else
+                "%d %s – %d %s" % (monday.day, monday.strftime("%b"),
+                                   sunday.day, sunday.strftime("%b")))
+        days = (sunday - monday).days + 1
+        return span + ("\n(%d days)" % days if w in window_label else "")
+
     r = 2
-    ws.cell(row=r, column=2, value="Are they using AI well, and are they getting better?").font = TITLE
+    ws.cell(row=r, column=2,
+            value="Is AI helping the team, and are they getting better at it?"
+            ).font = TITLE
     r += 1
     ws.cell(row=r, column=2,
-            value="August 2026 · %s · every figure counted from events, not "
-                  "self-reported" % ", ".join(names)).font = NOTE
+            value="August 2026 · %s · measured automatically from their tools, "
+                  "not from anything they filled in" % " and ".join(names)
+            ).font = NOTE
     r += 2
 
     def table(rows, note):
         nonlocal r
-        ws.cell(row=r, column=2, value="Measure").font = GRP
+        ws.cell(row=r, column=2, value="What we measured").font = GRP
         for i, w in enumerate(shown):
-            c = ws.cell(row=r, column=3 + i,
-                        value=w[-3:] + ("*" if w in window_label else ""))
+            c = ws.cell(row=r, column=3 + i, value=label_of(w))
             c.font = GRP
-            c.alignment = Alignment(horizontal="right")
-        ws.cell(row=r, column=3 + len(shown), value="Direction").font = GRP
+            c.alignment = Alignment(horizontal="right", wrap_text=True)
+        ws.row_dimensions[r].height = 30
+        ws.cell(row=r, column=3 + len(shown), value="Trend").font = GRP
         r += 1
         full_idx = [shown.index(w) for w in full_weeks if w in shown]
         for label, series, want_up, fmt, is_rate in rows:
@@ -899,11 +936,20 @@ def pm_view(wb, data, weeks, full_weeks, window_label):
                 c.alignment = Alignment(horizontal="right")
             word, colour, change = _arrow(
                 series, want_up, None if is_rate else full_idx)
-            if not is_rate and len(full_idx) < len(shown):
-                word += " \u2020"
-            cell = ws.cell(row=r, column=3 + len(shown),
-                           value=word + ("" if change is None
-                                         else "  (%+d%%)" % change))
+            plain = {"up every week": "better every week",
+                     "down every week": "better every week",
+                     "no clear trend": "up and down",
+                     "flat": "no change", "-": "-"}.get(word)
+            if plain is None:
+                plain = "worse" if colour == BAD else "better"
+            if colour == BAD and plain.startswith("better"):
+                plain = "worse every week"
+            # A net figure beside "up and down" has to say it is a net, or it
+            # reads as the trend the row has just denied having.
+            suffix = ("" if change is None else
+                      ("   net %+d%%" % change if plain == "up and down"
+                       else "   %+d%%" % change))
+            cell = ws.cell(row=r, column=3 + len(shown), value=plain + suffix)
             cell.font = Font(bold=True, color=colour)
             r += 1
         ws.cell(row=r, column=2, value=note).font = NOTE
@@ -914,13 +960,13 @@ def pm_view(wb, data, weeks, full_weeks, window_label):
         ws.cell(row=r, column=2, value=name.upper()).font = Font(bold=True, size=13)
         ws.cell(row=r, column=3, value=role).font = ROLE
         r += 1
-        c = ws.cell(row=r, column=2, value=verdict)
-        c.font = Font(bold=True, size=11, color=verdict_colour)
+        ws.cell(row=r, column=2, value=verdict).font = Font(
+            bold=True, size=11, color=verdict_colour)
         r += 2
         table(rows, note)
 
-    def rate(n, key_a, key_b):
-        return [pct(ai[n][w][key_a], ai[n][w][key_b]) for w in shown]
+    def rate(n, a, b):
+        return [pct(ai[n][w][a], ai[n][w][b]) for w in shown]
 
     def money(n, per):
         out = []
@@ -932,110 +978,105 @@ def pm_view(wb, data, weeks, full_weeks, window_label):
 
     scripts = lambda n, w: bb[n][w]["scripts_added"] + bb[n][w]["scripts_modified"]
 
-    # ---- the automation engineer -----------------------------------------
-    linh = next((n for n in names if sum(scripts(n, w) for w in shown) > 10), None)
-    if linh:
-        block(linh, "writes the automation — work lands in the repo",
-              "Improving, on the two measures that move in one direction: the "
-              "action rate rose every week, and cost per PR merged fell every "
-              "week.", GOOD,
-              [("Action rate — prompts that did work",
-                rate(linh, "tool.call", "human.turn"), True, "%.1f%%", True),
-               ("Cost per automation script touched",
-                money(linh, scripts), False, "$%.2f", True),
-               ("Cost per PR merged",
-                money(linh, lambda n, w: bb[n][w]["scm.pr.merged"]), False,
+    # ---- the person who writes the automation -----------------------------
+    builder = next((n for n in names if sum(scripts(n, w) for w in shown) > 10), None)
+    if builder:
+        block(builder, "builds the automated tests",
+              "Getting better. She is producing more while asking AI for less, "
+              "and each delivery costs less than it did.", GOOD,
+              [("How often AI did the work, not just answered",
+                rate(builder, "tool.call", "human.turn"), True, "%.0f%%", True),
+               ("AI cost per test script she worked on",
+                money(builder, scripts), False, "$%.2f", True),
+               ("AI cost per change she delivered",
+                money(builder, lambda n, w: bb[n][w]["scm.pr.merged"]), False,
                 "$%.2f", True),
-               ("Automation scripts touched",
-                [scripts(linh, w) for w in shown], True, "%d", False),
-               ("AI prompts used",
-                [ai[linh][w]["human.turn"] for w in shown], False, "%d", False)],
-              "Read the last two rows together, across the full weeks: scripts "
-              "touched rose 74% while prompts fell 29%. More output from less "
-              "AI is the improvement worth having. Both rows wander week to "
-              "week, so the net is the claim — not a line through four points.")
+               ("Test scripts worked on",
+                [scripts(builder, w) for w in shown], True, "%d", False),
+               ("Times she asked AI for help",
+                [ai[builder][w]["human.turn"] for w in shown], False, "%d", False)],
+              "The bottom two lines are the story: across the full weeks she "
+              "worked on 74% more test scripts while asking AI for help 29% "
+              "less. More work, less AI to get there. Both lines move around "
+              "week to week, so the overall change is the claim — not a "
+              "straight line through four weeks.")
 
-    # ---- the test engineer -----------------------------------------------
-    ngoc = next((n for n in names if n != linh), None)
-    if ngoc:
-        runs = data["coverage_by_cycle"]
-        theirs = sum(c["ours"].get(ngoc, 0) for c in runs.values())
-        block(ngoc, "runs the tests and moves the tickets — not a repo job",
-              "No trend yet. The automation measures above do not apply to this "
-              "role; the delivery is real and sits in Jira and AIO.", FLAT,
-              [("Action rate — prompts that did work",
-                rate(ngoc, "tool.call", "human.turn"), True, "%.1f%%", True),
-               ("AI prompts used",
-                [ai[ngoc][w]["human.turn"] for w in shown], False, "%d", False),
-               ("Cost per prompt",
-                [round(((cost[ngoc].get(w) or {}).get("modelled") or 0)
-                       / ai[ngoc][w]["human.turn"], 3)
-                 if ai[ngoc][w]["human.turn"] else None for w in shown],
-                False, "$%.3f", True)],
-              "Scoring this person on scripts or pull requests would measure "
-              "them against a job they are not doing. Their August delivery: "
-              "%d test runs, and the Summary sheet has the ticket side. The "
-              "action rate is erratic rather than trending, and cost per "
-              "prompt is drifting up — worth a conversation, not a conclusion."
-              % theirs)
+    # ---- the person who runs the tests ------------------------------------
+    runner = next((n for n in names if n != builder), None)
+    if runner:
+        theirs = sum(c["ours"].get(runner, 0)
+                     for c in data["coverage_by_cycle"].values())
+        block(runner, "runs the tests and manages the tickets",
+              "Too early to say. Her AI use is not settling into a pattern yet, "
+              "and it is costing more per question than it did.", FLAT,
+              [("How often AI did the work, not just answered",
+                rate(runner, "tool.call", "human.turn"), True, "%.0f%%", True),
+               ("Times she asked AI for help",
+                [ai[runner][w]["human.turn"] for w in shown], False, "%d", False),
+               ("AI cost each time she asked",
+                [round(((cost[runner].get(w) or {}).get("modelled") or 0)
+                       / ai[runner][w]["human.turn"], 2)
+                 if ai[runner][w]["human.turn"] else None for w in shown],
+                False, "$%.2f", True)],
+              "She does a different job, so the test-script and delivery "
+              "numbers above are not hers to hit — judging her by them would be "
+              "measuring the wrong work. What she did deliver in August: %d test "
+              "runs, plus the tickets, both on the Summary tab. Worth asking "
+              "what she is using AI for, rather than concluding anything." % theirs)
 
-    # ---- where the work actually is --------------------------------------
+    # ---- the estate --------------------------------------------------------
     cov = data["coverage_by_cycle"]
     tot = sum(c["cases"] for c in cov.values())
     auto = sum(c["automated"] for c in cov.values())
-    ws.cell(row=r, column=2, value="THE ESTATE THEY WORK ON").font = Font(bold=True, size=13)
+    ws.cell(row=r, column=2, value="HOW MUCH OF THE TESTING IS AUTOMATED"
+            ).font = Font(bold=True, size=13)
     r += 1
     if not tot:
-        # No test-management events reached this run. Absent is not zero, and
-        # "0% automated" is the most damaging way to render a missing source.
         ws.cell(row=r, column=2,
-                value="No test-cycle data in this pull — coverage not measured."
-                ).font = VERDICT
+                value="Not measured — the test management data was not included "
+                      "in this pull.").font = VERDICT
         r += 1
         ws.cell(row=r, column=2,
-                value="This is an absent source, not a coverage of zero. Check "
-                      "AIO_PROJECTS is set before reading anything into it."
-                ).font = NOTE
+                value="This is a missing source, not a score of zero. Do not "
+                      "read anything into it.").font = NOTE
         r += 2
     else:
         ws.cell(row=r, column=2,
-                value="%.1f%% of the cases in the cycles being delivered are "
-                      "automated (%s of %s)."
-                      % (100.0 * auto / tot, f"{auto:,}", f"{tot:,}")).font = VERDICT
+                value="%.0f%% — %s of the %s tests in the cycles being run are "
+                      "automated." % (100.0 * auto / tot, f"{auto:,}", f"{tot:,}")
+                ).font = VERDICT
         r += 1
         manual = [k for k in cov if cov[k]["pct"] == 0]
         ws.cell(row=r, column=2,
-                value="Measured per cycle, which is the unit of delivery."
-                      + (" %d of the %d cycles are fully manual suites (%s) — "
-                         "that is a scope decision, not a failure."
-                         % (len(manual), len(cov), ", ".join(sorted(manual)))
-                         if manual else
-                         " All %d cycles carry some automation." % len(cov))
-                ).font = NOTE
+                value=("Counted across the test cycles actually being run, which "
+                       "is the work in flight." +
+                       (" %d of the %d cycles are run by hand on purpose — that "
+                        "is a decision about scope, not a gap." % (len(manual), len(cov))
+                        if manual else "")).strip()).font = NOTE
         r += 2
 
-    # ---- the honest limits ------------------------------------------------
-    ws.cell(row=r, column=2, value="WHAT THIS CANNOT TELL YOU").font = Font(bold=True, size=13)
+    # ---- limits ------------------------------------------------------------
+    ws.cell(row=r, column=2, value="WHAT THESE NUMBERS CANNOT TELL YOU"
+            ).font = Font(bold=True, size=13)
     r += 1
     for line in [
-        "Whether AI made them faster. That needs the same work done without AI "
-        "to compare against, and no such control group exists. Metric 6 is "
-        "excluded for this reason, not for want of data.",
-        "The real AI bill. These are token costs at list price; Copilot charges "
-        "per seat plus premium requests, and this surface records neither. "
-        "Treat the dollar figures as a direction of travel.",
-        "Cost per accepted output. It needs a link from an AI run to the thing "
-        "it produced, and the chat surface emits no run id at all.",
-        "Anything from three or four weeks with confidence. These are early "
-        "readings on a short series — the direction is worth acting on, the "
-        "magnitude is not.",
-        "* marks a part-week (24-27 Aug, four days). \u2020 marks a row whose "
-        "direction is read across the full weeks only, because a count over "
-        "four days is not comparable to one over five. Rates are ratios of two "
-        "things measured in the same window, so they use every week.",
-        "\"No clear trend\" means the series changes direction. Three or four "
-        "points that go down then up are not a decline, and this sheet will not "
-        "draw a line through them.",
+        "Whether AI made them faster. To say that we would need the same work "
+        "done without AI to compare against, and there isn't any. Anyone "
+        "quoting a speed-up percentage is guessing.",
+        "What AI actually costs. The dollar figures are the value of the text "
+        "sent to and from the AI. The real bill is a monthly charge per person "
+        "plus usage, which this cannot see. Use the figures to compare weeks "
+        "against each other, not to forecast a budget.",
+        "The cost of one finished piece of work. The tool cannot yet tell which "
+        "AI conversation produced which script, so cost can be split by person "
+        "and week but not by deliverable.",
+        "Anything with confidence from four weeks. The direction is worth "
+        "acting on. The exact percentages are not — expect them to move.",
+        "Weeks marked (4 days) are short. Percentages from them are still fair "
+        "to compare; the raw counts are not, so those trends ignore them.",
+        "Up-and-down means the number changed direction between weeks. Four "
+        "points that fall then rise are not a decline, and this sheet will not "
+        "pretend otherwise.",
     ]:
         ws.cell(row=r, column=2, value="•  " + line).font = NOTE
         ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=8)
@@ -1096,17 +1137,18 @@ def colour_tabs(wb):
     ws = wb["Summary"]
     ws.insert_rows(1, 4)
     ws.cell(row=1, column=1,
-            value="Dark blue tabs are the answer. Grey tabs are the rows behind "
-                  "it. The amber tab says what is NOT measured -- read it before "
-                  "quoting a number."
+            value="Dark blue tabs are the answer. Grey tabs are the detail "
+                  "behind it. The amber tab lists what we could not measure -- "
+                  "worth a look before quoting any number."
             ).font = Font(bold=True, size=11, color="1F3864")
     ws.cell(row=2, column=1,
-            value="Start at Charts, then Ten Metrics. AI Usage and Productivity "
-                  "carry the per-week detail behind them."
+            value="If you read one tab, read Start Here. Charts shows the same "
+                  "story visually; the rest is supporting detail."
             ).font = NOTE
     ws.cell(row=3, column=1,
-            value="Every figure is counted from events. A blank cell is a "
-                  "quantity nobody measured, never a zero."
+            value="Every figure is counted automatically from Jira, AIO test, "
+                  "Bitbucket and Copilot. A blank cell means nobody measured it "
+                  "-- it does not mean zero."
             ).font = NOTE
 
 if __name__ == "__main__":

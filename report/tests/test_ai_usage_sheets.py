@@ -181,8 +181,9 @@ class ChangeColumnTests(unittest.TestCase):
         sheets.render(wb, data, weeks, weeks, {})
         text = " ".join(str(c.value) for row in wb["Start Here"].iter_rows()
                         for c in row if c.value)
-        self.assertIn("not measured", text)
+        self.assertIn("not measured", text.lower())
         self.assertNotIn("0.0%", text)
+        self.assertNotIn("0%", text)
 
     def test_full_weeks_outside_the_span_are_refused(self):
         with self.assertRaises(SystemExit):
