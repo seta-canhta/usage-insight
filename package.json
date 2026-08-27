@@ -1,0 +1,45 @@
+{
+  "name": "usage-insight",
+  "version": "1.0.0",
+  "description": "The /insights and /activities screens. Python is the rest of this repo.",
+  "main": "index.js",
+  "directories": {
+    "doc": "docs",
+    "test": "tests"
+  },
+  "scripts": {
+    "build:web": "vite build",
+    "typecheck:web": "tsc --noEmit",
+    "dev:web": "vite"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/seta-canhta/usage-insight.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/seta-canhta/usage-insight/issues"
+  },
+  "homepage": "https://github.com/seta-canhta/usage-insight#readme",
+  "dependencies": {
+    "@astryxdesign/cli": "^0.5.0",
+    "@astryxdesign/core": "^0.5.0",
+    "@astryxdesign/theme-neutral": "^0.5.0",
+    "@heroicons/react": "^2.2.0",
+    "@stylexjs/stylex": "^0.19.0",
+    "react": "^19.2.8",
+    "react-dom": "^19.2.8",
+    "recharts": "^3.10.1"
+  },
+  "devDependencies": {
+    "@types/react": "^19.2.18",
+    "@types/react-dom": "^19.2.5",
+    "@vitejs/plugin-react-swc": "^4.3.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.2.2"
+  },
+  "private": true
+}
