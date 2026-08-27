@@ -49,20 +49,32 @@ real ones.
       `reports/2026-W34/exports/` was repaired by hand (originals in
       `superseded/`).
 
-## Open questions, not yet decided
+## Open questions — three of four closed 2026-08-27
 
-- [ ] `ATTRIBUTE_ALLOWLIST["scm.pr.created"]` names 3 attributes; the poller
-      emits ~29, including everything metrics 3 and 4 need. They survive only
-      because poller output does not pass through `importers/bundle.py`, where
-      the allow-list is enforced. Widening it is a schema decision.
-- [ ] `post_review_change_ratio` is defined in `schema/CONTRACT.md` §5 and
-      drives the accepted/reworked state machine, but nothing emits
-      `lines_changed_after_first_review`. Needs per-commit diffstat.
-- [ ] `repo_of()` reads the branch with `git rev-parse HEAD` at collection
-      time, so a backfill stamps today's branch on three weeks of sessions.
-      Value may be right by luck; the method is not, and `link.confidence` is
-      0.9 either way.
-- [ ] Thao Nguyen is on the roster and has never enrolled.
+- [x] `ATTRIBUTE_ALLOWLIST` was describing the pollers wrongly, not protecting
+      them. Measured: `scm.pr.merged` emitted 38 attributes against 3 listed,
+      `scm.pr.declined` 37 against 3, `ci.pipeline.completed` 19 against 8
+      (plus 5 more on the Jenkins path, which is the one production uses),
+      `jira.transition` 10 against 6. Widened to what is emitted, `CONTRACT.md`
+      §3 rows 16–20 corrected to match, and a drift test now runs all four
+      pollers and fails on the next name that appears without being listed.
+- [x] `post_review_change_ratio` has an emitter. `lines_changed_after_first_review`
+      and `lines_changed_pre_review` are measured per commit against its first
+      parent, split at `first_review_at`. Both NULL when the PR was never
+      reviewed — the boundary that defines them does not exist — and both NULL
+      if any per-commit request fails, because an undercount of rework is wrong
+      in the flattering direction.
+- [x] `repo_of()` no longer stamps today's branch on old sessions. The branch
+      now comes from HEAD's reflog at the session's own timestamp, and a
+      session older than the reflog gets NULL rather than an answer.
+- [ ] Thao Nguyen is on the roster and has never enrolled. Not a code fix.
+
+## Backfill
+
+- [x] `pack` emits one bundle per ISO week. A bundle is filed by the endpoint
+      under `iso_week(window_start)` alone and the pipeline pulls a week at a
+      time, so `backfill --since 2026-08-01` filed four weeks under 2026-W31
+      and W32–W34 read as weeks nobody sent.
 
 ## Housekeeping on the host
 

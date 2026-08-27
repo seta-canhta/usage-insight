@@ -97,6 +97,21 @@ Running either twice is safe. Event ids are derived from the fact rather than
 minted per run, so a day collected twice arrives as one day, and the server
 answers `409` to a bundle it already holds.
 
+A backfill spanning several weeks produces **one bundle per ISO week**, and says
+so:
+
+```
+3,214 events, 19 day(s), 2026-08-01 -> 2026-08-27
+4 bundles, one per week: 2026-W31 (402), 2026-W32 (1,118), 2026-W33 (940), 2026-W34 (754)
+```
+
+That is not cosmetic. The endpoint files a bundle under a folder derived from
+its window *start*, and the report pipeline asks for one week at a time — so a
+single bundle covering four weeks lands entirely in the first week's folder and
+the other three read as weeks nobody sent. Nothing errors; the weeks just go
+missing. Splitting happens on this side because only the machine packing knows
+which days it meant to cover.
+
 ## Controls
 
 `insight help` prints all of this in the terminal.
@@ -112,9 +127,22 @@ answers `409` to a bundle it already holds.
 
 ## Upgrading
 
-Re-run the installer. It replaces the launcher and the archive only.
-`~/.seta-insight/` is untouched, so your config, secret and buffered events
-survive, and an existing schedule is repointed automatically.
+It upgrades itself. The hourly run checks the endpoint for a newer release,
+verifies its digest, swaps the archive atomically and rolls back if the new one
+fails its own smoke test — so on a machine that is used, there is nothing to do.
+
+To take a release now rather than within the hour:
+
+```bash
+curl -fsSL https://aeris-insight.seta-international.com/update | sh
+```
+
+That is the installer, under the name that says what it does. It replaces the
+launcher and the archive only. `~/.seta-insight/` is untouched, so your config,
+secret and buffered events survive, and an existing schedule is repointed
+automatically. `insight update --now` does the same thing from inside the tool,
+and `insight update --status` says which version this is and when it last
+looked.
 
 ## Uninstalling
 

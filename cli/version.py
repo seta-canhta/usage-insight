@@ -12,4 +12,4 @@ Bumping this is what a release is. The tag ``v<VERSION>`` triggers
 ``.github/workflows/release.yml``, which refuses to publish if the two disagree.
 """
 
-VERSION = "0.5.0"
+VERSION = "0.6.0"

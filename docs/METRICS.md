@@ -26,7 +26,7 @@ Window: August 2026 onward. Measured 2026-08-26.
 | 1 | partial | 195 scripts changed across 35 merged PRs | only 2 of 35 carry an AI marker |
 | 2 | declared, not verified | 80.2% (1,483 / 1,848) | `has_automation_key` is false on every case, so this measures a dropdown, not whether automation exists. 1,150 cases have no status and are excluded, not counted as un-automated |
 | 3 | no signal | — | 5 review events on 41 PRs |
-| 4 | no signal | — | same denominator |
+| 4 | no signal | — | same denominator. One of its two blockers was removed 2026-08-27: `lines_changed_after_first_review`, the numerator §5 defines and `sql/08_metrics.sql` sums, had no emitter at all, so `v_rework_rate` was averaging over an empty column. It is now measured per commit against its first parent, split at `first_review_at`. The remaining blocker is the one above — 5 review events on 41 PRs, and a rework figure needs a review to be after |
 | 5 | partial | — | AIO case ↔ Bitbucket merge join not built |
 | 6 | out of scope | — | counterfactual; needs a controlled manual arm |
 | 7 | **live** | 66.6% (8,653 / 12,983) | 13 cycles, 8,028 automated, 557 defects |

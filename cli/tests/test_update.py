@@ -138,9 +138,17 @@ class DueTests(unittest.TestCase):
     def test_never_checked_is_due(self):
         self.assertTrue(update.due({}))
 
-    def test_checked_an_hour_ago_is_not(self):
+    def test_checked_a_minute_ago_is_not(self):
         self.assertFalse(update.due({"last_check_epoch": 1000},
-                                    clock=lambda: 1000 + 3600))
+                                    clock=lambda: 1000 + 60))
+
+    def test_checked_an_hour_ago_is_due_again(self):
+        # The interval is the collection interval. A release reaches a laptop
+        # on its next run rather than its next working day -- which is what
+        # 24 hours meant against a 09:00-19:00 day.
+        self.assertEqual(update.CHECK_INTERVAL, 3600)
+        self.assertTrue(update.due({"last_check_epoch": 1000},
+                                   clock=lambda: 1000 + 3600))
 
     def test_checked_two_days_ago_is(self):
         self.assertTrue(update.due({"last_check_epoch": 1000},

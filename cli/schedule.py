@@ -74,12 +74,27 @@ def launchd_path(home: Optional[str] = None) -> str:
 
 
 def launchd_plist(insight: str, log: str) -> str:
-    """``RunAtLoad`` is false on purpose.
+    """``RunAtLoad`` is true, and it was false until 2026-08-27.
 
-    True would fire a collection the instant the agent is installed, which is
-    the same second the engineer is reading what it will do. Waiting for the
-    first interval costs an hour and means nothing is ever uploaded inside the
-    conversation where consent was given.
+    The old reason: true fires a collection the instant the agent is installed,
+    which is the same second the engineer is reading what it will do. Two things
+    are wrong with it. `setup` records the consent *before* it reaches the
+    schedule step, so the run happens after the answer, not during the question.
+    And a run at that moment cannot do anything a run an hour later would not --
+    `collect` is debounced ten minutes, `ship` batches an hour, and every event
+    id is derived from the fact it describes, so the extra invocation is either
+    a no-op or the same upload made earlier.
+
+    What false actually cost was the first hour of every login. `StartInterval`
+    counts from load, and launchd loads a LaunchAgent at each login -- so a
+    laptop shut overnight and opened at 09:00 collected nothing on the clock
+    until 10:00. Against a 09:00-19:00 working day that is one hour in ten,
+    every day, and it is worst on the machines that are opened and closed most,
+    which are the ones already thinnest on data.
+
+    Linux has never had this gap: ``Persistent=true`` makes systemd run a timer
+    it missed as soon as the user manager starts. This is the same behaviour,
+    written the way launchd spells it.
     """
     return """<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
@@ -93,7 +108,7 @@ def launchd_plist(insight: str, log: str) -> str:
     <string>auto</string>
   </array>
   <key>StartInterval</key><integer>{interval}</integer>
-  <key>RunAtLoad</key><false/>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>{log}</string>
   <key>StandardErrorPath</key><string>{log}</string>
   <key>ProcessType</key><string>Background</string>

@@ -49,7 +49,7 @@ import subprocess
 import sys
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -1612,77 +1612,165 @@ def sources_of(config: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
+def iso_week_of(day: str) -> str:
+    year, week, _ = date.fromisoformat(day[:10]).isocalendar()
+    return "{}-W{:02d}".format(year, week)
+
+
+def week_bounds(week: str) -> Tuple[str, str]:
+    """``2026-W34`` -> the Monday and the Sunday, as dates."""
+    year, number = week.split("-W")
+    monday = date.fromisocalendar(int(year), int(number), 1)
+    return monday.isoformat(), (monday + timedelta(days=6)).isoformat()
+
+
+def weeks_between(since: Optional[str], until: Optional[str]) -> List[str]:
+    """Every ISO week touched by an inclusive date range."""
+    if not since or not until:
+        return []
+    start, stop = date.fromisoformat(since[:10]), date.fromisoformat(until[:10])
+    weeks: List[str] = []
+    cursor = start
+    while cursor <= stop:
+        week = iso_week_of(cursor.isoformat())
+        if week not in weeks:
+            weeks.append(week)
+        cursor += timedelta(days=7 - cursor.weekday())
+    return weeks
+
+
 def cmd_pack(args: argparse.Namespace) -> int:
+    """One bundle per ISO week. Never one bundle across several.
+
+    A bundle is filed by the endpoint under a folder derived from its
+    `window_start` alone (`server/proxy.py:object_key`), and the report
+    pipeline asks for a week at a time. So a bundle whose window straddles a
+    week boundary is filed under the earlier of the two, and the later week's
+    pull finds nothing -- not an error anywhere, just a week that reads as
+    quiet.
+
+    `insight backfill --since 2026-08-01` is where this bites: four weeks of
+    events in one bundle, all of them filed under 2026-W31, and W32 through W34
+    read as weeks nobody sent. The hourly `auto` is not affected -- it packs
+    `--since today --until today`, which is one day and therefore one week --
+    but every wide `pack` by hand is, and backfill is the command this project
+    is about to ask two people to run.
+
+    Splitting here rather than in the endpoint is deliberate: the client is the
+    only party that knows which days it meant to cover, and a server that
+    re-filed a straddling bundle would have to guess.
+    """
     config = require_config()
     events = read_buffer(args.since, args.until)
-    times = sorted(e["event_time"] for e in events if e.get("event_time"))
 
-    counts: Dict[str, int] = {}
+    by_week: Dict[str, List[Dict[str, Any]]] = {}
     for event in events:
-        counts[event["event_type"]] = counts.get(event["event_type"], 0) + 1
+        by_week.setdefault(iso_week_of(partition_of(event)), []).append(event)
 
-    body = "".join(json.dumps(e, sort_keys=True) + "\n" for e in events)
-    manifest = {
-        "format": BUNDLE_FORMAT,
-        "schema_version": common.SCHEMA_VERSION,
-        "machine_id": config["machine_id"],
-        "packed_at": now(),
-        # The window is declared even when it is empty. A bundle covering a week
-        # with no activity is a measured zero; a week with no bundle is missing
-        # data. Reports must be able to tell those apart.
-        # A requested window is declared even when it turned up nothing. That
-        # is what separates "this week was quiet" from "nobody sent this week",
-        # and only the person packing knows which window they meant.
-        "window_start": (args.window_start
-                         or (args.since + "T00:00:00Z" if args.since else None)
-                         or (times[0] if times else None)),
-        "window_end": (args.window_end
-                       or (args.until + "T23:59:59Z" if args.until else None)
-                       or (times[-1] if times else None)),
-        "days_covered": sorted({partition_of(e) for e in events}),
-        "event_count": len(events),
-        "event_counts_by_type": counts,
-        # What this machine was in a position to measure at all.
-        #
-        # Without it a zero is ambiguous in the one way that matters. A bundle
-        # from a machine with no repository registered is well formed: it
-        # declares its window and reports no events, which is exactly what a
-        # genuinely quiet day looks like. Read as a measurement it says the
-        # person did no work -- a wrong answer, not a missing one, and the only
-        # failure this whole design exists to prevent.
-        #
-        # Counts and booleans, never paths. `importers/bundle.py` uses this to
-        # separate a measured zero from a machine that measured nothing.
-        "sources": sources_of(config),
-        "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
-    }
+    # A requested window declares every week in it, including the empty ones.
+    # That is what separates "this week was quiet" from "nobody sent this
+    # week", and only the person packing knows which window they meant.
+    requested = weeks_between(args.since, args.until)
+    for week in requested:
+        by_week.setdefault(week, [])
 
-    os.makedirs(REPORTS_DIR, exist_ok=True)
-    name = "{}-{}.ndjson".format(config["machine_id"][:8], now().replace(":", "").replace("-", ""))
-    path = os.path.join(REPORTS_DIR, name)
-    # The stamp has second resolution, so two packs in the same second collide.
-    # Rare by hand and routine once a scheduler is driving this -- and the
-    # failure is silent: the second bundle overwrites the first, which may not
-    # have been uploaded yet.
-    if os.path.exists(path):
-        stem = name[:-len(".ndjson")]
-        serial = 2
-        while os.path.exists(path):
-            path = os.path.join(REPORTS_DIR, "{}-{}.ndjson".format(stem, serial))
-            serial += 1
-    with open(path, "w", encoding="utf-8") as handle:
-        handle.write(json.dumps({"_manifest": manifest}, sort_keys=True) + "\n")
-        handle.write(body)
+    # No events and no window: one bundle declaring nothing, as before. There
+    # is no week to file it under and inventing one would be a claim.
+    weeks = sorted(by_week) if by_week else [None]
+
+    written: List[Dict[str, Any]] = []
+    for week in weeks:
+        group = by_week.get(week, []) if week else []
+        times = sorted(e["event_time"] for e in group if e.get("event_time"))
+        counts: Dict[str, int] = {}
+        for event in group:
+            counts[event["event_type"]] = counts.get(event["event_type"], 0) + 1
+
+        if week:
+            monday, sunday = week_bounds(week)
+            # Clamped to what was asked for, so a bundle never declares
+            # coverage of days outside the request.
+            start = max(monday, args.since) if args.since else monday
+            stop = min(sunday, args.until) if args.until else sunday
+            window_start = start + "T00:00:00Z"
+            window_end = stop + "T23:59:59Z"
+        else:
+            window_start = args.window_start or (times[0] if times else None)
+            window_end = args.window_end or (times[-1] if times else None)
+
+        body = "".join(json.dumps(e, sort_keys=True) + "\n" for e in group)
+        manifest = {
+            "format": BUNDLE_FORMAT,
+            "schema_version": common.SCHEMA_VERSION,
+            "machine_id": config["machine_id"],
+            "packed_at": now(),
+            # The window is declared even when it is empty. A bundle covering a
+            # week with no activity is a measured zero; a week with no bundle
+            # is missing data. Reports must be able to tell those apart.
+            "window_start": window_start,
+            "window_end": window_end,
+            "days_covered": sorted({partition_of(e) for e in group}),
+            "event_count": len(group),
+            "event_counts_by_type": counts,
+            # What this machine was in a position to measure at all.
+            #
+            # Without it a zero is ambiguous in the one way that matters. A
+            # bundle from a machine with no repository registered is well
+            # formed: it declares its window and reports no events, which is
+            # exactly what a genuinely quiet day looks like. Read as a
+            # measurement it says the person did no work -- a wrong answer, not
+            # a missing one, and the only failure this whole design exists to
+            # prevent.
+            #
+            # Counts and booleans, never paths. `importers/bundle.py` uses this
+            # to separate a measured zero from a machine that measured nothing.
+            "sources": sources_of(config),
+            "sha256": hashlib.sha256(body.encode("utf-8")).hexdigest(),
+        }
+
+        os.makedirs(REPORTS_DIR, exist_ok=True)
+        stem = "{}-{}".format(config["machine_id"][:8],
+                              now().replace(":", "").replace("-", ""))
+        if week:
+            stem = "{}-{}".format(stem, week)
+        path = os.path.join(REPORTS_DIR, stem + ".ndjson")
+        # The stamp has second resolution, so two packs in the same second
+        # collide. Rare by hand and routine once a scheduler is driving this --
+        # and the failure is silent: the second bundle overwrites the first,
+        # which may not have been uploaded yet.
+        if os.path.exists(path):
+            serial = 2
+            while os.path.exists(path):
+                path = os.path.join(REPORTS_DIR,
+                                    "{}-{}.ndjson".format(stem, serial))
+                serial += 1
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(json.dumps({"_manifest": manifest}, sort_keys=True) + "\n")
+            handle.write(body)
+        written.append({"bundle": path, "week": week, **manifest})
 
     if args.clear:
         # Only the partitions that were packed. Clearing everything would throw
         # away days the bundle does not cover.
         for day in {partition_of(e) for e in events}:
-            path = buffer_path(day)
-            if os.path.exists(path):
-                os.remove(path)
+            buffered = buffer_path(day)
+            if os.path.exists(buffered):
+                os.remove(buffered)
 
-    print(json.dumps({"bundle": path, **manifest}, sort_keys=True))
+    # The last line stays one JSON object because three callers parse it that
+    # way. `bundle`/`window_start` describe the newest bundle so a single-week
+    # pack reads exactly as it did; `bundles` is the whole truth.
+    newest = written[-1]
+    print(json.dumps({
+        **newest,
+        "bundles": [{"bundle": b["bundle"], "week": b["week"],
+                     "event_count": b["event_count"],
+                     "window_start": b["window_start"],
+                     "window_end": b["window_end"]} for b in written],
+        "bundle_count": len(written),
+        "event_count": sum(b["event_count"] for b in written),
+        "days_covered": sorted({d for b in written for d in b["days_covered"]}),
+    }, sort_keys=True))
     return 0
 
 
@@ -2095,9 +2183,19 @@ def cmd_backfill(args: argparse.Namespace) -> int:
             step.get("detail") or ""))
     print()
     if bundle:
+        made = bundle.get("bundles") or []
         print("{:,} events, {} day(s), {} -> {}".format(
             bundle.get("event_count", 0), len(bundle.get("days_covered") or []),
             since, until))
+        if len(made) > 1:
+            # Said out loud because the alternative used to be silent. One
+            # bundle per ISO week is what keeps each week in its own folder at
+            # the endpoint; a single bundle spanning the range filed the whole
+            # backfill under its first week.
+            print("{} bundles, one per week: {}".format(
+                len(made), ", ".join(
+                    "{} ({:,})".format(b["week"], b["event_count"])
+                    for b in made if b.get("week"))))
     if args.no_ship or args.dry_run:
         print("Nothing was uploaded. `insight ship --all` sends it.")
     if problems:
@@ -2563,6 +2661,24 @@ SENDING NOW, AND BACKFILLING
 
     Running it twice is safe. Event ids are derived from the fact rather than
     minted per run, so a day collected twice is one day at the far end.
+
+    A backfill spanning weeks makes one bundle per ISO week and says so. The
+    endpoint files a bundle by the week its window starts in, so one bundle
+    across four weeks would put all four in the first week's folder and the
+    other three would read as weeks nobody sent.
+
+STAYING CURRENT
+
+    insight update --status       which version this is, and when it last looked
+    insight update --now          take a new release now
+    insight update --off          stop replacing itself
+
+    It updates itself on the hourly run by default: it checks the endpoint,
+    verifies the digest, swaps the archive atomically and rolls back if the new
+    one fails its own smoke test. Re-running the installer does the same thing
+    and is the answer when the tool itself will not start:
+
+        curl -fsSL {endpoint}/update | sh
 
 CONTROL
 

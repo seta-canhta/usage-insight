@@ -492,3 +492,92 @@ class TestRepoDiscovery(ReaderTestCase):
         self.workspace(name="wsd", folder=os.path.join(self.root, "gone"),
                        requests=[a_request(0)])
         self.assertEqual(vscode_read.discover_repos(self.root), [])
+
+
+class TestBranchAtTheTimeOfTheSession(unittest.TestCase):
+    """A branch read today is not evidence about a session three weeks old.
+
+    `insight backfill --since 2026-08-01` walks weeks of chat sessions and, for
+    each one, used to stamp whatever branch happened to be checked out on the
+    morning of the backfill -- at `link.confidence` 0.9, which is the
+    confidence of a measurement. The reflog is the record of the thing being
+    asked about, so the question now goes there.
+    """
+
+    REFLOG = "\n".join([
+        "ccc HEAD@{2026-08-20T15:00:00+07:00}: commit: work",
+        "ccc HEAD@{2026-08-20T14:00:00+07:00}: checkout: moving from feature/b to main",
+        "bbb HEAD@{2026-08-10T09:00:00+07:00}: checkout: moving from main to feature/b",
+        "aaa HEAD@{2026-08-01T08:00:00+07:00}: commit: first",
+    ]) + "\n"
+
+    def _history(self, reflog=None, current="main"):
+        text = self.REFLOG if reflog is None else reflog
+
+        def run(*args):
+            if args[0] == "reflog":
+                return text
+            if args[:2] == ("rev-parse", "--abbrev-ref"):
+                return current + "\n"
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            return vscode_read.checkout_history(tmp, run=run)
+
+    def test_a_session_is_attributed_to_the_branch_it_was_held_on(self):
+        history = self._history()
+        self.assertEqual(
+            vscode_read.branch_at(history, "2026-08-15T10:00:00Z"), "feature/b")
+        self.assertEqual(
+            vscode_read.branch_at(history, "2026-08-21T10:00:00Z"), "main")
+
+    def test_before_the_first_recorded_move_head_was_where_it_moved_from(self):
+        self.assertEqual(
+            vscode_read.branch_at(self._history(), "2026-08-05T10:00:00Z"),
+            "main")
+
+    def test_older_than_the_reflog_is_none_not_todays_branch(self):
+        # The whole fix. git expires reflogs, and an expired range is not an
+        # empty one -- this machine cannot speak about that session.
+        self.assertIsNone(
+            vscode_read.branch_at(self._history(), "2026-07-01T10:00:00Z"))
+
+    def test_a_clone_that_never_switched_branch_still_answers(self):
+        history = self._history(
+            reflog="aaa HEAD@{2026-08-01T08:00:00+07:00}: clone: from x\n",
+            current="release/2.0")
+        self.assertEqual(
+            vscode_read.branch_at(history, "2026-08-02T10:00:00Z"), "release/2.0")
+        self.assertIsNone(
+            vscode_read.branch_at(history, "2026-07-30T10:00:00Z"))
+
+    def test_a_detached_head_is_not_reported_as_a_branch(self):
+        history = self._history(
+            reflog="aaa HEAD@{2026-08-01T08:00:00+07:00}: "
+                   "checkout: moving from main to 4f2c9ab\n")
+        self.assertIsNone(
+            vscode_read.branch_at(history, "2026-08-02T10:00:00Z"))
+
+    def test_no_reflog_means_no_history_rather_than_an_empty_one(self):
+        self.assertIsNone(self._history(reflog=""))
+
+    def test_a_session_spanning_a_checkout_is_split_at_the_checkout(self):
+        # Two requests, either side of the 2026-08-20 move from feature/b to
+        # main. `context` is per event in the schema, so representing this
+        # honestly costs nothing.
+        history = self._history()
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "s.json")
+            with open(path, "w", encoding="utf-8") as handle:
+                json.dump({"requests": [
+                    {"requestId": "r1", "timestamp": 1786788000000,
+                     "message": {"text": "before"}},
+                    {"requestId": "r2", "timestamp": 1787306400000,
+                     "message": {"text": "after"}},
+                ]}, handle)
+            events = vscode_read.session_events(
+                path, "sess", "acme/watchtower", "main",
+                jira_projects=("IML",), history=history)
+        branches = [e["context"].get("branch_name") for e in events]
+        self.assertIn("feature/b", branches)
+        self.assertIn("main", branches)

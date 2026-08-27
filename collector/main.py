@@ -95,6 +95,39 @@ MAX_FUTURE_SKEW = timedelta(minutes=5)
 # CONTRACT.md §3 — CLOSED event_type enum. Unknown values are rejected.
 # --------------------------------------------------------------------------- #
 
+#: The block `pollers/poll_bitbucket.py` puts on every terminal PR event.
+#:
+#: Named once here because it is named once there. Measured 2026-08-27, the
+#: three-name entries below it had fallen 34 names behind what the poller
+#: writes -- and nothing failed, because poller output goes straight to the
+#: warehouse and never passes `importers/bundle.py`, where this list is
+#: enforced. So the list was not protecting these events; it was describing
+#: them, wrongly, while `sql/06_marts.sql` read the names it did not have.
+#:
+#: Every name here is a count, a timestamp, a duration, a classification or an
+#: id. No path, no title, no message body, and no valuation -- `cost_usd` is
+#: still absent from this file and still derived in the warehouse (§4).
+#: `automation_files_by_kind` is a map of classified kind to counts; the paths
+#: that produced it are classified and dropped in the poller.
+_PR_SHARED = frozenset({
+    "pr_id", "pr_state", "pr_title_has_ai_marker", "has_ai_marker",
+    "created_on", "first_review_at", "review_lead_time_ms",
+    "reviewer_count", "approval_count", "changes_requested_count",
+    # Rework, as the review timeline records it.
+    "commits_after_first_review", "reopened_at", "reopen_count",
+    "revision_count", "revisions_after_first_review",
+    # CONTRACT.md §5's numerator, and the figure §8.9 requires beside it
+    # rather than folded into it.
+    "lines_changed_pre_review", "lines_changed_after_first_review",
+    "self_comment_count", "bot_comment_count", "comment_count",
+    "inline_comment_count", "toplevel_comment_count",
+    "lines_added", "lines_removed",
+    "files_changed", "files_added", "files_modified", "files_removed",
+    "automation_scripts_added", "automation_scripts_modified",
+    "automation_scripts_removed", "automation_files_by_kind",
+    "commit_count", "ai_commit_count", "ai_run_ids", "ai_model_ids",
+})
+
 ATTRIBUTE_ALLOWLIST: Dict[str, frozenset] = {
     "run.started": frozenset({"invocation_mode", "model_declared_id", "input_source"}),
     # `base_commit_sha`/`head_commit_sha` are the 1.1.0 addition, and they are
@@ -166,15 +199,47 @@ ATTRIBUTE_ALLOWLIST: Dict[str, frozenset] = {
     "scm.pr.created": frozenset({"pr_id", "commit_shas", "pr_title_has_ai_marker"}),
     "scm.pr.reviewed": frozenset({
         "pr_id", "reviewer_person_id", "action", "comment_count", "reviewed_at",
+        # `is_first_review` and `review_lead_time_ms` are metric 3's inputs:
+        # first-pass acceptance is a question about the first review, and it
+        # cannot be asked of a row that does not say which one that was.
+        "is_first_review", "first_review_at", "pr_created_on",
+        "review_lead_time_ms", "pr_title_has_ai_marker", "has_ai_marker",
     }),
-    "scm.pr.merged": frozenset({"pr_id", "merged_at", "merge_commit_sha"}),
-    "scm.pr.declined": frozenset({"pr_id", "declined_at", "decline_reason_class"}),
+    "scm.pr.merged": _PR_SHARED | frozenset({
+        "merged_at", "merge_commit_sha", "merge_lead_time_ms",
+        "review_to_merge_ms",
+    }),
+    "scm.pr.declined": _PR_SHARED | frozenset({
+        "declined_at", "decline_reason_class", "decline_lead_time_ms",
+    }),
     "scm.revert": frozenset({
         "reverted_commit_sha", "revert_commit_sha", "days_to_revert",
+        # `resolution` says whether the reverted commit was found at all. A
+        # revert of something outside the window is not evidence about that
+        # something, and without this the two are one number.
+        "resolution", "reverted_commit_has_ai_marker",
+        "reverted_at", "reverted_commit_at",
     }),
     "ci.pipeline.completed": frozenset({
         "pipeline_id", "commit_sha", "status", "duration_ms", "tests_total",
         "tests_passed", "tests_failed", "coverage_pct",
+        # `tests_skipped` belongs beside the other three or the four do not sum
+        # to `tests_total`, and metric 8 is a rate over that total.
+        "tests_skipped",
+        # Provenance for the numbers above. `coverage_source` says where a
+        # coverage figure was read from and `ci_system_verified` whether the
+        # system was identified or assumed -- an unverified guess and a read
+        # value must not arrive looking alike (§1).
+        "ci_system", "ci_system_verified", "coverage_source",
+        "pipeline_build_number", "trigger_kind", "ref_name",
+        "started_at", "completed_at", "step_count", "failed_step_name",
+        # `poll_ci.py` has two sources and they do not share a vocabulary.
+        # These five are the Jenkins-via-commit-statuses path, which is the one
+        # production uses -- CONTRACT.md §3 row 20 records that the CI is
+        # self-hosted Jenkins, not Bitbucket Pipelines. The names above are the
+        # Pipelines path. Both are listed because both are emitted; the
+        # alternative is a list that is right about the source nobody has.
+        "ci_provider", "ci_kind", "job_name", "job_branch", "build_number",
     }),
     # 21 — `issue` is the snapshot sub-object CONTRACT.md §3 row 21 mandates: the
     # enum is closed, so there is no separate snapshot event and the snapshot has
@@ -186,6 +251,14 @@ ATTRIBUTE_ALLOWLIST: Dict[str, frozenset] = {
     "jira.transition": frozenset({
         "from_status", "to_status", "transitioned_at", "status_category",
         "issue", "attribution",
+        # `from_status_category` completes the pair -- a transition reported
+        # with only the destination's category cannot say whether it moved
+        # forward. `age_at_transition_ms` is metric 5's input at the grain it
+        # is measured. `is_synthesised_creation` marks the one row the poller
+        # manufactures, because an issue's creation predates its changelog;
+        # unlabelled it would count as a measured transition (§1).
+        "from_status_category", "age_at_transition_ms",
+        "is_synthesised_creation", "jira_issue_key",
     }),
     # 22 — AIO TCMS test execution. Added 2026-08-20 once an AioAuth key made the
     # source reachable; the enum previously stopped at 21 because it could not be.

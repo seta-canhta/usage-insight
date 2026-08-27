@@ -36,11 +36,23 @@ class UnitContentTests(unittest.TestCase):
         self.assertIn("<integer>3600</integer>", plist)
         self.assertIn("/opt/usage-insight/insight", plist)
 
-    def test_launchd_does_not_fire_the_moment_it_is_installed(self):
-        # RunAtLoad true would collect and upload in the same second the
-        # engineer is still reading what it is about to do.
-        self.assertIn("<key>RunAtLoad</key><false/>",
+    def test_launchd_runs_at_login_rather_than_an_hour_after_it(self):
+        # `StartInterval` counts from load, and launchd loads a LaunchAgent at
+        # each login. With RunAtLoad false a laptop opened at 09:00 collected
+        # nothing on the clock until 10:00 -- one hour in ten of a working day,
+        # every day. This is the launchd spelling of systemd's Persistent=true,
+        # which the Linux units have always had.
+        self.assertIn("<key>RunAtLoad</key><true/>",
                       schedule_mod.launchd_plist("/x/insight", "/tmp/x.log"))
+
+    def test_both_platforms_catch_up_after_a_machine_was_off(self):
+        # The property that matters is one claim in two dialects: a machine
+        # that missed its window runs when it comes back. Asserted together so
+        # that changing one platform's answer without the other fails here.
+        plist = schedule_mod.launchd_plist("/x/insight", "/tmp/x.log")
+        timer = schedule_mod.systemd_units("/x/insight")["insight-collect.timer"]
+        self.assertIn("<key>RunAtLoad</key><true/>", plist)
+        self.assertIn("Persistent=true", timer)
 
     def test_systemd_timer_catches_up_once_not_once_per_missed_hour(self):
         units = schedule_mod.systemd_units("/x/insight")

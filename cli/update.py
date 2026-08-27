@@ -74,11 +74,26 @@ import common  # noqa: E402  -- the shared trust store; see common.ssl_context
 #: request ever reaches the endpoint.
 USER_AGENT = "seta-insight/1 (+usage-insight)"
 
-#: Once a day. Hourly would be 24 pointless requests per laptop per day for a
-#: file that changes a few times a year, and it would put a network call in the
-#: path of a collection run that has to work on a plane. A release is not
-#: urgent; if one ever is, that is what telling people is for.
-CHECK_INTERVAL = 24 * 3600
+#: Once an hour, with the collection run that is already making network calls.
+#:
+#: This was once a day until 2026-08-27, on the argument that hourly is 24
+#: pointless requests a day for a file that changes a few times a year. Two
+#: things were wrong with it. The arithmetic assumed a 24-hour day: the team
+#: works 09:00-19:00 ICT and the laptops are shut for the other fourteen hours,
+#: so "once a day" is really once per working day -- and because the swapped
+#: archive only takes effect on the *next* invocation, a release reached the
+#: fleet in up to two working days.
+#:
+#: The second is what that delay cost. v0.5.0 was the release that tells a
+#: laptop which Jira project keys are real; until it lands, every reader runs
+#: permissive and invents them (AR-1). A fleet two working days behind is two
+#: working days of fabricated join keys, and no amount of "a release is not
+#: urgent" survives an example of one that was.
+#:
+#: The cost of the new value is one conditional GET of a few hundred bytes per
+#: laptop per hour, on a run that is already uploading. `check` is written
+#: never to raise, so the laptop on a plane is unaffected either way.
+CHECK_INTERVAL = 3600
 
 #: Where the manifest lives, relative to the configured endpoint. Derived by
 #: ``server/proxy.py`` from the very ``install.sh`` it serves at ``/install``,

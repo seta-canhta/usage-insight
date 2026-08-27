@@ -630,7 +630,23 @@ class Handler(BaseHTTPRequestHandler):
                                  "public, max-age=300")
                 return
 
-            if parsed.path in ("/install", "/install.sh"):
+            if parsed.path in ("/install", "/install.sh",
+                               "/update", "/update.sh"):
+                # `/update` is the same fixed bytes under a second name, and it
+                # is not redundant. Re-running the installer *is* the manual
+                # upgrade: `$PYZ` is versioned, so a machine on an older
+                # release downloads the new archive, verifies its digest, swaps
+                # `current.pyz` atomically, rolls back if the new one fails its
+                # own smoke test, and leaves the config, machine id, salt and
+                # upload secret alone. That was already true and nobody could
+                # tell, because the only name it had said "install" -- so the
+                # answer to "how do I upgrade?" was a paragraph instead of a
+                # line somebody can paste.
+                #
+                # No alias in the other direction: this route serves the
+                # installer, and `insight update` is the command for a machine
+                # that already has one.
+                #
                 # The first unauthenticated public route that returns anything
                 # an attacker might want, so it is worth writing down what they
                 # get and what stops them getting more.

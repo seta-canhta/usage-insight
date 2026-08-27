@@ -314,6 +314,12 @@ def repo_of(folder: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
     been deleted since the chat happened resolves to nothing. That is the same
     perishability `copilot_read.run_bound` was built around, and the same
     answer applies: what cannot be evidenced is left NULL.
+
+    The repository name survives that reading; the branch does not. A remote
+    url is a property of the clone and does not change under a checkout, but
+    "what branch is this on" answered now is not an answer about a session held
+    three weeks ago. `checkout_history` is where that question goes, and this
+    branch is the fallback for a caller that has no history to consult.
     """
     if not folder or not os.path.isdir(folder):
         return None, None
@@ -333,6 +339,126 @@ def repo_of(folder: Optional[str]) -> Tuple[Optional[str], Optional[str]]:
         parts = [p for p in url.replace(":", "/").split("/") if p]
         name = "/".join(parts[-2:]) if len(parts) >= 2 else None
     return name, git("rev-parse", "--abbrev-ref", "HEAD")
+
+
+#: A ref that is a raw object id rather than a branch. `git reflog` writes the
+#: sha when HEAD goes detached, and "the branch was 4f2c9ab" is not a fact about
+#: a branch.
+_DETACHED = re.compile(r"\A[0-9a-f]{7,40}\Z")
+
+#: `git reflog --date=iso-strict` line, as far as this needs to read it:
+#:     <sha> HEAD@{2026-08-26T10:00:00+07:00}: checkout: moving from main to x
+_REFLOG = re.compile(
+    r"HEAD@\{(?P<when>[^}]+)\}:\s*(?P<what>.*)\Z")
+_MOVED = re.compile(r"\Acheckout:\s*moving from (?P<src>\S+) to (?P<dst>\S+)")
+
+
+def checkout_history(folder: Optional[str],
+                     run=None) -> Optional[Dict[str, Any]]:
+    """When HEAD pointed at which branch, from the reflog. None if unanswerable.
+
+    This exists because the branch was being read at the wrong time. `repo_of`
+    asks the clone what branch it is on **now**, and `insight backfill --since
+    2026-08-01` then stamps that answer on every session in the window --
+    three weeks of chats attributed to whatever happens to be checked out on
+    the morning somebody runs the backfill. The value can be right by luck. The
+    method never is, and `link.confidence` said 0.9 either way.
+
+    The reflog is the record of the thing actually being asked about: it says
+    when HEAD moved and where to. So the question "which branch was this
+    session held on" gets answered from evidence, and a session older than the
+    reflog gets no answer at all rather than today's.
+
+    Returns ``{"floor": datetime, "timeline": [(when, branch), ...]}`` with the
+    timeline ascending. ``floor`` is the oldest entry the reflog still holds;
+    below it nothing is known, because git expires reflogs (90 days by
+    default) and an expired range is not an empty one.
+    """
+    if not folder or not os.path.isdir(folder):
+        return None
+
+    def git(*args: str) -> Optional[str]:
+        if run is not None:
+            return run(*args)
+        try:
+            out = subprocess.run(("git", "-C", folder) + args,
+                                 capture_output=True, text=True, timeout=10)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return out.stdout if out.returncode == 0 else None
+
+    raw = git("reflog", "show", "--date=iso-strict", "HEAD")
+    if not raw:
+        return None
+
+    entries: List[Tuple[datetime, Optional[str], Optional[str]]] = []
+    for line in raw.splitlines():
+        found = _REFLOG.search(line)
+        if not found:
+            continue
+        when = _parse_iso(found.group("when"))
+        if when is None:
+            continue
+        moved = _MOVED.match(found.group("what").strip())
+        if moved:
+            entries.append((when, moved.group("src"), moved.group("dst")))
+        else:
+            entries.append((when, None, None))
+    if not entries:
+        return None
+
+    entries.reverse()                                   # reflog is newest-first
+    floor = entries[0][0]
+
+    timeline: List[Tuple[datetime, Optional[str]]] = []
+    for when, src, dst in entries:
+        if dst is None:
+            continue
+        if not timeline and src:
+            # Before the first recorded move, HEAD was where that move came
+            # from -- but only back as far as the reflog goes.
+            timeline.append((floor, None if _DETACHED.match(src) else src))
+        timeline.append((when, None if _DETACHED.match(dst) else dst))
+
+    if not timeline:
+        # A clone that has never changed branch. Every entry in the reflog --
+        # commits, pulls, resets -- happened on the branch it is on now.
+        current = (git("rev-parse", "--abbrev-ref", "HEAD") or "").strip()
+        if not current or current == "HEAD":
+            return None
+        timeline.append((floor, current))
+
+    return {"floor": floor, "timeline": timeline}
+
+
+def _parse_iso(text: str) -> Optional[datetime]:
+    try:
+        parsed = datetime.fromisoformat(text.strip())
+    except (TypeError, ValueError):
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def branch_at(history: Optional[Dict[str, Any]],
+              when: Optional[str]) -> Optional[str]:
+    """The branch HEAD pointed at, at ``when``. None where nothing is known.
+
+    None rather than the current branch, and that is the whole point: a session
+    older than the reflog is a session this machine cannot speak about. It
+    leaves `jira_issue_key` null, `scan_for_key` gets its turn at the prompt,
+    and if that finds nothing the row says so instead of guessing (§1, AR-1).
+    """
+    if not history or not when:
+        return None
+    moment = _parse_iso(when.replace("Z", "+00:00"))
+    if moment is None or moment < history["floor"]:
+        return None
+    found = None
+    for started, branch in history["timeline"]:
+        if started > moment:
+            break
+        found = branch
+    return found
 
 
 def discover_repos(root: Optional[str] = None) -> List[str]:
@@ -463,9 +589,16 @@ def load_requests(path: str) -> List[Dict[str, Any]]:
 def session_events(path: str, session_id: str,
                    repo: Optional[str], branch: Optional[str],
                    actor: Optional[Dict[str, Any]] = None,
-                   jira_projects: Optional[Tuple[str, ...]] = None
+                   jira_projects: Optional[Tuple[str, ...]] = None,
+                   history: Optional[Dict[str, Any]] = None
                    ) -> List[Dict[str, Any]]:
-    """Build contract events for one chat session file."""
+    """Build contract events for one chat session file.
+
+    ``branch`` is what the clone says today. ``history`` is what its reflog says
+    it said at the time, and where both are available the second wins -- see
+    `checkout_history`. Passing no history keeps the old behaviour, which is
+    right for a caller that has already established the branch some other way.
+    """
     requests = load_requests(path)
     if not requests:
         return []
@@ -474,12 +607,20 @@ def session_events(path: str, session_id: str,
     # would otherwise turn branch `fix/AUG-25` into ticket "AUG-25" -- a date.
     # Measured on a live machine 2026-08-26, 28 of 28 events. AR-1.
     projects = common.validated_projects(jira_projects, source="jira_projects")
-    branch_key = common.extract_jira_key(branch, projects=projects)
-    context = common.make_context(
-        jira_issue_key=branch_key,
-        repo_full_name=repo,
-        branch_name=branch,
-    )
+
+    #: One entry per distinct branch this session touched. A session is
+    #: normally held on one, so this is normally one build; a session that
+    #: spanned a checkout gets the right answer on both sides of it.
+    built: Dict[Optional[str], Tuple[Dict[str, Any], Optional[str]]] = {}
+
+    def for_branch(name: Optional[str]) -> Tuple[Dict[str, Any], Optional[str]]:
+        if name not in built:
+            key = common.extract_jira_key(name, projects=projects)
+            built[name] = (common.make_context(
+                jira_issue_key=key, repo_full_name=repo, branch_name=name), key)
+        return built[name]
+
+    context, branch_key = for_branch(branch)
     agent = common.make_agent("copilot.chat", surface=SURFACE)
     # The journal reader nulls this for the same reason: the agent's version is
     # not something the surface records, and the poller's own version number
@@ -524,19 +665,27 @@ def session_events(path: str, session_id: str,
         request_id = attrs.get("requestId") or "req-{}".format(index)
         when = stamp(attrs.get("timestamp"))
 
+        # Which branch this request was made on, asked of the reflog rather
+        # than of the working tree. `branch_at` returns None for a session
+        # older than the reflog, and None is the answer -- see its docstring.
+        if history is not None:
+            here, here_key = for_branch(branch_at(history, when))
+        else:
+            here, here_key = context, branch_key
+
         # The branch wins where it has an answer, and the prompt is consulted
         # only where it does not. So this can turn a null into a key and can
         # never overwrite one -- no figure that exists today moves because of
         # it, which is the only safe way to introduce a weaker signal.
-        if branch_key:
-            current["context"], current["confidence"] = context, 0.9
+        if here_key:
+            current["context"], current["confidence"] = here, 0.9
         else:
             prompt_key = scan_for_key(request, projects)
             current["context"] = common.make_context(
                 jira_issue_key=prompt_key,
                 repo_full_name=repo,
-                branch_name=branch,
-            ) if prompt_key else context
+                branch_name=here.get("branch_name"),
+            ) if prompt_key else here
             current["confidence"] = 0.5 if prompt_key else 0.9
 
         # -- the human turn -------------------------------------------------
@@ -628,15 +777,19 @@ def to_events(root: Optional[str] = None,
 
     events: List[Dict[str, Any]] = []
     sessions = with_requests = 0
-    resolved: Dict[str, Tuple[Optional[str], Optional[str]]] = {}
+    resolved: Dict[str, Tuple[Optional[str], Optional[str],
+                              Optional[Dict[str, Any]]]] = {}
 
     for storage, session_id, path in iter_sessions(root):
         sessions += 1
         if storage not in resolved:
-            resolved[storage] = repo_of(workspace_folder(storage))
-        repo, branch = resolved[storage]
+            folder = workspace_folder(storage)
+            repo_name, current_branch = repo_of(folder)
+            resolved[storage] = (repo_name, current_branch,
+                                 checkout_history(folder))
+        repo, branch, history = resolved[storage]
         found = session_events(path, session_id, repo, branch, actor,
-                               jira_projects)
+                               jira_projects, history)
         if found:
             with_requests += 1
             events += found

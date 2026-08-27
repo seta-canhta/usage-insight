@@ -521,6 +521,16 @@ class InstallRouteTests(ProxyTestCase):
     def test_install_sh_is_the_same_bytes(self):
         self.assertEqual(self.fetch("/install.sh")[1], self.fetch("/install")[1])
 
+    def test_update_is_the_installer_under_the_name_people_look_for(self):
+        # Re-running the installer *is* the manual upgrade -- the archive is
+        # versioned, the swap is atomic and the config is untouched. That was
+        # already true and unfindable, because the route was called "install".
+        for path in ("/update", "/update.sh"):
+            status, body, headers = self.fetch(path)
+            self.assertEqual(status, 200, path)
+            self.assertEqual(body, self.script, path)
+            self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")
+
     def test_it_is_served_as_text_a_shell_can_read(self):
         _, _, headers = self.fetch("/install")
         self.assertEqual(headers["Content-Type"], "text/plain; charset=utf-8")

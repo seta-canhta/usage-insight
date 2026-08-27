@@ -1314,14 +1314,52 @@ class TestPackWindow(ClientTestCase):
         self.assertEqual(manifest["event_count"], 2)
         self.assertEqual(manifest["days_covered"], ["2026-08-17", "2026-08-19"])
 
+    def manifests(self):
+        found = []
+        for name in sorted(os.listdir(self.insight.REPORTS_DIR)):
+            with open(os.path.join(self.insight.REPORTS_DIR, name),
+                      "r", encoding="utf-8") as handle:
+                found.append(json.loads(handle.readline())["_manifest"])
+        return found
+
     def test_the_requested_window_is_declared_even_when_empty(self):
         # "That week was quiet" and "nobody sent that week" are opposite
         # findings, and only the person packing knows which window they meant.
+        # 2026-07-01..07 is two ISO weeks, so it is two bundles -- and between
+        # them they still declare every day that was asked for.
         self.run_cli("pack", "--since", "2026-07-01", "--until", "2026-07-07")
-        manifest = self.manifest()
-        self.assertEqual(manifest["event_count"], 0)
-        self.assertEqual(manifest["window_start"], "2026-07-01T00:00:00Z")
-        self.assertEqual(manifest["window_end"], "2026-07-07T23:59:59Z")
+        found = self.manifests()
+        self.assertEqual([m["event_count"] for m in found], [0, 0])
+        self.assertEqual(found[0]["window_start"], "2026-07-01T00:00:00Z")
+        self.assertEqual(found[0]["window_end"], "2026-07-05T23:59:59Z")
+        self.assertEqual(found[1]["window_start"], "2026-07-06T00:00:00Z")
+        self.assertEqual(found[1]["window_end"], "2026-07-07T23:59:59Z")
+
+    def test_a_bundle_never_straddles_the_week_it_is_filed_under(self):
+        # The endpoint files a bundle by `iso_week(window_start)` alone and the
+        # report pipeline pulls a week at a time, so a straddling bundle puts
+        # the later week's events in the earlier week's folder and the later
+        # week reads as quiet. Nothing errors; a week just goes missing.
+        self.run_cli("pack", "--since", "2026-08-17", "--until", "2026-08-30")
+        for manifest in self.manifests():
+            start = manifest["window_start"][:10]
+            end = manifest["window_end"][:10]
+            self.assertEqual(self.insight.iso_week_of(start),
+                             self.insight.iso_week_of(end), manifest)
+
+    def test_a_backfill_across_weeks_becomes_one_bundle_per_week(self):
+        self.run_cli("pack", "--since", "2026-08-17", "--until", "2026-08-30")
+        found = self.manifests()
+        self.assertEqual(len(found), 2)
+        self.assertEqual([m["event_count"] for m in found], [2, 1])
+        self.assertEqual(found[0]["days_covered"],
+                         ["2026-08-17", "2026-08-19"])
+        self.assertEqual(found[1]["days_covered"], ["2026-08-25"])
+
+    def test_every_event_survives_the_split(self):
+        # The split must move events between files, never lose them.
+        self.run_cli("pack", "--since", "2026-08-17", "--until", "2026-08-30")
+        self.assertEqual(sum(m["event_count"] for m in self.manifests()), 3)
 
     def test_clear_removes_only_the_packed_partitions(self):
         # Clearing everything would throw away days the bundle does not cover.

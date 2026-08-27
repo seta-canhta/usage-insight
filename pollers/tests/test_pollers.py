@@ -23,7 +23,10 @@ POLLERS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, POLLERS_DIR)                      # poll_*
 sys.path.insert(0, os.path.dirname(POLLERS_DIR))     # common
 
+sys.path.insert(0, os.path.join(os.path.dirname(POLLERS_DIR), "collector"))
+
 import common  # noqa: E402
+import main as collector_main  # noqa: E402  -- the attribute allow-list
 import poll_bitbucket  # noqa: E402
 import poll_ci  # noqa: E402
 import poll_aio  # noqa: E402
@@ -242,6 +245,16 @@ def bitbucket_routes():
         ),
         (lambda u: "/pullrequests/101/diffstat" in u, jsonr(PR_101_DIFFSTAT_PAGE1)),
         (lambda u: "/pullrequests/101/commits" in u, jsonr({"values": [COMMIT_AI, COMMIT_HUMAN]})),
+        # Per-commit diffstat, which is a different route from the PR's own:
+        # `/diffstat/{sha}` rather than `/pullrequests/{id}/diffstat`. Ordered
+        # after the PR routes so the more specific matchers win.
+        (
+            lambda u: "/diffstat/" in u and "/pullrequests/" not in u,
+            jsonr({"values": [
+                {"lines_added": 7, "lines_removed": 3, "status": "modified",
+                 "new": {"path": "tests/test_login.py"}},
+            ]}),
+        ),
         (
             lambda u: "/pullrequests/102/activity" in u,
             jsonr(
@@ -2308,3 +2321,159 @@ class TestReopenAndRework(unittest.TestCase):
         self.assertEqual(t["reopen_count"], 0)
         self.assertEqual(t["revision_count"], 0)
         self.assertIsNone(t["reopened_at"])
+
+
+class TestReviewBoundaryChurn(unittest.TestCase):
+    """`post_review_change_ratio`'s numerator, which nothing used to emit.
+
+    CONTRACT.md §5 defines the ratio and `sql/08_metrics.sql` sums
+    `lines_changed_after_first_review` to report metric 4. Neither had an
+    emitter, so `v_rework_rate` summed an empty column and reported a rework
+    rate over no rework -- indistinguishable, downstream, from a team that
+    never reworks anything.
+    """
+
+    def _poller(self, per_commit=(7, 3)):
+        added, removed = per_commit
+        routes = [
+            (lambda u: "/diffstat/" in u and "/pullrequests/" not in u,
+             jsonr({"values": [{"lines_added": added, "lines_removed": removed,
+                                "status": "modified",
+                                "new": {"path": "tests/test_a.py"}}]})),
+        ]
+        poller, _ = make_bitbucket_poller(FakeTransport(routes))
+        return poller
+
+    @staticmethod
+    def _commit(sha, when):
+        return {"hash": sha, "date": when, "message": "x\n"}
+
+    def test_lines_are_split_at_the_first_review(self):
+        poller = self._poller()
+        commits = [
+            self._commit("a" * 40, "2026-08-01T08:00:00+00:00"),
+            self._commit("b" * 40, "2026-08-01T09:00:00+00:00"),
+            self._commit("c" * 40, "2026-08-01T15:00:00+00:00"),
+        ]
+        churn = poller.review_boundary_churn(commits, "2026-08-01T12:00:00+00:00")
+        self.assertEqual(churn["commits_after_first_review"], 1)
+        self.assertEqual(churn["lines_changed_pre_review"], 20)
+        self.assertEqual(churn["lines_changed_after_first_review"], 10)
+
+    def test_an_unreviewed_pr_is_null_on_both_sides_not_zero(self):
+        # Absent is never zero. Without a first review the boundary that
+        # defines "before" and "after" does not exist, and a 0 here would read
+        # as "nothing was reworked" -- the wrong answer, not the missing one.
+        churn = self._poller().review_boundary_churn(
+            [self._commit("a" * 40, "2026-08-01T08:00:00+00:00")], None)
+        self.assertIsNone(churn["lines_changed_pre_review"])
+        self.assertIsNone(churn["lines_changed_after_first_review"])
+
+    def test_a_reviewed_pr_with_nothing_after_it_is_a_measured_zero(self):
+        churn = self._poller().review_boundary_churn(
+            [self._commit("a" * 40, "2026-08-01T08:00:00+00:00")],
+            "2026-08-01T12:00:00+00:00")
+        self.assertEqual(churn["lines_changed_after_first_review"], 0)
+        self.assertEqual(churn["lines_changed_pre_review"], 10)
+
+    def test_a_failed_request_nulls_the_figure_rather_than_shrinking_it(self):
+        # An undercount of rework is wrong in the flattering direction and
+        # nothing downstream could tell it from a real improvement.
+        poller, _ = make_bitbucket_poller(FakeTransport([]))
+        churn = poller.review_boundary_churn(
+            [self._commit("a" * 40, "2026-08-01T15:00:00+00:00")],
+            "2026-08-01T12:00:00+00:00")
+        self.assertIsNone(churn["lines_changed_after_first_review"])
+        self.assertEqual(churn["commits_after_first_review"], 1)
+
+    def test_a_commit_with_no_date_is_not_silently_counted_as_pre_review(self):
+        churn = self._poller().review_boundary_churn(
+            [{"hash": "a" * 40, "message": "no date\n"}],
+            "2026-08-01T12:00:00+00:00")
+        self.assertEqual(churn["commits_after_first_review"], 0)
+        self.assertEqual(churn["lines_changed_pre_review"], 0)
+
+
+class TestPollerOutputStaysInsideTheAllowList(unittest.TestCase):
+    """Every attribute every poller emits is one the collector will keep.
+
+    This is a drift test, and it exists because the drift had already happened.
+    Measured 2026-08-27: `scm.pr.merged` emitted 38 attributes against 3 in
+    `ATTRIBUTE_ALLOWLIST`, `scm.pr.declined` 37 against 3,
+    `ci.pipeline.completed` 19 against 8. Metrics 3 and 4 read several of the
+    missing ones.
+
+    Nothing had failed, because poller output does not pass through
+    `importers/bundle.py`, where the list is enforced -- it is written straight
+    to the warehouse. So the list was not protecting these events, it was
+    describing them, and describing them wrongly. The two ways to fix that are
+    to widen the list or to stop writing the attributes; this asserts the first
+    stayed done.
+    """
+
+    def _drift(self, events):
+        emitted = {}
+        for event in events:
+            emitted.setdefault(event["event_type"], set()).update(
+                event.get("attributes") or {})
+        problems = []
+        for event_type in sorted(emitted):
+            allowed = collector_main.ATTRIBUTE_ALLOWLIST.get(event_type)
+            if allowed is None:
+                problems.append("{}: not an allowed event_type".format(event_type))
+                continue
+            for name in sorted(emitted[event_type] - allowed):
+                problems.append("{}.{}".format(event_type, name))
+        return problems
+
+    def _read(self, out):
+        with open(out, "r", encoding="utf-8") as handle:
+            return [json.loads(line) for line in handle if line.strip()]
+
+    def test_bitbucket(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.ndjson")
+            poll_bitbucket.main(
+                ["--workspace", "acme", "--repo", "watchtower", "--out", out,
+                 "--state-file", os.path.join(tmp, "s.json"),
+                 "--since", "2026-07-01T00:00:00Z"],
+                client=client_for(FakeTransport(bitbucket_routes())))
+            self.assertEqual(self._drift(self._read(out)), [])
+
+    def test_jira(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.ndjson")
+            poll_jira.main(
+                ["--project", "PRJ", "--out", out,
+                 "--state-file", os.path.join(tmp, "s.json"),
+                 "--since", "2026-07-01T00:00:00Z", "--delivery-project", "QD"],
+                client=client_for(FakeTransport(jira_routes(None, "legacy"))),
+                base_url=JIRA_BASE)
+            self.assertEqual(self._drift(self._read(out)), [])
+
+    def test_ci(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "out.ndjson")
+            poll_ci.main(
+                ["--workspace", "acme", "--repo", "watchtower", "--out", out,
+                 "--state-file", os.path.join(tmp, "s.json"),
+                 "--since", "2026-07-01T00:00:00Z"],
+                client=client_for(FakeTransport(ci_routes())))
+            self.assertEqual(self._drift(self._read(out)), [])
+
+    def test_the_jenkins_status_path_as_well_as_the_pipelines_one(self):
+        # `poll_ci.py` has two sources with different vocabularies, and the
+        # route fixture only exercises one. This is the other -- and it is the
+        # one production uses (CONTRACT.md §3 row 20: the CI is self-hosted
+        # Jenkins, not Bitbucket Pipelines).
+        attributes = poll_ci.build_status_event_attributes({
+            "key": "jenkins-1",
+            "state": "SUCCESSFUL",
+            "name": "watchtower-api #418",
+            "url": "https://jenkins.example.com/job/watchtower-api/418/",
+            "commit": {"hash": "a" * 40},
+            "created_on": "2026-08-20T09:00:00+00:00",
+            "updated_on": "2026-08-20T09:04:00+00:00",
+        })
+        allowed = collector_main.ATTRIBUTE_ALLOWLIST["ci.pipeline.completed"]
+        self.assertEqual(sorted(set(attributes) - allowed), [])

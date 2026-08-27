@@ -644,6 +644,76 @@ class BitbucketPoller:
             )
         )
 
+    def commit_diffstat(self, sha: str) -> List[Dict[str, Any]]:
+        """Churn of one commit against its first parent.
+
+        The PR-level diffstat cannot answer the question CONTRACT.md §5 asks.
+        It is the whole branch against its destination, one number for work
+        done before anybody looked at it and work done because somebody did.
+        `post_review_change_ratio` is the second divided by the first, and
+        separating them needs the commits priced one at a time.
+
+        One request per commit, and only for PRs that were reviewed. That is
+        the cost of the metric; the alternative on offer is the metric.
+        """
+        return list(
+            paginate(self.client, f"{self.base}/diffstat/{sha}", {"pagelen": 100})
+        )
+
+    def review_boundary_churn(
+        self, commits: Sequence[Dict[str, Any]], first_review_at: Optional[str]
+    ) -> Dict[str, Optional[int]]:
+        """Lines changed either side of the first review, or NULLs.
+
+        Both sides are NULL when the PR was never reviewed. Not zero: without a
+        first review the boundary that defines "before" and "after" does not
+        exist, and a zero here would read as "nothing was reworked" -- the
+        wrong answer rather than the missing one (CONTRACT.md §1).
+
+        A failed request nulls **both** figures rather than returning a smaller
+        one. An undercount of rework is a number that is wrong in the flattering
+        direction, and nothing downstream could tell it from a real improvement.
+        """
+        blank: Dict[str, Optional[int]] = {
+            "commits_after_first_review": 0,
+            "lines_changed_pre_review": None,
+            "lines_changed_after_first_review": None,
+        }
+        if not first_review_at:
+            return blank
+        boundary = parse_ts(first_review_at)
+        if boundary is None:
+            return blank
+
+        after: List[Dict[str, Any]] = []
+        before: List[Dict[str, Any]] = []
+        for commit in commits or []:
+            when = parse_ts(commit.get("date"))
+            if when is None:
+                continue
+            (after if when > boundary else before).append(commit)
+
+        def churn(group: Sequence[Dict[str, Any]]) -> Optional[int]:
+            total = 0
+            for commit in group:
+                sha = commit.get("hash")
+                if not sha:
+                    continue
+                try:
+                    stat = summarise_diffstat(self.commit_diffstat(sha))
+                except Exception:                              # noqa: BLE001
+                    self.stats["commit_diffstat_failed"] = (
+                        self.stats.get("commit_diffstat_failed", 0) + 1)
+                    return None
+                total += stat["lines_added"] + stat["lines_removed"]
+            return total
+
+        return {
+            "commits_after_first_review": len(after),
+            "lines_changed_pre_review": churn(before),
+            "lines_changed_after_first_review": churn(after),
+        }
+
     def pr_commits(self, pr_id: Any) -> List[Dict[str, Any]]:
         return list(
             paginate(
@@ -734,15 +804,9 @@ class BitbucketPoller:
         trace_id = trailer_trace or self._synthetic_trace("pr", pr_id)
         created_on = to_rfc3339(pull_request.get("created_on"))
 
-        commits_after_first_review = 0
         first_review_at = timeline["first_review_at"]
-        if first_review_at:
-            boundary = parse_ts(first_review_at)
-            commits_after_first_review = sum(
-                1
-                for commit in commits
-                if parse_ts(commit.get("date")) and parse_ts(commit.get("date")) > boundary
-            )
+        churn = self.review_boundary_churn(commits, first_review_at)
+        commits_after_first_review = churn["commits_after_first_review"]
 
         shared = {
             "pr_id": pr_id,
@@ -760,6 +824,14 @@ class BitbucketPoller:
                 1 for r in timeline["reviewers"] if r["action"] == "changes_requested"
             ),
             "commits_after_first_review": commits_after_first_review,
+            # The numerator of `post_review_change_ratio` (CONTRACT.md §5) and
+            # the figure §8.9 insists is reported beside it rather than folded
+            # into it. Defined in the contract and in `sql/08_metrics.sql`
+            # since both were written; emitted by nothing until 2026-08-27, so
+            # `v_rework_rate` has been summing NULL over an empty column.
+            "lines_changed_pre_review": churn["lines_changed_pre_review"],
+            "lines_changed_after_first_review":
+                churn["lines_changed_after_first_review"],
             # Rework, as the review timeline records it. A reopen is the
             # strongest signal here and was not being read at all; a push after
             # the first review is the weaker, commoner one. Both are counts of

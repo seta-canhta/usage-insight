@@ -92,6 +92,29 @@ Deployment files: `server/compose.yaml`, `server/insight-proxy.service`,
 Live at `https://aeris-insight.seta-international.com`, behind the office
 gateway.
 
+### Pushing a release to the fleet
+
+Redeploy the endpoint with the new `install.sh` in `etc/` and the fleet follows
+on its own: `insight auto` runs hourly, checks `/install.json`, verifies the
+digest and swaps the archive. Two caveats worth holding.
+
+**Count in working hours.** The team works 09:00–19:00 ICT, so a laptop is
+awake about ten hours a day. The swapped archive also only takes effect on the
+*next* invocation. A release therefore reaches a used machine within about two
+hours of use, and a machine nobody opens not at all.
+
+**There is no way to push.** A laptop takes no inbound commands and that is
+deliberate. To move faster than the hourly run, ask the person to paste:
+
+```bash
+curl -fsSL https://aeris-insight.seta-international.com/update | sh
+```
+
+That is the installer under the name that says what it does — same bytes, same
+route, and re-running it *is* the upgrade: the archive is versioned, the swap
+is atomic, it rolls back if the new one fails its own smoke test, and the
+config, machine id, salt and upload secret are untouched.
+
 ## 2. Pollers
 
 Credentials come from the environment; a `.env` in any parent directory is a

@@ -127,14 +127,54 @@ everything else is `heuristic` or `marker_only`.
 | 13 | `run.abandoned` | **DQ job** | `last_seen_at` |
 | 14 | `scm.commit` | git hook | `commit_sha`, `output_ids`, `lines_added`, `lines_removed`, `has_ai_marker` |
 | 15 | `scm.pr.created` | emitter | `pr_id`, `commit_shas`, `pr_title_has_ai_marker` |
-| 16 | `scm.pr.reviewed` | **poller** | `pr_id`, `reviewer_person_id`, `action` (`approved`\|`changes_requested`\|`commented`), `comment_count`, `reviewed_at` |
-| 17 | `scm.pr.merged` | **poller** | `pr_id`, `merged_at`, `merge_commit_sha` |
-| 18 | `scm.pr.declined` | **poller** | `pr_id`, `declined_at`, `decline_reason_class` |
-| 19 | `scm.revert` | **poller** | `reverted_commit_sha`, `revert_commit_sha`, `days_to_revert` |
-| 20 | `ci.pipeline.completed` | **poller** | `pipeline_id`, `commit_sha`, `status`, `duration_ms`, `tests_total`, `tests_passed`, `tests_failed`, `coverage_pct`, `ci_provider`, `ci_kind` (`build`\|`deploy`), `job_name`, `job_branch`, `build_number`. **Measured 2026-08-19:** CI is self-hosted **Jenkins**, not Bitbucket Pipelines. The source is `/commit/{sha}/statuses`, which needs no Jenkins credential. `tests_*` and `coverage_pct` are NOT available on that path and stay NULL — never 0 |
+| 16 | `scm.pr.reviewed` | **poller** | `pr_id`, `reviewer_person_id`, `action` (`approved`\|`changes_requested`\|`commented`), `comment_count`, `reviewed_at`, `is_first_review`, `first_review_at`, `pr_created_on`, `review_lead_time_ms`, `pr_title_has_ai_marker`, `has_ai_marker`. **Corrected 2026-08-27:** this row named five attributes and the poller emitted eleven. Metric 3 is a question about the *first* review and cannot be asked of a row that does not say which one that was |
+| 17 | `scm.pr.merged` | **poller** | `merged_at`, `merge_commit_sha`, `merge_lead_time_ms`, `review_to_merge_ms`, plus the **terminal-PR block** below |
+| 18 | `scm.pr.declined` | **poller** | `declined_at`, `decline_reason_class`, `decline_lead_time_ms`, plus the **terminal-PR block** below |
+| 19 | `scm.revert` | **poller** | `reverted_commit_sha`, `revert_commit_sha`, `days_to_revert`, `resolution`, `reverted_commit_has_ai_marker`, `reverted_at`, `reverted_commit_at`. `resolution` says whether the reverted commit was found at all — a revert of something outside the window is not evidence about that something, and without this the two are one number |
+| 20 | `ci.pipeline.completed` | **poller** | `pipeline_id`, `commit_sha`, `status`, `duration_ms`, `tests_total`, `tests_passed`, `tests_failed`, `coverage_pct`, `ci_provider`, `ci_kind` (`build`\|`deploy`), `job_name`, `job_branch`, `build_number`. The **Bitbucket Pipelines** path of the same poller emits a different vocabulary for the same event — `ci_system`, `ci_system_verified`, `coverage_source`, `pipeline_build_number`, `trigger_kind`, `ref_name`, `started_at`, `completed_at`, `step_count`, `failed_step_name`, `tests_skipped` — and both are permitted, because both are emitted. `tests_skipped` belongs beside the other three counts or the four do not sum to `tests_total`, and metric 8 is a rate over that total. **Measured 2026-08-19:** CI is self-hosted **Jenkins**, not Bitbucket Pipelines. The source is `/commit/{sha}/statuses`, which needs no Jenkins credential. `tests_*` and `coverage_pct` are NOT available on that path and stay NULL — never 0 |
 | 21 | `jira.transition` | **poller** | `from_status`, `to_status`, `transitioned_at`, `status_category`, `issue` (snapshot sub-object: status, assignee accountId, issue type, labels, parent, estimates), `attribution` (AR-3 evidence sub-object: `rule`, `ai_labels`, `has_ai_labels`, `label_authored_by_ai`, `label_planned_by_ai`, `label_generated_by_ai`, `label_reviewed_by_ai`, `unrecognised_ai_labels`, `has_ai_label_drift`, `is_delivery_ticket_candidate`, `delivery_ticket_key`, `feature_ticket_key`, `feature_ticket_source`, `resolution_confidence`, `linked_issues`, `parent_key`). Issue creation is synthesised as a transition so every issue yields ≥1 event — the enum is closed, so there is no separate snapshot event. **`unrecognised_ai_labels` is a DQ signal, never a count:** it carries label *names* outside the §3.1 closed set, and those tickets are deliberately excluded from every AI figure |
 | 22 | `test.run.completed` | **poller** | `test_case_key`, `test_cycle_key`, `test_run_id`, `status` (AIO run status name), `status_category` (`passed`\|`failed`\|`blocked`\|`skipped`\|`in_progress`\|`not_run`\|`other`), `is_automated`, `executed_by_person_id`, `assigned_to_person_id`, `executed_at`, `effort_seconds`, `defect_count`, `folder_name`, `priority`. **Added 2026-08-20**, when an AioAuth key first made AIO TCMS reachable — the enum stopped at 21 because this source was blocked (`401 Invalid or missing API Token`), not because test execution did not matter. For a QA engineer the test cycle *is* the delivery record; pull requests are not. `test_case_title` is deliberately **not** carried: titles are free text, which rule 1 excludes. A run that has never been executed emits `status_category = not_run` with a NULL `executed_at` — it is **not** a failure and must never be counted as one |
 | 23 | `test.case.snapshot` | **poller** | `test_case_key`, `automation_status` (AIO's own value, e.g. `Automated` / `To Be Automated`, or NULL when nobody has set it), `automation_owner_person_id`, `has_automation_key`, `test_case_status`, `script_type`, `folder_name`, `priority`, `is_archived`, `created_at`, `updated_at`. **Added 2026-08-20.** This is the *inventory* event, and it exists because the denominator of Automation Coverage is invisible to event 22: a test case nobody has ever executed emits no run, and those are exactly the un-automated cases the coverage metric has to count. `automation_status` is passed through verbatim and is **NULL for roughly half the estate** — an unset field is not "not automated", so a coverage figure must state its known-status denominator or it is measuring how diligently the field is filled in |
+
+#### The terminal-PR block (rows 17 and 18)
+
+Both terminal PR events carry the same summary of the pull request they end.
+Written once here because it is written once in `pollers/poll_bitbucket.py`,
+and because the two copies that were not written down drifted 34 names apart
+from this file between 2026-08-19 and 2026-08-27.
+
+`pr_id`, `pr_state`, `pr_title_has_ai_marker`, `has_ai_marker`, `created_on`,
+`first_review_at`, `review_lead_time_ms`, `reviewer_count`, `approval_count`,
+`changes_requested_count`, `commits_after_first_review`, `reopened_at`,
+`reopen_count`, `revision_count`, `revisions_after_first_review`,
+`lines_changed_pre_review`, `lines_changed_after_first_review`,
+`self_comment_count`, `bot_comment_count`, `comment_count`,
+`inline_comment_count`, `toplevel_comment_count`, `lines_added`,
+`lines_removed`, `files_changed`, `files_added`, `files_modified`,
+`files_removed`, `automation_scripts_added`, `automation_scripts_modified`,
+`automation_scripts_removed`, `automation_files_by_kind`, `commit_count`,
+`ai_commit_count`, `ai_run_ids`, `ai_model_ids`.
+
+Every name is a count, a timestamp, a duration, a classification or an id. No
+path, no title, no message body, no valuation. `automation_files_by_kind` maps
+a classified kind to counts; the paths that produced it are classified and
+dropped in the poller (rule 1, §11.3).
+
+**`lines_changed_after_first_review` is §5's numerator and was emitted by
+nothing until 2026-08-27.** `sql/08_metrics.sql` has summed it since it was
+written, over a column no poller filled, so `v_rework_rate` reported a rework
+rate over no rework — indistinguishable downstream from a team that never
+reworks anything. It is now measured per commit, against each commit's first
+parent, split at `first_review_at`. `lines_changed_pre_review` is the other
+side of that split and §8.9 requires it reported *beside* rework rather than
+folded into it.
+
+**Both are NULL when the PR was never reviewed** — not 0. Without a first
+review the boundary that defines "before" and "after" does not exist, and a
+zero would read as "nothing was reworked": the wrong answer rather than the
+missing one (§1). A failed per-commit request nulls both rather than returning
+a smaller number, because an undercount of rework is wrong in the flattering
+direction and nothing downstream could tell it from an improvement.
 
 ### 3.1 Provenance markers — two closed sets, not one
 
