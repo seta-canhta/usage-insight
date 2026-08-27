@@ -6,6 +6,7 @@ came from one -- coverage read over the case estate instead of the cycle, a
 partial week compared against a full one, an unpriced model treated as free.
 """
 
+import io
 import json
 import os
 import sys
@@ -179,7 +180,7 @@ class ChangeColumnTests(unittest.TestCase):
         weeks = ["2026-W32", "2026-W33"]
         data = sheets.collect([], PEOPLE, weeks, PRICES)
         sheets.render(wb, data, weeks, weeks, {})
-        text = " ".join(str(c.value) for row in wb["Start Here"].iter_rows()
+        text = " ".join(str(c.value) for row in wb["Summary"].iter_rows()
                         for c in row if c.value)
         self.assertIn("not measured", text.lower())
         self.assertNotIn("0.0%", text)
@@ -194,3 +195,56 @@ class ChangeColumnTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class PronounTests(unittest.TestCase):
+    """A name does not carry pronouns, so nothing here may infer them."""
+
+    def test_the_default_is_they_and_it_agrees_with_its_verbs(self):
+        p = sheets.Pronouns()
+        self.assertEqual(p.subj, "they")
+        self.assertEqual(p.is_, "are")
+        self.assertEqual(p.v("write"), "write")
+
+    def test_a_named_set_agrees_singular(self):
+        for spec, subj, indep, verb in (("he", "he", "his", "writes"),
+                                        ("she", "she", "hers", "writes")):
+            p = sheets.Pronouns(spec)
+            self.assertEqual(p.subj, subj)
+            self.assertEqual(p.indep, indep)
+            self.assertEqual(p.is_, "is")
+            self.assertEqual(p.v("write"), verb)
+
+    def test_a_full_set_is_taken_verbatim(self):
+        p = sheets.Pronouns("xe/xem/xyr/xyrs")
+        self.assertEqual((p.subj, p.obj, p.poss, p.indep),
+                         ("xe", "xem", "xyr", "xyrs"))
+        self.assertEqual(p.is_, "is")
+
+    def test_parse_wants_a_name_and_a_spec(self):
+        name, p = sheets.parse_pronouns("Linh Hoang=he")
+        self.assertEqual(name, "Linh Hoang")
+        self.assertEqual(p.subj, "he")
+        with self.assertRaises(Exception):
+            sheets.parse_pronouns("no-equals-sign")
+
+    def test_pronouns_for_an_unlisted_person_are_rejected_not_guessed(self):
+        with self.assertRaises(SystemExit):
+            sheets.main(["x.xlsx", "--person", "Real Person=abc",
+                      "--pronouns", "Someone Else=he",
+                      "--input", "nope", "--weeks", "2026-W32..2026-W32"])
+
+
+class PerPersonSplitTests(unittest.TestCase):
+    """Test Activity must carry only these people, and never guess an author."""
+
+    def test_case_counts_are_not_attributed_to_a_person(self):
+        src = io.open(sheets.__file__, encoding="utf-8").read()
+        fn = src[src.index("def test_activity("):src.index("def person_tabs(")]
+        # Only these keys may appear in a per-person row; cases_created and
+        # cases_updated carry no author and must stay out of the split block.
+        head = fn[:fn.index("---- the part that carries no author")]
+        for banned in ("cases_created", "cases_updated"):
+            self.assertNotIn(banned, head,
+                             "%s has no author and must not be split by "
+                             "person" % banned)
+
