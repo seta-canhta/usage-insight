@@ -1,0 +1,39 @@
+{
+  "_comment": [
+    "The /insights snapshot publisher: importers/publish_snapshot.py, and",
+    "importers/daily_pull.py --publish. Copy this to reports/dashboard.json",
+    "and fill it in -- the real one is gitignored, because it names people.",
+    "",
+    "Every name and id below is invented. The account ids are the shape",
+    "Atlassian uses (a 24-character hex id, or the newer 712020:<uuid>), not",
+    "anybody's. Read them out of reports/identities.txt, never guessed.",
+    "",
+    "No secret belongs in this file. The push is scp/ssh and uses your own",
+    "key; the endpoint is handed derived counts and is never handed a",
+    "credential -- it runs untrusted workflow code."
+  ],
+
+  "destination": "future:/home/ubuntu/aeris-insight/insights/insights.json",
+
+  "weeks_back": 5,
+
+  "prices": {
+    "claude-sonnet-4.6": "3.0/15.0"
+  },
+
+  "members": [
+    {
+      "name": "Alex Example",
+      "account_id": "0000000000000000000000aa",
+      "short": "Alex",
+      "role": "runs the tests and raises the bugs",
+      "pronouns": "she"
+    },
+    {
+      "name": "Sam Sample",
+      "account_id": "712020:00000000-0000-0000-0000-0000000000bb",
+      "role": "builds the automated tests",
+      "pronouns": "he"
+    }
+  ]
+}

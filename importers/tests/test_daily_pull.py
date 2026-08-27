@@ -322,7 +322,7 @@ class ExitCodeTests(unittest.TestCase):
     def tearDown(self):
         shutil.rmtree(self.tmp, ignore_errors=True)
 
-    def run_main(self, config, env, poller, extra=()):
+    def run_main(self, config, env, poller, extra=(), publisher=None):
         # `main` reads the repos and projects from the real environment, so
         # this restores it rather than leaving the suite's later tests running
         # against whatever the developer's .env happens to say.
@@ -334,7 +334,8 @@ class ExitCodeTests(unittest.TestCase):
             with contextlib.redirect_stdout(io.StringIO()):
                 return daily.main(["--date", DAY.isoformat(),
                                    "--cache", self.tmp] + list(extra),
-                                  runner=poller, config=config)
+                                  runner=poller, config=config,
+                                  publisher=publisher)
         finally:
             os.environ.clear()
             os.environ.update(saved)
@@ -362,6 +363,111 @@ class ExitCodeTests(unittest.TestCase):
         self.assertEqual(
             self.run_main(Config(), {"BITBUCKET_REPOS": "", "AIO_PROJECTS": ""},
                           Poller()), 2)
+
+
+class Publisher:
+    """A stand-in for `importers/publish_snapshot.py`.
+
+    It must never be reached in the tests that matter here: a snapshot build
+    reads a month of cache and the push is an scp to a real host.
+    """
+
+    def __init__(self, code=0):
+        self.code = code
+        self.calls = []
+
+    def __call__(self, config_path, cache_dir, day):
+        self.calls.append((config_path, cache_dir, day))
+        return self.code
+
+
+class PublishTests(unittest.TestCase):
+    """`--publish` ships the day, and only a whole one."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def run_main(self, config, env, poller, extra=(), publisher=None):
+        saved = dict(os.environ)
+        os.environ.update(env)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                return daily.main(["--date", DAY.isoformat(),
+                                   "--cache", self.tmp] + list(extra),
+                                  runner=poller, config=config,
+                                  publisher=publisher)
+        finally:
+            os.environ.clear()
+            os.environ.update(saved)
+
+    def test_it_is_off_unless_asked_for(self):
+        # The pull is the job; publishing is a thing the pull can also do. A
+        # default that pushed would mean any hand-run of this from a checkout
+        # overwrote what the endpoint is serving.
+        publisher = Publisher()
+        self.assertEqual(self.run_main(FULL, ENV, Poller(),
+                                       publisher=publisher), 0)
+        self.assertEqual(publisher.calls, [])
+
+    def test_a_complete_day_is_published(self):
+        publisher = Publisher()
+        self.assertEqual(self.run_main(FULL, ENV, Poller(), extra=["--publish"],
+                                       publisher=publisher), 0)
+        self.assertEqual(len(publisher.calls), 1)
+        self.assertEqual(publisher.calls[0][2], DAY)
+
+    def test_an_incomplete_day_is_never_published(self):
+        # The one that matters. A failed source writes no file at all, and the
+        # screens have no way to draw its absence as anything but zero -- a
+        # week Bitbucket failed on would render as a week in which nobody
+        # delivered anything. Better a snapshot that is a day old.
+        publisher = Publisher()
+        code = self.run_main(FULL, ENV, Poller(fails=["poll_bitbucket.py"]),
+                             extra=["--publish"], publisher=publisher)
+        self.assertEqual(publisher.calls, [])
+        # And the pull's own exit code is untouched: the reason nothing was
+        # published is the reason the pull was bad, and a second code for it
+        # would send somebody looking for a second fault.
+        self.assertEqual(code, 1)
+
+    def test_a_blocked_source_is_not_published_either(self):
+        # Blocked is a missing credential rather than a failing API, and it is
+        # the same absence downstream.
+        no_aio = Config(bitbucket_username="u", bitbucket_token="t",
+                        jira_url="https://jira.test", jira_username="u",
+                        jira_token="t", jira_project_keys=("IML",))
+        publisher = Publisher()
+        self.assertEqual(self.run_main(no_aio, ENV, Poller(),
+                                       extra=["--publish"],
+                                       publisher=publisher), 1)
+        self.assertEqual(publisher.calls, [])
+
+    def test_nothing_planned_publishes_nothing(self):
+        publisher = Publisher()
+        self.assertEqual(
+            self.run_main(Config(), {"BITBUCKET_REPOS": "", "AIO_PROJECTS": ""},
+                          Poller(), extra=["--publish"],
+                          publisher=publisher), 2)
+        self.assertEqual(publisher.calls, [])
+
+    def test_a_failed_publish_has_its_own_exit_code(self):
+        # 3, not 1: the day is on disk and complete, and only the shipping
+        # failed. That is a different morning's work from a pull that could not
+        # reach a source.
+        self.assertEqual(self.run_main(FULL, ENV, Poller(),
+                                       extra=["--publish"],
+                                       publisher=Publisher(code=2)), 3)
+
+    def test_the_day_pulled_is_the_day_published(self):
+        publisher = Publisher()
+        self.run_main(FULL, ENV, Poller(), extra=["--publish"],
+                      publisher=publisher)
+        _, cache_dir, day = publisher.calls[0]
+        self.assertTrue(cache_dir.endswith(DAY.isoformat()))
+        self.assertEqual(day, DAY)
 
 
 class ScheduleTemplateTests(unittest.TestCase):
@@ -394,6 +500,11 @@ class ScheduleTemplateTests(unittest.TestCase):
     def test_it_runs_the_daily_pull_on_a_calendar(self):
         self.assertIn("importers/daily_pull.py", self.text)
         self.assertIn("StartCalendarInterval", self.text)
+
+    def test_it_publishes_the_snapshot(self):
+        # The whole point of the unattended job: the two screens follow the
+        # data without anybody running a command.
+        self.assertIn("<string>--publish</string>", self.text)
 
 
 if __name__ == "__main__":

@@ -4,6 +4,7 @@
     python3 importers/daily_pull.py                    # today, month-to-date
     python3 importers/daily_pull.py --date 2026-08-26  # a specific day
     python3 importers/daily_pull.py --force            # re-fetch what is cached
+    python3 importers/daily_pull.py --publish          # ...and update /insights
 
 Four kinds of pull -- Jira, Bitbucket, AIO runs, AIO coverage -- into
 ``reports/cache/<YYYY-MM-DD>/``, one NDJSON file per source, plus a
@@ -41,6 +42,16 @@ set there is no safe default -- polling "whatever Jira will return" is how a
 key space stops being an allow-list -- so those sources are reported blocked
 rather than guessed at.
 
+**``--publish`` ships the day, and only a whole one.** With it, a complete pull
+is followed by `importers/publish_snapshot.py`: the /insights and /activities
+snapshot is rebuilt and put on the endpoint, so the two screens follow the data
+without anybody typing anything. An **incomplete** pull is never published, and
+that is the whole point of putting the switch here -- this is the only thing
+that knows whether the day was whole. A missing source is absent, not zero, and
+the screens have no way to tell the difference: a week Bitbucket failed on
+would draw as a week in which nobody delivered anything. Better a snapshot that
+is a day old and says so than one that is current and wrong.
+
 **This runs on the laptop that holds the credentials, and only there.** Not on
 ``future``, which executes untrusted workflow code from pull requests and must
 never hold one. Nothing here needs a special case for that: the credentials
@@ -64,6 +75,7 @@ if _ROOT not in sys.path:
     sys.path.insert(0, _ROOT)
 
 import common  # noqa: E402  -- Config, and the .env walk-up that finds it
+from importers import publish_snapshot  # noqa: E402
 
 #: Where a day lands. Under ``reports/``, which is gitignored: these files
 #: carry live Atlassian account ids, issue keys and branch names, and a
@@ -377,9 +389,27 @@ def _point_latest(cache_root: str, day: date) -> None:
 
 # --------------------------------------------------------------------------
 
+#: ``(config path, cache directory, day) -> exit code``. Injected by the tests,
+#: which must never build a snapshot or reach the endpoint.
+Publisher = Callable[[str, str, date], int]
+
+
+def _publish(config_path: str, cache_dir: str, day: date) -> int:
+    """Hand the day to ``importers/publish_snapshot.py``.
+
+    A call and not a subprocess: it has already been decided by this point
+    that the day is whole, and the publisher's own exit code is all this needs
+    back. Its failures are its own to log.
+    """
+    return publish_snapshot.main(["--config", config_path,
+                                  "--cache", cache_dir,
+                                  "--date", day.isoformat()])
+
+
 def main(argv: Optional[Sequence[str]] = None,
          runner: Optional[Runner] = None,
-         config: Optional["common.Config"] = None) -> int:
+         config: Optional["common.Config"] = None,
+         publisher: Optional[Publisher] = None) -> int:
     """``runner``/``config`` are injectable so the tests never touch a source."""
     parser = argparse.ArgumentParser(
         prog="daily_pull.py",
@@ -397,6 +427,16 @@ def main(argv: Optional[Sequence[str]] = None,
                              "rolling window moves its denominator daily")
     parser.add_argument("--force", action="store_true",
                         help="re-fetch sources already cached for this day")
+    parser.add_argument("--publish", action="store_true",
+                        help="after a COMPLETE pull, rebuild the /insights "
+                             "snapshot and put it on the endpoint. A pull with "
+                             "a blocked or failed source is never published: "
+                             "the screens would draw its absence as zero")
+    parser.add_argument("--publish-config",
+                        default=publish_snapshot.DEFAULT_CONFIG,
+                        help="the member list, prices and destination, "
+                             "repo-relative (default: {})".format(
+                                 publish_snapshot.DEFAULT_CONFIG))
     args = parser.parse_args(argv)
 
     day = (date.fromisoformat(args.date) if args.date
@@ -427,7 +467,33 @@ def main(argv: Optional[Sequence[str]] = None,
                    sources=[r["source"] for r in bad],
                    hint="those files are ABSENT, not zero. Every rate computed "
                         "over this day is missing their denominator")
+        if args.publish:
+            # Said out loud, and the exit code above is left alone: the reason
+            # nothing was published is the same reason the pull was bad, and
+            # two codes for one fault would only send somebody looking for a
+            # second thing to fix. The endpoint keeps serving yesterday's
+            # snapshot, which is a day old and true.
+            common.log("daily_pull_not_published",
+                       missing=[r["source"] for r in bad],
+                       hint="an incomplete day is never published -- the "
+                            "screens cannot draw a missing source as anything "
+                            "but zero. Fix the source and re-run; a cached "
+                            "source is not re-fetched")
         return 1
+
+    if args.publish:
+        code = (publisher or _publish)(
+            args.publish_config, os.path.join(cache_root, day.isoformat()), day)
+        if code:
+            # Its own code: the day is on disk and complete, and only the
+            # shipping failed. That is a different morning's work from a pull
+            # that could not reach a source, and the screens are stale rather
+            # than wrong.
+            common.log("daily_pull_publish_failed", exit=code,
+                       hint="the cache for this day is complete. Re-run "
+                            "importers/publish_snapshot.py once the "
+                            "destination is reachable")
+            return 3
     return 0
 
 

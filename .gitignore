@@ -58,3 +58,11 @@ samples
 # a box with no Node toolchain, so the bundle has to travel with the code.
 # They hold no personal data -- the figures arrive at runtime from the
 # snapshot above, which does not travel with git.
+
+# The publisher's config. It names individuals and carries their Atlassian
+# account ids and the endpoint's hostname, so it is data like
+# reports/identities.txt is -- already covered by /reports/* above, and named
+# here so nobody re-adds it by hand. reports/dashboard.json.example is the
+# tracked shape, with invented names.
+/reports/dashboard.json
+!/reports/dashboard.json.example

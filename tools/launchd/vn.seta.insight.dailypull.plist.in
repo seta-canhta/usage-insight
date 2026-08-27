@@ -70,6 +70,26 @@
   path, not for finding the credentials.
 
 
+  IT PUBLISHES, AND ONLY A WHOLE DAY
+
+  `--publish` rebuilds the /insights snapshot and puts it on the endpoint after
+  the pull, so the two screens follow the data with nobody typing anything. It
+  needs `reports/dashboard.json` -- the member list, the prices and the
+  destination -- which is gitignored because it names people; copy
+  reports/dashboard.json.example. Without that file the pull still runs and the
+  publish step reports the missing config and exits non-zero.
+
+  A pull with a blocked or failed source is NOT published, and daily_pull.py
+  enforces that rather than this file: a missing source is absent, not zero,
+  and the screens would draw a week Bitbucket failed on as a week in which
+  nobody delivered anything. The endpoint then keeps serving the previous
+  snapshot, which is older and true.
+
+  The push is scp/ssh under the login this agent runs as, with BatchMode on so
+  a missing key fails instead of waiting forever for a prompt that has no
+  terminal to appear on. No credential goes to the endpoint -- see below.
+
+
   NOT ON THE `future` BOX
 
   This is a per-user LaunchAgent on the developer laptop, which is the only
@@ -84,6 +104,9 @@
   <array>
     <string>@PYTHON@</string>
     <string>@REPO@/importers/daily_pull.py</string>
+    <!-- Update /insights and /activities from the day just pulled. Off unless
+         asked for, and refused on an incomplete pull; see the header. -->
+    <string>--publish</string>
   </array>
   <key>WorkingDirectory</key><string>@REPO@</string>
   <key>StartCalendarInterval</key>
