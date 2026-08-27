@@ -144,19 +144,35 @@ the admin token, because the page writes it. A passcode with no attendance file
 stops the process at startup rather than serving a page that refuses every
 entry.
 
-Reach it over the tunnel that already exists for `pull`:
+**Know where it is reachable from before turning it on.** The page is served on
+the read listener (8479) and never on the upload listener (8480), so it is not
+internet-reachable whatever the gateway forwards. Everything beyond that is a
+property of the deployment, not of the code:
+
+| if the read listener is | `/dashboard` is reachable from |
+|---|---|
+| unpublished (`INSIGHT_PUBLISH=127.0.0.1:8479`) | an SSH tunnel only |
+| published to the LAN (`INSIGHT_PUBLISHED_PORT=8479`) | every machine on the office network |
+
+**The production deployment is the second row.** `.env` on the host sets
+`INSIGHT_PUBLISH=192.168.90.127:8479`, and the gateway's `insight-read` router
+allows `127.0.0.1/32` plus all of RFC1918 — so the daybook is an office-LAN
+page behind a passcode, not a tunnel-only one. That was chosen deliberately;
+it is written down here so nobody re-derives the tunnel assumption from the
+`pull` instructions above.
+
+Either way:
 
 ```bash
-ssh -L 8479:127.0.0.1:8479 <host>
+ssh -L 8479:127.0.0.1:8479 <host>        # always works
 open http://127.0.0.1:8479/dashboard
 ```
 
-**Why loopback only.** A passcode is a weaker credential than
-`INSIGHT_ADMIN_TOKEN`, and this page lists every engineer on one screen. It is
-served on port 8479 and never on 8480, so it is not reachable from the internet
-even if the gateway forwards every path. Eight wrong passcodes from one address
-locks that address out for a minute; sessions are signed with a key minted per
-process, so a restart signs everyone out.
+A passcode is a weaker credential than `INSIGHT_ADMIN_TOKEN`, and this page
+lists every engineer on one screen — which is the whole reason it never goes on
+8480. Eight wrong passcodes from one address locks that address out for a
+minute; sessions are signed with a key minted per process, so a restart signs
+everyone out.
 
 The attendance file is tab separated and meant to be edited by hand:
 
