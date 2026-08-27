@@ -21,14 +21,19 @@ for _p in (_REPORT, os.path.dirname(_REPORT)):
 
 import ai_usage_sheets as sheets  # noqa: E402
 
-NGOC = "5bee6a1ec03ef4570f0a78e3"
-LINH = "712020:28cc987e-5263-4564-83c6-7f76fa32574e"
-PEOPLE = {NGOC: "Ngoc Nguyen", LINH: "Linh Hoang"}
+# Synthetic, and deliberately so. Both account-id shapes are represented --
+# the older 24-hex form and the newer `712020:` one -- because a regex written
+# for the newer shape silently drops anybody on the older one, which has
+# happened here. Real names and real account ids are personal data and do not
+# belong in a repository.
+ONE = "5f00000000000000000000aa"
+TWO = "712020:00000000-0000-4000-8000-000000000002"
+PEOPLE = {ONE: "Engineer One", TWO: "Engineer Two"}
 WEEKS = ["2026-W32", "2026-W33", "2026-W34"]
 PRICES = {"claude-sonnet-4.6": (3.0, 15.0)}
 
 
-def event(kind, when, who=NGOC, **attrs):
+def event(kind, when, who=ONE, **attrs):
     return {"event_type": kind, "event_time": when,
             "actor": {"person_id": who}, "trace_id": attrs.pop("trace", "s1"),
             "attributes": attrs}
@@ -54,7 +59,7 @@ class ArgParsingTests(unittest.TestCase):
 
     def test_a_person_needs_both_halves(self):
         with self.assertRaises(Exception):
-            sheets.parse_person("Ngoc Nguyen")
+            sheets.parse_person("Engineer One")
 
 
 class CoverageByCycleTests(unittest.TestCase):
@@ -72,7 +77,7 @@ class CoverageByCycleTests(unittest.TestCase):
     def run_event(self, cycle, case, automated):
         return {"event_type": "test.run.completed",
                 "event_time": "2026-08-12T09:00:00Z",
-                "actor": {"person_id": NGOC},
+                "actor": {"person_id": ONE},
                 "attributes": {"test_cycle_key": cycle, "test_case_key": case,
                                "is_automated": automated,
                                "executed_at": "2026-08-12T09:00:00Z",
@@ -134,7 +139,7 @@ class CostTests(unittest.TestCase):
             event("model.call", "2026-08-12T09:00:00Z",
                   input_tokens=1000, output_tokens=100, model_id="mystery-1"),
         ])
-        row = cost["Ngoc Nguyen"]["2026-W33"]
+        row = cost["Engineer One"]["2026-W33"]
         self.assertIsNone(row["modelled"])
         self.assertEqual(row["calls"], 1)
         self.assertEqual(row["unpriced"], 1)
@@ -145,14 +150,14 @@ class CostTests(unittest.TestCase):
                        model_id="claude-sonnet-4.6")
         bare = event("model.call", "2026-08-12T10:00:00Z",
                      model_id="claude-sonnet-4.6")
-        row = self.collect([priced, bare])["Ngoc Nguyen"]["2026-W33"]
+        row = self.collect([priced, bare])["Engineer One"]["2026-W33"]
         self.assertEqual(row["measured"], 3.0)   # 1M input at $3/1M
         self.assertEqual(row["modelled"], 6.0)   # the bare call projected
         self.assertEqual(row["n"], 1)
 
     def test_a_week_with_no_calls_is_none_rather_than_zero(self):
         cost = self.collect([event("human.turn", "2026-08-12T09:00:00Z")])
-        self.assertIsNone(cost["Ngoc Nguyen"]["2026-W32"])
+        self.assertIsNone(cost["Engineer One"]["2026-W32"])
 
 
 class ChangeColumnTests(unittest.TestCase):
@@ -221,8 +226,8 @@ class PronounTests(unittest.TestCase):
         self.assertEqual(p.is_, "is")
 
     def test_parse_wants_a_name_and_a_spec(self):
-        name, p = sheets.parse_pronouns("Linh Hoang=he")
-        self.assertEqual(name, "Linh Hoang")
+        name, p = sheets.parse_pronouns("Engineer Two=he")
+        self.assertEqual(name, "Engineer Two")
         self.assertEqual(p.subj, "he")
         with self.assertRaises(Exception):
             sheets.parse_pronouns("no-equals-sign")

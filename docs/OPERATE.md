@@ -241,6 +241,7 @@ wherever `workbook-input/` is read from.
 ```bash
 python3 importers/daily_pull.py                          # today, month-to-date
 python3 importers/daily_pull.py --date 2026-08-26 --force
+python3 importers/daily_pull.py --publish                # ...and the screens
 ```
 
 The window is the first of the day's month, not a rolling 30 days: the workbook
@@ -258,6 +259,19 @@ costs one API budget rather than four.
 | 0 | every source is on disk, fetched or already cached |
 | 1 | one or more blocked (no credential) or failed. The rest are still there |
 | 2 | nothing planned: `JIRA_PROJECT_KEYS`/`BITBUCKET_REPOS`/`AIO_PROJECTS` are empty, and keys are never guessed (AR-1) |
+| 3 | `--publish` only: the day is complete and on disk, and the snapshot did not reach the endpoint |
+
+`--publish` is off by default. With it, a **complete** pull is followed by
+`importers/publish_snapshot.py` (§4b): the /insights snapshot is rebuilt from
+the day just pulled and pushed to the endpoint, so the two screens follow the
+data with nobody running a command.
+
+An incomplete pull is never published, and this is where that is enforced —
+it is the only thing that knows whether the day was whole. A source that failed
+wrote no file, the screens cannot draw its absence as anything but zero, and a
+week Bitbucket failed on would render as a week in which nobody delivered
+anything. The log says so (`daily_pull_not_published`), the exit code stays 1,
+and the endpoint keeps serving the previous snapshot — older, and true.
 
 #### Scheduling it — macOS, launchd
 
@@ -279,6 +293,10 @@ sed -e "s|@REPO@|$REPO|g" -e "s|@PYTHON@|$(command -v python3)|g" \
 launchctl bootstrap gui/$UID ~/Library/LaunchAgents/vn.seta.insight.dailypull.plist
 launchctl kickstart -p gui/$UID/vn.seta.insight.dailypull   # run it now
 ```
+
+The template passes `--publish`, so it needs `reports/dashboard.json` (§4b) in
+place before the first run. Without it the pull still runs; only the publish
+step fails, and says which key it wanted.
 
 Off again: `launchctl bootout gui/$UID/vn.seta.insight.dailypull`, then delete
 the plist. It logs to `reports/daily-pull.log`. The label is deliberately not
@@ -312,11 +330,15 @@ allow-list and dedupes.
 
 ### `--identities` — without it, laptop events join to nothing
 
-`identities.txt` is one `email accountId` line per person, `#` for comments:
+`identities.txt` is one `email accountId` line per person, `#` for comments.
+Both accountId shapes are real and both turn up on one team — the older 24-hex
+form and the newer `712020:` one — so anything reading this file must accept
+either. A regex written for only the newer shape drops those people silently,
+which has happened here:
 
 ```
-ngoc.nguyen@aeris.net   712020:198a0913-d658-4d93-9e9d-1b9747429f1b
-linh.hoang@aeris.net    712020:28cc987e-5263-4564-83c6-7f76fa32574e
+one.engineer@example.net   5f00000000000000000000aa
+two.engineer@example.net   712020:00000000-0000-4000-8000-000000000002
 ```
 
 A laptop cannot know its own Atlassian accountId — that is a Jira fact, not a
@@ -381,11 +403,11 @@ Generate it from the same pull the workbook uses:
 
 ```bash
 python3 report/dashboard_data.py \
-  --person "Ngoc Nguyen=5bee6a1ec03ef4570f0a78e3" \
-  --person "Linh Hoang=712020:28cc987e-5263-4564-83c6-7f76fa32574e" \
-  --pronouns "Ngoc Nguyen=she" --pronouns "Linh Hoang=he" \
-  --role "Ngoc Nguyen=runs the tests and raises the bugs" \
-  --role "Linh Hoang=builds the automated tests" \
+  --person "Engineer One=5f00000000000000000000aa" \
+  --person "Engineer Two=712020:00000000-0000-4000-8000-000000000002" \
+  --pronouns "Engineer One=she" --pronouns "Engineer Two=he" \
+  --role "Engineer One=runs the tests and raises the bugs" \
+  --role "Engineer Two=builds the automated tests" \
   --input reports/cache/latest \
   --weeks 2026-W31..2026-W35 --full-weeks 2026-W32..2026-W34 \
   --price "claude-sonnet-4.6=3.0/15.0" \
@@ -398,6 +420,48 @@ that finished, and leaving a part week in a trend once turned a +74% into a
 -17%. `--pronouns` is never inferred from a name; anyone unnamed stays
 they/them. The snapshot is **gitignored** for the same reason `/reports/*` is —
 it names individuals and carries issue keys.
+
+#### Keeping it current, unattended
+
+`importers/publish_snapshot.py` is that invocation with the arguments in a file
+and an scp on the end. `importers/daily_pull.py --publish` (§2) calls it after
+every complete pull, which is how the screens follow the data; run it by hand
+when only the snapshot needs moving:
+
+```bash
+python3 importers/publish_snapshot.py                # reports/cache/latest
+python3 importers/publish_snapshot.py --dry-run      # build it, push nothing
+```
+
+Config is `reports/dashboard.json` — copy `reports/dashboard.json.example`,
+which is tracked and invented. It is gitignored like `reports/identities.txt`:
+it names individuals and carries their account ids. Four keys, all checked
+before anything is built or pushed, and a missing one is named:
+
+| | |
+|---|---|
+| `destination` | `host:/absolute/path/insights.json`, an ssh destination. A relative remote path is refused — scp would resolve it against the login's home directory and the push would succeed nowhere useful |
+| `members` | one object per person: `name` and `account_id`, plus optional `short`, `role`, `pronouns`. A misspelt key is refused, not dropped |
+| `prices` | `{"model": "IN/OUT"}` per 1M tokens. `{}` is a real answer — a model with no price is counted and left unpriced |
+| `weeks_back` | how many ISO weeks the screens show, ending with the day being published. Optional, default 5, minimum 2 |
+
+**No secret goes in it, and none goes to the endpoint.** The push is scp/ssh
+under your own key, with `BatchMode=yes` so a scheduled run fails instead of
+waiting for a prompt it has no terminal for. What lands there is derived
+counts; that box runs untrusted workflow code.
+
+**The week window is derived, never written down.** A `--weeks` span pasted
+into a config is right on the day it is pasted and wrong every Monday after, so
+this reads the pull's own `_status.json`: the span ends with the day being
+published, and two kinds of week are marked `--partial` and kept out of
+`--full-weeks` — the one still running, and any week that opens before the pull
+window does. Both are shown and neither is compared.
+
+**It is copied to `insights.json.tmp` and `mv`d into place.** The endpoint
+re-stats that file and re-reads it the moment the mtime moves, so a copy
+straight onto the live path would hand it half a document. The built snapshot
+is also parsed here first: a file that will not load is never pushed over one
+that does.
 
 Build the pages (Node, on a developer machine — the endpoint has no toolchain,
 so the bundle is committed and ships with the code):

@@ -7,9 +7,9 @@
 // distinction -- measured, partly, not at all -- and everything here serves it.
 //
 // Accent is a deep instrument teal. It is deliberately not either of the two
-// categorical hues: those belong to Ngoc and Linh, colour follows the person,
-// and an accent sharing a hue with one of them would quietly imply the page
-// was taking a side.
+// categorical hues: those belong to the people on the team, colour follows
+// the person, and an accent sharing a hue with one of them would quietly
+// imply the page was taking a side.
 //
 // Type is three faces doing three jobs. Archivo is signage -- flat terminals,
 // real width, built to be read across a room -- and carries the headings. Public

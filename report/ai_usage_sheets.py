@@ -8,7 +8,7 @@ question this project exists to answer, so this adds it to the same file.
 
     python3 report/people_workbook.py --person ... --out W.xlsx
     python3 report/ai_usage_sheets.py W.xlsx \
-        --person "Ngoc Nguyen=5bee..." --person "Linh Hoang=712020:28cc..." \
+        --person "NAME=ACCOUNT_ID" --person "NAME=ACCOUNT_ID" \
         --input reports/2026-08/workbook-input \
         --weeks 2026-W31..2026-W35 --full-weeks 2026-W32..2026-W34 \
         --price "claude-sonnet-4.6=3.0/15.0" --price "claude-opus-4.6=5.0/25.0"
@@ -71,7 +71,7 @@ def parse_person(value):
     name, _, account = value.partition("=")
     if not name.strip() or not account.strip():
         raise argparse.ArgumentTypeError(
-            "--person takes NAME=ACCOUNT_ID, e.g. \"Ngoc Nguyen=5bee...\"")
+            "--person takes NAME=ACCOUNT_ID, e.g. \"A Name=5f00...\"")
     return name.strip(), account.strip()
 
 
@@ -1003,11 +1003,11 @@ def charts(wb, data, weeks, window_label):
 # ratio of two things measured in the same window and is comparable. Volumes
 # get compared across full weeks only; rates use every week.
 #
-# The second is that these two people do different jobs. Linh writes automation
-# and her work lands in the SCM; Ngoc runs tests and moves tickets, and hers
-# lands in AIO and Jira. Scoring both on scripts-per-prompt would measure Ngoc
-# against a job she is not doing, so each gets the measures that fit their work
-# and the sheet says which is which.
+# The second is that two people on the same team do different jobs. One writes
+# automation and that work lands in the SCM; the other runs tests and moves
+# tickets, and theirs lands in AIO and Jira. Scoring both on scripts-per-prompt
+# would measure the second against a job they are not doing, so each gets the
+# measures that fit their work and the sheet says which is which.
 
 TITLE = Font(bold=True, size=16, color="1F3864")
 Q = Font(bold=True, size=11, color="1F3864")
@@ -1021,7 +1021,7 @@ def _arrow(series, want_up, compare=None):
 
     Two traps this exists to avoid, both of which it fell into first:
 
-    **A V is not a trend.** Ngoc's prompts ran 189, 61, 75, 97. First-against-
+    **A V is not a trend.** One person's prompts ran 189, 61, 75, 97. First-against-
     last calls that "down 49%" when it fell once and has risen every week
     since. A series whose steps change sign has no direction, and saying so is
     the honest answer.
