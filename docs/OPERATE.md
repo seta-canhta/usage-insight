@@ -230,7 +230,67 @@ JSON.
 `--pace` matters on AIO, which 429s readily. `--max-cycles` bounds what is kept,
 not what is fetched.
 
-Schedule: Bitbucket hourly, Jira and AIO nightly.
+### Daily, unattended
+
+`importers/daily_pull.py` runs all four pulls — Bitbucket, Jira, AIO runs, AIO
+coverage — into `reports/cache/<YYYY-MM-DD>/`: one NDJSON per source, plus a
+`_status.json` naming what arrived and what did not, plus a `latest` symlink.
+File names match `admin.py pull`, so a dated directory drops straight in
+wherever `workbook-input/` is read from.
+
+```bash
+python3 importers/daily_pull.py                          # today, month-to-date
+python3 importers/daily_pull.py --date 2026-08-26 --force
+```
+
+The window is the first of the day's month, not a rolling 30 days: the workbook
+is monthly, and a rolling window moves its denominator by a day every morning.
+`--since` and `--days` override it.
+
+A source that fails writes **no file**. An empty NDJSON where the pull should
+have been reads downstream as a real day with nothing on it, and nobody is
+watching when a scheduled job fails. Re-running is cheap and is the normal fix
+— a source already cached for that day is left alone, so recovering one failure
+costs one API budget rather than four.
+
+| Exit | |
+|---|---|
+| 0 | every source is on disk, fetched or already cached |
+| 1 | one or more blocked (no credential) or failed. The rest are still there |
+| 2 | nothing planned: `JIRA_PROJECT_KEYS`/`BITBUCKET_REPOS`/`AIO_PROJECTS` are empty, and keys are never guessed (AR-1) |
+
+#### Scheduling it — macOS, launchd
+
+launchd and not cron, because the machine is a laptop that is shut every
+evening: cron does not run a job it slept through, launchd runs a missed
+`StartCalendarInterval` as soon as the machine wakes. 09:15, inside the hours
+the laptop is actually on.
+
+`tools/launchd/vn.seta.insight.dailypull.plist.in` is a template — a committed
+absolute path carries a username. Its header comment carries the same lines and
+the reasoning:
+
+```bash
+REPO="$(git rev-parse --show-toplevel)"
+mkdir -p "$REPO/reports" ~/Library/LaunchAgents
+sed -e "s|@REPO@|$REPO|g" -e "s|@PYTHON@|$(command -v python3)|g" \
+  "$REPO/tools/launchd/vn.seta.insight.dailypull.plist.in" \
+  > ~/Library/LaunchAgents/vn.seta.insight.dailypull.plist
+launchctl bootstrap gui/$UID ~/Library/LaunchAgents/vn.seta.insight.dailypull.plist
+launchctl kickstart -p gui/$UID/vn.seta.insight.dailypull   # run it now
+```
+
+Off again: `launchctl bootout gui/$UID/vn.seta.insight.dailypull`, then delete
+the plist. It logs to `reports/daily-pull.log`. The label is deliberately not
+the client's `vn.seta.insight` (§1) — sharing one would mean
+`insight schedule --off` silently removing this job too.
+
+**The laptop only.** This job holds the credentials, and `future` runs
+untrusted workflow code — it must never have one. Nothing goes in the plist
+either: `~/Library/LaunchAgents` is world-readable, and `common.Config` finds
+the repo-root `.env` on its own, whatever the environment or the working
+directory. A copy of this landing on `future` reports every source blocked and
+exits 1, rather than writing a day of zeros.
 
 ## 3. Importing a week
 
@@ -304,6 +364,54 @@ python3 report/weekly_report.py --input events.ndjson --format html --out r.html
 
 Stdlib only, no network. `report/people_workbook.py` needs `openpyxl`; without
 it that one module and its tests are skipped.
+
+## 4b. The insights screens
+
+Two more pages on the same read listener and behind the same passcode:
+`/insights` (the ten metrics, with charts and tables) and `/activities` (the
+work itself, grouped by the job being done). Both filter by member.
+
+They read a **snapshot**, not the sources. Three of the four sources need
+credentials that must never exist on the box serving the page — it runs
+untrusted workflow code — so the figures are derived where the credentials are
+and travel with the deploy. The snapshot carries counts and no secrets: no
+tokens, no emails, no paths, no prompt or response text.
+
+Generate it from the same pull the workbook uses:
+
+```bash
+python3 report/dashboard_data.py \
+  --person "Ngoc Nguyen=5bee6a1ec03ef4570f0a78e3" \
+  --person "Linh Hoang=712020:28cc987e-5263-4564-83c6-7f76fa32574e" \
+  --pronouns "Ngoc Nguyen=she" --pronouns "Linh Hoang=he" \
+  --role "Ngoc Nguyen=runs the tests and raises the bugs" \
+  --role "Linh Hoang=builds the automated tests" \
+  --input reports/cache/latest \
+  --weeks 2026-W31..2026-W35 --full-weeks 2026-W32..2026-W34 \
+  --price "claude-sonnet-4.6=3.0/15.0" \
+  --partial "2026-W35=week not finished" \
+  --out server/assets/insights.json
+```
+
+`--full-weeks` is not optional in spirit: volume is only compared across weeks
+that finished, and leaving a part week in a trend once turned a +74% into a
+-17%. `--pronouns` is never inferred from a name; anyone unnamed stays
+they/them. The snapshot is **gitignored** for the same reason `/reports/*` is —
+it names individuals and carries issue keys.
+
+Build the pages (Node, on a developer machine — the endpoint has no toolchain,
+so the bundle is committed and ships with the code):
+
+```bash
+npm install
+npm run typecheck:web && npm run build:web   # -> server/assets/app/
+```
+
+The server reads `server/assets/app/` once at startup and serves it by exact
+key, so no request path ever reaches the filesystem. Override either location
+with `--insights-app` / `--insights-snapshot`. A missing bundle is not an
+error: those two routes 404 and the daybook is untouched. A missing snapshot
+returns 503 with a reason — never an empty object, and never zeros.
 
 ## 5. Warehouse
 
