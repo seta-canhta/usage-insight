@@ -358,10 +358,18 @@ html[data-state="in"] .shell { display: block; }
   }
 
   function standing(person) {
-    // Three different absences. None of them is an error, so none is red.
+    // Four different absences. None is an error, so none is red -- and none is
+    // interchangeable with the others. The bundle count is checked before the
+    // roster, because a person off the whitelist who has bundles on file has
+    // plainly enrolled at some point and "never enrolled" would be a lie the
+    // card beside it contradicts.
+    if (!person.email) return "Not in the whitelist";
+    if (!person.enrolled && person.bundles) {
+      return "Not on the whitelist · " + person.bundles
+        + (person.bundles === 1 ? " bundle" : " bundles") + " on file";
+    }
     if (!person.enrolled && person.on_roster) return "On the roster, never enrolled";
     if (person.enrolled && person.bundles === 0) return "Enrolled, no bundle received";
-    if (!person.email) return "Not in the whitelist";
     return person.email;
   }
 
