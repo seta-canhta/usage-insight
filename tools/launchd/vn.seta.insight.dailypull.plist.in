@@ -1,0 +1,109 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  importers/daily_pull.py, once a working morning.
+
+  A TEMPLATE, not a plist. `@REPO@` and `@PYTHON@` are substituted at install
+  time because a committed absolute path carries a username, and this file is
+  in git while the installed one is not.
+
+  Install:
+
+      REPO="$(git rev-parse --show-toplevel)"
+      mkdir -p "$REPO/reports" ~/Library/LaunchAgents
+      sed -e "s|@REPO@|$REPO|g" -e "s|@PYTHON@|$(command -v python3)|g" \
+        "$REPO/tools/launchd/vn.seta.insight.dailypull.plist.in" \
+        > ~/Library/LaunchAgents/vn.seta.insight.dailypull.plist
+      launchctl bootstrap gui/$UID \
+        ~/Library/LaunchAgents/vn.seta.insight.dailypull.plist
+
+  Remove:
+
+      launchctl bootout gui/$UID/vn.seta.insight.dailypull
+      rm ~/Library/LaunchAgents/vn.seta.insight.dailypull.plist
+
+  Run it now rather than waiting for the clock, which is also how you find out
+  whether it works:
+
+      launchctl kickstart -p gui/$UID/vn.seta.insight.dailypull
+      tail -f "$REPO/reports/daily-pull.log"
+
+
+  WHY launchd AND NOT cron
+
+  Because the machine is a laptop that is shut every evening. cron does not run
+  a job it slept through; the entry fires or it does not, and a job that lands
+  in the small hours never fires at all. launchd runs a missed
+  StartCalendarInterval as soon as the machine wakes, so the worst case is a
+  late pull rather than a missing day -- and a missing day in a scheduled cache
+  is invisible, which is the failure mode this whole job exists to remove.
+  Separately, cron on macOS has needed Full Disk Access granted to
+  /usr/sbin/cron since Catalina, which is a per-machine GUI step nobody
+  remembers having skipped.
+
+
+  WHY 09:15 AND NOT OVERNIGHT
+
+  The laptops here are awake roughly 09:00-19:00 ICT. Overnight is the obvious
+  slot and it is the one hour of the day this machine is guaranteed to be
+  closed. 09:15 is inside the window the machine is actually on, so the normal
+  case is an on-time run and the wake-up catch-up stays a fallback.
+
+
+  WHY ITS OWN LABEL
+
+  `vn.seta.insight` is the client's hourly collection agent (cli/schedule.py).
+  Sharing a label would mean `insight schedule --off` silently removing this
+  job, and this job's install removing that one. That is not hypothetical: a
+  bootout against the wrong label already deleted a live agent here once, on
+  2026-08-26. The suffix keeps the two independent.
+
+
+  NO CREDENTIALS IN THIS FILE
+
+  ~/Library/LaunchAgents is world-readable, and launchd hands a job no shell
+  environment -- so the temptation is to paste the tokens into
+  EnvironmentVariables. Don't. `common.Config` walks up from its own module to
+  the repository-root `.env`, which works regardless of the environment or the
+  working directory. WorkingDirectory below is for the relative `reports/cache`
+  path, not for finding the credentials.
+
+
+  NOT ON THE `future` BOX
+
+  This is a per-user LaunchAgent on the developer laptop, which is the only
+  machine that holds these credentials. `future` runs untrusted workflow code
+  and must never hold one. If this were installed there anyway it would report
+  four blocked sources and exit 1, rather than write a day of zeros.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>vn.seta.insight.dailypull</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@PYTHON@</string>
+    <string>@REPO@/importers/daily_pull.py</string>
+  </array>
+  <key>WorkingDirectory</key><string>@REPO@</string>
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>9</integer>
+    <key>Minute</key><integer>15</integer>
+  </dict>
+  <!-- False, unlike the client's agent. That one uses StartInterval, which
+       counts from load and so needed a run at login to avoid losing the first
+       hour of every day. StartCalendarInterval is absolute and catches up on
+       its own, so a run at every login would only re-read a cache the day
+       already has. -->
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>@REPO@/reports/daily-pull.log</string>
+  <key>StandardErrorPath</key><string>@REPO@/reports/daily-pull.log</string>
+  <!-- Background nice-ness and low-priority IO: this fires while somebody is
+       starting work on the same machine, and a paced AIO inventory pass runs
+       for minutes. -->
+  <key>ProcessType</key><string>Background</string>
+  <key>LowPriorityIO</key><true/>
+  <key>Nice</key><integer>5</integer>
+</dict>
+</plist>
