@@ -30,6 +30,30 @@ have gone to W31.
       machine nobody opens stays behind. Watch `docker logs insight-proxy` for
       `"event": "enrolled"` from the two real addresses.
 
+## Attribution — what still cannot be joined
+
+Fixed 2026-08-27 (0.7.0): AIO events carry their own case and cycle keys, the
+extractor can read that key space, prompts and PR fields are scanned for it,
+and `pull.py --identities` supplies the accountId. Verified end to end against
+the live release: a stamped laptop event joins to 7,836 real AIO test runs and
+to that person's pull requests. It joined to nothing the day before.
+
+- [ ] **Write `identities.txt`** — one `email accountId` line for Ngoc and
+      Linh, and pass `--identities` on every pull. Without it laptop events
+      keep `person_id: null` and join to nothing, however many arrive. Get the
+      accountIds from Jira; `pull.py` names anyone it could not map.
+- [ ] **Case-level attribution is out of reach, and is not a code problem.**
+      0 of 82 Watchtower branch names contain a test key; 1 real prompt in
+      5,036 names any ticket; `has_automation_key` is false on all 4,512 AIO
+      cases including the 4,165 marked "Automated". Until a test case can point
+      at its script — or branches/PRs name the case — no parser reaches a test
+      case from a laptop. Worth raising with the QA team; person-and-week
+      attribution works now, case-level does not.
+- [ ] **`AI-Run-Id` trailers: 0 of 121.** `link.method` is heuristic 112,
+      marker_only 9, explicit 0 — and CONTRACT.md §2.4 admits only `explicit`
+      rows to the cost metrics. Find out whether the commit hook is installed
+      on their machines and whether they commit from the machine they chat on.
+
 ## Re-collect the laptop data
 
 0.4.0 sets no `jira_projects`, so every reader ran with no allow-list and
@@ -37,7 +61,7 @@ invented keys. Measured 2026-08-26: `fix/AUG-25` became ticket `AUG-25` on 28
 of 28 of Linh's events; a Bitbucket export held 45 fabricated keys against 9
 real ones.
 
-- [ ] Once both laptops report 0.6.0, have Ngoc and Linh run
+- [ ] Once both laptops report 0.7.0, have Ngoc and Linh run
       `insight backfill --since 2026-08-01`. It now produces one bundle per
       ISO week, so W31-W35 each land in their own folder.
 - [ ] Re-pull W34 and regenerate the report; the current
