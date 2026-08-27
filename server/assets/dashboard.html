@@ -152,6 +152,11 @@ html[data-state="in"] .shell { display: block; }
 .cal-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 20px; border-bottom: 1px solid var(--rule); background: var(--panel); border-radius: 8px 8px 0 0; }
 .cal-head .nm { font-size: 13px; font-weight: 600; }
 .cal-head .meta { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.cal-head .on-day {
+  font-family: var(--mono); font-size: 11px; color: var(--ink);
+  background: var(--panel); border: 1px solid var(--rule);
+  border-radius: 5px; padding: 2px 8px;
+}
 .cal-head .spacer { flex: 1 1 auto; }
 
 .key { display: flex; align-items: center; gap: 4px 14px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
@@ -185,7 +190,23 @@ html[data-state="in"] .shell { display: block; }
 .day.away::after { content: none; }
 
 .day:hover { outline: 1.5px solid var(--faint); outline-offset: 1px; }
-.day.picked { outline: 2px solid var(--ink); outline-offset: 1px; }
+
+/* The selected day is one square in 371, so a 2px outline was not enough to
+   find it: it gets a ring with a page-coloured halo that lifts it off its
+   neighbours. The week it belongs to is marked on the ruler rather than on the
+   cells -- a hairline drawn on the squares themselves reads on the pale ones
+   and disappears on the dark greens, and an indicator that only works over
+   half its range is worse than none. */
+.day.picked {
+  outline: 2px solid var(--ink);
+  outline-offset: 2px;
+  box-shadow: 0 0 0 2px var(--page);
+  z-index: 2;
+}
+.months div.here::after {
+  content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 2px;
+  background: var(--ink); border-radius: 1px;
+}
 
 .enrolled-rule { grid-row: 2; grid-column: 2; }
 
@@ -263,6 +284,7 @@ html[data-state="in"] .shell { display: block; }
       <div class="cal-head">
         <span class="nm" id="cal-name">—</span>
         <span class="meta" id="cal-meta"></span>
+        <span class="on-day" id="cal-day"></span>
         <span class="spacer"></span>
         <div class="key">
           <i><b class="nil-swatch" style="background:radial-gradient(circle at 50% 50%,var(--nil) 0 3px,transparent 3px)"></b>Not measured</i>
@@ -678,10 +700,42 @@ html[data-state="in"] .shell { display: block; }
   }
 
   function mark() {
-    Array.prototype.forEach.call($("cal-body").querySelectorAll(".day.picked"),
-      function (node) { node.classList.remove("picked"); });
-    var chosen = $("cal-body").querySelector('.day[data-day="' + app.day + '"]');
-    if (chosen) chosen.classList.add("picked");
+    var body = $("cal-body");
+    Array.prototype.forEach.call(body.querySelectorAll(".day.picked, .months .here"),
+      function (node) { node.classList.remove("picked"); node.classList.remove("here"); });
+
+    var chosen = body.querySelector('.day[data-day="' + app.day + '"]');
+    if (chosen) {
+      chosen.classList.add("picked");
+      // Tick the ruler above the week this day sits in.
+      var monday = shift(app.day, -((at(app.day).getUTCDay() + 6) % 7));
+      var column = app.weeks.findIndex(function (week) { return week[0].day === monday; });
+      var tick = body.querySelectorAll(".months div")[column];
+      if (tick) tick.classList.add("here");
+      // A year of weeks does not fit every window, and a marker outside the
+      // scrolled box is a date change that visibly does nothing.
+      var cell = chosen.getBoundingClientRect();
+      var box = body.getBoundingClientRect();
+      if (cell.left < box.left + 24 || cell.right > box.right - 24) {
+        body.scrollLeft += (cell.left - box.left) - (box.width - cell.width) / 2;
+      }
+    }
+    describeDay();
+  }
+
+  // The card carries one line that answers "and on the selected day?", so the
+  // date and the calendar are visibly the same subject.
+  function describeDay() {
+    var person = app.data && app.data.people[app.who];
+    if (!person) return;
+    var col = app.index[app.day];
+    var count = person.activity[col];
+    var record = person.attendance[col];
+    var when = at(app.day);
+    $("cal-day").textContent = when.getUTCDate() + " "
+      + MONTHS[when.getUTCMonth()].slice(0, 3) + " · "
+      + (count === null ? "not measured" : count.toLocaleString() + " events")
+      + " · " + said(record);
   }
 
   function repaint() {
@@ -700,6 +754,14 @@ html[data-state="in"] .shell { display: block; }
         cell.setAttribute("aria-label", cell.title);
       });
   }
+
+  var resizing = null;
+  window.addEventListener("resize", function () {
+    // Overflow appears and disappears with the window, and the scroll position
+    // that was right at the old width is not right at the new one.
+    window.clearTimeout(resizing);
+    resizing = window.setTimeout(function () { if (app.data) mark(); }, 150);
+  });
 
   document.addEventListener("keydown", function (event) {
     if (root.getAttribute("data-state") !== "in") return;
