@@ -254,6 +254,22 @@ AI_LABEL_DRIFT_SHAPE_RE = re.compile(r"(?<![A-Za-z0-9])COPILOT(?![A-Za-z0-9])", 
 #: The spine of the whole model (design §5.2).
 JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+-\d+)\b")
 
+#: An AIO TCMS test case or cycle: ``IML-TC-5``, ``IML-CY-199``.
+#:
+#: A different key space from Jira's, and for a QA team the more important one
+#: -- CONTRACT.md §3 row 22 puts it plainly, the test cycle is the delivery
+#: record and the pull request is not. Until 2026-08-27 nothing here could read
+#: one. Worse, `JIRA_KEY_RE` matched their *tails*: `IML-TC-5` yielded `TC-5`
+#: and `IML-CY-199` yielded `CY-199`, which is exactly the `TC-12018` and
+#: `CY-199` fabrication `extract_jira_key`'s own docstring records. The
+#: allow-list caught them, because `TC` and `CY` are not projects. An
+#: unconfigured reader did not.
+#:
+#: So this serves two purposes at once: it reads the key somebody actually
+#: meant, and masking it first stops the other function inventing one from the
+#: same characters.
+AIO_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9})-(TC|CY)-(\d{1,7})\b")
+
 #: "Revert "subject"" / "Revert: subject" -- git's own revert subject form.
 REVERT_SUBJECT_RE = re.compile(r"^\s*Revert[\s:\"]", re.IGNORECASE)
 
@@ -378,11 +394,50 @@ def extract_jira_key(*candidates: Optional[str],
     for candidate in candidates:
         if not candidate:
             continue
-        for match in JIRA_KEY_RE.finditer(candidate):
+        # An AIO key is not a Jira key and must not be mined for one. Masked
+        # rather than skipped so offsets stay put and the rest of the string is
+        # still read: `IML-TC-5 blocks IML-6500` yields `IML-6500`, not `TC-5`.
+        for match in JIRA_KEY_RE.finditer(_mask_test_keys(candidate)):
             key = match.group(1)
             if allowed is None or key.split("-", 1)[0].upper() in allowed:
                 return key
     return None
+
+
+def _mask_test_keys(text: str) -> str:
+    return AIO_KEY_RE.sub(lambda m: " " * len(m.group(0)), text)
+
+
+def extract_test_keys(*candidates: Optional[str],
+                      projects: Optional[Collection[str]] = None
+                      ) -> Dict[str, Optional[str]]:
+    """First AIO test case and test cycle key found, else Nones.
+
+    Allow-listed on the project prefix by the same rule and for the same reason
+    as `extract_jira_key`: `TC-5` on its own is not evidence of anything, and
+    `SPRINT-CY-3` is only a cycle if `SPRINT` is a project somebody confirmed.
+    AR-1 does not care which key space is being fabricated.
+
+    Returns both keys because they answer different questions -- the case is
+    *what* was automated, the cycle is *when it ran* -- and a string may name
+    either, both or neither.
+    """
+    allowed = {p.upper() for p in projects} if projects is not None else None
+    found: Dict[str, Optional[str]] = {"test_case_key": None,
+                                       "test_cycle_key": None}
+    for candidate in candidates:
+        if not candidate:
+            continue
+        for match in AIO_KEY_RE.finditer(candidate):
+            project, kind, _number = match.groups()
+            if allowed is not None and project.upper() not in allowed:
+                continue
+            field = "test_case_key" if kind == "TC" else "test_cycle_key"
+            if found[field] is None:
+                found[field] = match.group(0)
+        if all(found.values()):
+            break
+    return found
 
 
 _UNVALIDATED_WARNED = False
@@ -1113,7 +1168,21 @@ def make_context(
     branch_name: Optional[str] = None,
     product_profile: Optional[str] = None,
     environment: Optional[str] = None,
+    test_case_key: Optional[str] = None,
+    test_cycle_key: Optional[str] = None,
 ) -> Dict[str, Any]:
+    """The context block. Two of these fields are new on 2026-08-27.
+
+    `test_case_key` and `test_cycle_key` are the AIO TCMS key space, and they
+    are here rather than in `attributes` because they are what an event is
+    *about*, the same way `jira_issue_key` is -- and because `attributes` is
+    per-event-type, while this question is asked of every event alike.
+
+    No schema bump. `collector/main.py:_subset` builds the block from its own
+    declared field list, so a client that does not send these produces NULLs
+    and a client that does is read. An older client stays valid, which matters
+    when the fleet upgrades over a working day rather than at once.
+    """
     return {
         "jira_issue_key": jira_issue_key,
         "jira_project_key": jira_project_key(jira_issue_key),
@@ -1121,6 +1190,8 @@ def make_context(
         "branch_name": branch_name,
         "product_profile": product_profile,
         "environment": environment,
+        "test_case_key": test_case_key,
+        "test_cycle_key": test_cycle_key,
     }
 
 

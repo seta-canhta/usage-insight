@@ -188,11 +188,45 @@ def coverage(objects: List[Dict[str, Any]], roster: List[str],
 
 # --------------------------------------------------------------------------
 
+def read_identities(path: Optional[str]) -> Dict[str, str]:
+    """``email accountId`` per line. Comments and blanks ignored.
+
+    An operator file, like the roster beside it, and for the same reason: a
+    laptop cannot know its own Atlassian accountId -- that is a Jira fact, not
+    a machine one -- so the address it authenticated with has to be turned into
+    one somewhere, and this is the last place the address exists.
+
+    Without it every laptop event keeps `person_id: null` and joins to nothing,
+    which is what was measured on 2026-08-26: 935 laptop events sharing not one
+    id with AIO or Bitbucket, while those two joined to each other perfectly.
+    """
+    found: Dict[str, str] = {}
+    if not path:
+        return found
+    with open(path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.split("#", 1)[0].strip()
+            if not line:
+                continue
+            parts = line.split()
+            if len(parts) >= 2:
+                found[parts[0].strip().lower()] = parts[1].strip()
+    return found
+
+
 def pull_week(endpoint: str, week: str, token: str, inbox: str,
               roster: Optional[List[str]] = None, timeout: int = 60,
-              get=_get) -> Dict[str, Any]:
+              get=_get, identities: Optional[Dict[str, str]] = None
+              ) -> Dict[str, Any]:
     objects = list_week(endpoint, week, token, timeout, get)
     os.makedirs(inbox, exist_ok=True)
+    identities = identities or {}
+    #: bundle file name -> accountId. Written beside the bundles for
+    #: `bundle.py`, and deliberately keyed by file name rather than by address:
+    #: the inbox is the start of the event path and CONTRACT.md §1.1 keeps raw
+    #: addresses out of it.
+    stamped: Dict[str, str] = {}
+    unmapped: set = set()
 
     written, skipped = [], []
     measured: Dict[str, bool] = {}
@@ -215,6 +249,11 @@ def pull_week(endpoint: str, week: str, token: str, inbox: str,
             # again produces `57833cd4-57833cd4-...`.
             name = "{}-{}".format(machine, name)
         path = os.path.join(inbox, name)
+        who = identities.get(_who(obj))
+        if who:
+            stamped[name] = who
+        elif _who(obj):
+            unmapped.add(_who(obj))
         if os.path.exists(path):
             # Keyed by content digest upstream, so the same name is the same
             # bytes. Re-running a pull is cheap and safe, which matters because
@@ -233,13 +272,27 @@ def pull_week(endpoint: str, week: str, token: str, inbox: str,
         if person:
             measured[person] = measured.get(person, False) or bundle_measured(path)
 
+    # Written even when empty, so `bundle.py` can tell "nobody is mapped" from
+    # "this pull predates identities" -- the same measured-zero rule the
+    # manifests follow.
+    if identities:
+        with open(os.path.join(inbox, "_identities.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump(stamped, handle, indent=2, sort_keys=True)
+
     result = {
         "week": week,
         "objects_listed": len(objects),
         "files_written": written,
         "files_already_present": skipped,
         "inbox": inbox,
+        "identified": len(stamped),
     }
+    if unmapped:
+        # Named, not counted. An unmapped person is one whose AI usage will not
+        # join to their test runs, and the fix is one line in the identities
+        # file -- which nobody does for a number.
+        result["unmapped"] = sorted(unmapped)
     if roster is not None:
         result["coverage"] = coverage(objects, roster, measured)
     return result
@@ -249,6 +302,13 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         description="Fetch a week's bundles from the collection endpoint.")
     parser.add_argument("--week", required=True, help="ISO week, e.g. 2026-W34")
+    parser.add_argument("--identities",
+                        help="file of `email accountId` lines. Turns the "
+                             "address the endpoint authenticated into the "
+                             "Atlassian accountId CONTRACT.md 2.1 calls the "
+                             "canonical person key, so laptop events join to "
+                             "AIO runs and pull requests. Without it they "
+                             "join to nothing")
     parser.add_argument("--inbox", required=True,
                         help="directory to write bundles into")
     parser.add_argument("--endpoint", help="collection endpoint "
@@ -272,7 +332,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     roster = read_roster(args.roster) if args.roster else None
     try:
         result = pull_week(endpoint, args.week, token, args.inbox, roster,
-                           args.timeout)
+                           args.timeout,
+                           identities=read_identities(args.identities))
     except PullError as exc:
         raise SystemExit(str(exc))
 

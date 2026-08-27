@@ -181,10 +181,28 @@ def measured(manifest: Dict[str, Any]) -> bool:
                ("repos", "copilot", "vscode", "rtk", "agent"))
 
 
+#: Written by `importers/pull.py` beside the bundles it downloads. Maps a
+#: bundle's file name to the Atlassian accountId of the person the endpoint
+#: authenticated -- never to their address, which CONTRACT.md §1.1 keeps out of
+#: the event path entirely.
+IDENTITIES = "_identities.json"
+
+
+def load_identities(inbox: str) -> Dict[str, str]:
+    try:
+        with open(os.path.join(inbox, IDENTITIES), "r", encoding="utf-8") as handle:
+            found = json.load(handle)
+    except (OSError, ValueError):
+        return {}
+    return {str(k): str(v) for k, v in found.items()
+            if isinstance(v, str) and v.strip()} if isinstance(found, dict) else {}
+
+
 def import_inbox(inbox: str, state: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
     state = state or {}
     seen = set(state.get("event_ids") or [])
     coverage: Dict[str, Dict[str, Any]] = dict(state.get("coverage") or {})
+    identities = load_identities(inbox)
 
     accepted: List[Dict[str, Any]] = []
     rejected: List[Dict[str, str]] = []
@@ -219,12 +237,35 @@ def import_inbox(inbox: str, state: Optional[Dict[str, Any]] = None) -> Dict[str
         if not measured(manifest):
             entry["unmeasured"] += 1
 
+        # Who this bundle came from, as the contract's canonical person key.
+        #
+        # A laptop cannot know its own accountId -- that is a Jira fact, not a
+        # machine one -- so it emits `person_id: null` and a `person_email_hash`
+        # salted with a `uuid4()` generated at `init`. Measured 2026-08-26: that
+        # made every one of 935 laptop events unjoinable to anything. AIO runs,
+        # AIO cases and Bitbucket all key on the same Atlassian ids and join to
+        # each other perfectly; the laptop side shared not one id with any of
+        # them, so "what did this person's AI use produce" had no join to make.
+        #
+        # The endpoint authenticated the upload and therefore knows the address.
+        # `pull.py` turns that into an accountId here, so the address itself
+        # never enters the event path (§1.1) and only the id the contract asks
+        # for arrives.
+        #
+        # Fill, never overwrite: a client that somehow knows better keeps its
+        # answer, and an unmapped person stays NULL rather than being guessed.
+        who = identities.get(name)
+
         for event in kept:
             event_id = event.get("event_id")
             if event_id in seen:
                 duplicates += 1
                 continue
             seen.add(event_id)
+            if who:
+                actor = event.get("actor")
+                if isinstance(actor, dict) and not actor.get("person_id"):
+                    actor["person_id"] = who
             event["ingested_at"] = datetime.now(timezone.utc).strftime(
                 "%Y-%m-%dT%H:%M:%SZ")
             accepted.append(event)

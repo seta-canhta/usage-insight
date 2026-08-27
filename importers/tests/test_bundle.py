@@ -309,3 +309,65 @@ class UnmeasuredCoverageTests(InboxTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestPersonIdentityIsStamped(InboxTestCase):
+    """Laptop events joined to nothing until 2026-08-27.
+
+    Measured that week: 935 laptop events, `person_id` null on every one and
+    `person_email_hash` salted with a `uuid4()` generated at `init` -- so two
+    machines of one person hash differently and the server cannot recompute
+    either. Meanwhile AIO runs, AIO cases and Bitbucket all key on the same
+    Atlassian accountIds and join to each other perfectly. The laptop side
+    shared not one id with any of them.
+
+    A laptop cannot know its own accountId; that is a Jira fact. The endpoint
+    authenticated the upload, so `pull.py` turns the address into an id and
+    leaves it here -- the address itself never enters the event path (§1.1).
+    """
+
+    def _actor(self, person_id=None):
+        return {"person_id": person_id, "person_email_hash": "abc",
+                "team_id": None, "role": None}
+
+    def _laptop_event(self, event_id, person_id=None):
+        found = event(event_id)
+        found["actor"] = self._actor(person_id)
+        return found
+
+    def _identities(self, mapping):
+        with open(self.path(bundle_mod.IDENTITIES), "w", encoding="utf-8") as h:
+            json.dump(mapping, h)
+
+    def test_an_event_gets_the_accountid_of_whoever_uploaded_it(self):
+        make_bundle(self.path("a.ndjson"), [self._laptop_event("evt_1")])
+        self._identities({"a.ndjson": "712020:abc"})
+        result = bundle_mod.import_inbox(self.inbox)
+        self.assertEqual(result["events"][0]["actor"]["person_id"], "712020:abc")
+
+    def test_an_unmapped_bundle_stays_null_rather_than_guessed(self):
+        make_bundle(self.path("a.ndjson"), [self._laptop_event("evt_1")])
+        self._identities({"someone-else.ndjson": "712020:abc"})
+        result = bundle_mod.import_inbox(self.inbox)
+        self.assertIsNone(result["events"][0]["actor"]["person_id"])
+
+    def test_a_client_that_already_knows_is_not_overwritten(self):
+        # Fill, never overwrite. The stamp is the weaker signal of the two.
+        make_bundle(self.path("a.ndjson"),
+                    [self._laptop_event("evt_1", person_id="712020:real")])
+        self._identities({"a.ndjson": "712020:other"})
+        result = bundle_mod.import_inbox(self.inbox)
+        self.assertEqual(result["events"][0]["actor"]["person_id"], "712020:real")
+
+    def test_no_identities_file_is_not_an_error(self):
+        # Every pull that predates this, and every deployment without a map.
+        make_bundle(self.path("a.ndjson"), [self._laptop_event("evt_1")])
+        result = bundle_mod.import_inbox(self.inbox)
+        self.assertIsNone(result["events"][0]["actor"]["person_id"])
+
+    def test_the_identities_file_is_not_imported_as_a_bundle(self):
+        make_bundle(self.path("a.ndjson"), [self._laptop_event("evt_1")])
+        self._identities({"a.ndjson": "712020:abc"})
+        result = bundle_mod.import_inbox(self.inbox)
+        self.assertEqual(len(result["events"]), 1)
+        self.assertEqual(result["rejected"], [])

@@ -40,6 +40,42 @@ scope. The rest are blocked.**
 An earlier draft claimed three were live. Two of those were wrong, which is why
 this file exists separately from the code.
 
+## What nothing could be attributed to, until 2026-08-27
+
+Measured on the W34 export, and the reason several of the rows above say "no
+signal" rather than a number:
+
+| | Measured |
+|---|---|
+| Laptop events carrying a person id | 0 of 935 |
+| Laptop events carrying any ticket | 0 of 935 |
+| Distinct branch names on those laptops | 4, none containing a key |
+| Real prompts naming a ticket | 1 in 5,036 |
+| Key-shaped decoys in those prompts | 234 (`UTF-8`, `SHA-256`, `CVE-2024`, `GPT-4`) |
+| Watchtower branch names naming an AIO test key | 0 of 82 |
+| AIO cases with `has_automation_key` | 0 of 4,512 (4,165 marked "Automated") |
+| AIO runs carrying any context key | 0 of 8,539 |
+| `AI-Run-Id` trailers, i.e. `link.method='explicit'` | 0 of 121 |
+
+AIO runs, AIO cases and Bitbucket all key on the same Atlassian accountIds and
+join to each other perfectly. The laptop side shared **not one id** with any of
+them, so the question "what did this person's AI use produce" had no join to
+make in any direction.
+
+Four of those rows were fixable in code and were fixed: AIO events now carry
+their own case and cycle keys; the extractor can read that key space at all
+(and no longer mines `IML-TC-5` for the false ticket `TC-5`); prompts and PR
+fields are scanned for it; and `importers/pull.py --identities` supplies the
+accountId the endpoint already authenticated. The report's §10 now prints a
+**Joinability** table per surface, so a zero here is visible rather than
+inferred.
+
+Two are not code. Branch names carry no test key and `has_automation_key` is
+unset on the whole estate — until one of those changes, no amount of parsing
+reaches a test case from a laptop, and case-level attribution stays out of
+reach. Person-level and week-level attribution is now possible; case-level is
+not.
+
 ## What blocks the rest
 
 **AI telemetry now arrives, and still has no cost input.** Superseded

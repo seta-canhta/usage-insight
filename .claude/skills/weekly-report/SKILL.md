@@ -112,10 +112,36 @@ python3 -c "import json,sys,collections; print(collections.Counter(
   for l in open(sys.argv[1]) if l.strip()))" reports/<name>/exports/<file>.ndjson
 ```
 
-Real keys are `IML`, `APR`, `AERLABS`. Anything else — month abbreviations
-especially — is fabricated and must be NULLed, with the original kept. AR-1.
+Real keys are `IML`, `APR`, `AERLABS`, `IOTA3`. Anything else — month
+abbreviations especially — is fabricated and must be NULLed, with the original
+kept. AR-1.
 
-## 6. Say what is missing
+**The AIO key space is separate and matters more here.** `IML-TC-5` is a test
+case and `IML-CY-199` a cycle; for a QA team the cycle is the delivery record
+and the pull request is not (CONTRACT.md §3 row 22). They live in
+`context.test_case_key` / `context.test_cycle_key`, not in `jira_issue_key`,
+and `TC-*` or `CY-*` appearing as a *project prefix* is the old bug, not a
+test key — before 2026-08-27 `IML-TC-5` was mined for the false ticket `TC-5`.
+
+## 6. Read the joinability table before quoting any per-person figure
+
+§10 of the report carries a **Joinability** table: for each surface, the share
+of events that name a person, a Jira issue, a test case, a test cycle and a
+repository. Read it first, because it decides which questions the week can
+answer at all.
+
+A surface at **0% on person** cannot be joined to anything: not to the test
+runs that person executed, not to their pull requests. That was the state on
+2026-08-26 — AIO and Bitbucket carried a person on every event and joined to
+each other perfectly, while all 935 laptop events carried none, so no AI usage
+could be attributed to any test, any ticket or anyone. The fix is
+`importers/pull.py --identities`, a file of `email accountId` lines; without it
+laptop events stay unattributed however many arrive.
+
+So: if the laptop surface shows 0% person, do **not** write a per-person
+section. Say the join is missing and name the file that supplies it.
+
+## 7. Say what is missing
 
 End with what could not be measured and why, naming the source. `docs/METRICS.md`
 holds the current status of all ten metrics — one live, one with a caveat, two

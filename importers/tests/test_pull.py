@@ -259,3 +259,42 @@ class MeasuringNothingTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestIdentityMapping(unittest.TestCase):
+    """`email accountId`, the last place the address exists.
+
+    Kept out of the inbox file names deliberately: the inbox is the start of
+    the event path and CONTRACT.md §1.1 keeps raw addresses out of it. What is
+    written beside the bundles is a file-name -> accountId map, so `bundle.py`
+    can stamp the contract's canonical person key without ever seeing an
+    address.
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="pull-id-")
+        self.addCleanup(shutil.rmtree, self.tmp, True)
+
+    def _write(self, text):
+        path = os.path.join(self.tmp, "identities.txt")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
+
+    def test_it_reads_pairs_and_ignores_comments(self):
+        path = self._write(
+            "# who is who\n"
+            "Ngoc.Nguyen@aeris.net   712020:abc\n"
+            "\n"
+            "linh.hoang@aeris.net 712020:def   # her laptop\n")
+        self.assertEqual(pull_mod.read_identities(path), {
+            "ngoc.nguyen@aeris.net": "712020:abc",
+            "linh.hoang@aeris.net": "712020:def",
+        })
+
+    def test_no_file_is_an_empty_map_not_a_failure(self):
+        self.assertEqual(pull_mod.read_identities(None), {})
+
+    def test_a_line_with_no_id_is_skipped_rather_than_half_read(self):
+        self.assertEqual(
+            pull_mod.read_identities(self._write("ngoc.nguyen@aeris.net\n")), {})

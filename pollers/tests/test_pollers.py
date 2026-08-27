@@ -844,6 +844,11 @@ class TestEnvelopeAndRedaction(unittest.TestCase):
                     "branch_name",
                     "product_profile",
                     "environment",
+                    # The AIO TCMS key space. A QA team's delivery record is the
+                    # test cycle, not the pull request (CONTRACT.md §3 row 22),
+                    # and until these existed no event could name one.
+                    "test_case_key",
+                    "test_cycle_key",
                 },
             ),
             (
@@ -2477,3 +2482,92 @@ class TestPollerOutputStaysInsideTheAllowList(unittest.TestCase):
         })
         allowed = collector_main.ATTRIBUTE_ALLOWLIST["ci.pipeline.completed"]
         self.assertEqual(sorted(set(attributes) - allowed), [])
+
+
+class TestAioKeyExtraction(unittest.TestCase):
+    """The AIO TCMS key space, which nothing could read until 2026-08-27.
+
+    For a QA engineer the test cycle is the delivery record and the pull
+    request is not (CONTRACT.md §3 row 22), so `IML-TC-5` is the key that
+    matters most here -- and `JIRA_KEY_RE` could not see it. Worse, it mined
+    the tail: `IML-TC-5` yielded `TC-5` and `IML-CY-199` yielded `CY-199`,
+    which are two of the four fabrications `extract_jira_key`'s own docstring
+    records.
+    """
+
+    REAL = ("IML", "APR", "AERLABS", "IOTA3")
+
+    def test_a_case_key_is_read(self):
+        self.assertEqual(
+            common.extract_test_keys("IML-TC-5", projects=self.REAL)["test_case_key"],
+            "IML-TC-5")
+
+    def test_a_cycle_key_is_read(self):
+        self.assertEqual(
+            common.extract_test_keys("IML-CY-199", projects=self.REAL)["test_cycle_key"],
+            "IML-CY-199")
+
+    def test_both_from_one_sentence(self):
+        found = common.extract_test_keys(
+            "fix the flaky IML-TC-1234 in cycle IML-CY-199", projects=self.REAL)
+        self.assertEqual(found["test_case_key"], "IML-TC-1234")
+        self.assertEqual(found["test_cycle_key"], "IML-CY-199")
+
+    def test_the_allow_list_applies_to_this_key_space_too(self):
+        # AR-1 does not care which vocabulary is being fabricated.
+        self.assertEqual(
+            common.extract_test_keys("NOPE-TC-5", projects=self.REAL),
+            {"test_case_key": None, "test_cycle_key": None})
+
+    def test_a_bare_tc_number_is_not_a_case_key(self):
+        self.assertEqual(
+            common.extract_test_keys("TC-5", projects=self.REAL)["test_case_key"], None)
+
+    def test_an_aio_key_is_no_longer_mined_for_a_false_ticket(self):
+        # The measured fabrication, in both directions: with an allow-list the
+        # tail was rejected, and without one it was returned.
+        self.assertIsNone(common.extract_jira_key("IML-TC-5", projects=self.REAL))
+        self.assertIsNone(common.extract_jira_key("IML-CY-199"))
+        self.assertIsNone(common.extract_jira_key("IML-TC-5"))
+
+    def test_masking_does_not_hide_a_real_ticket_beside_it(self):
+        # Masked rather than skipped, so the rest of the string is still read.
+        self.assertEqual(
+            common.extract_jira_key("IML-TC-5 blocks IML-6500", projects=self.REAL),
+            "IML-6500")
+
+    def test_a_plain_jira_key_is_untouched(self):
+        self.assertEqual(
+            common.extract_jira_key("IML-6500", projects=self.REAL), "IML-6500")
+        self.assertEqual(
+            common.extract_test_keys("IML-6500", projects=self.REAL),
+            {"test_case_key": None, "test_cycle_key": None})
+
+
+class TestAioEventsCarryTheirOwnKeys(unittest.TestCase):
+    """Measured 2026-08-26: `jira_issue_key` NULL on all 8,539 IML runs.
+
+    The AIO poller held the case and cycle keys in local variables and put
+    neither in the context, so metric 7's own events -- the only live metric --
+    joined to nothing at all.
+    """
+
+    def _poller(self):
+        return poll_aio.AioPoller(aio_client(FakeTransport([])), AIO_BASE, "IML")
+
+    def test_a_run_names_its_case_and_cycle(self):
+        poller = self._poller()
+        event = poller.build_event(
+            {"key": "IML-CY-199", "updatedDate": 1787000000000},
+            {"testCase": {"key": "IML-TC-5"},
+             "latestRun": {"ID": 7, "updatedDate": 1787000000000,
+                           "testRunStatus": {"name": "Passed"},
+                           "executedByID": "712020:abc"}})
+        self.assertIsNotNone(event)
+        self.assertEqual(event["context"]["test_case_key"], "IML-TC-5")
+        self.assertEqual(event["context"]["test_cycle_key"], "IML-CY-199")
+
+    def test_an_inventory_row_names_its_case(self):
+        event = self._poller().build_case_event(
+            {"key": "IML-TC-5", "updatedDate": 1787000000000})
+        self.assertEqual(event["context"]["test_case_key"], "IML-TC-5")

@@ -385,7 +385,11 @@ class AioPoller:
             natural_key=(case_key, updated),
             attributes=attributes,
             actor=make_actor(person_id=test_case.get("ownedByID")),
-            context=make_context(),
+            # The case names itself. Read from AIO's own record, not extracted
+            # from a string, so there is nothing here to fabricate -- and until
+            # 2026-08-27 this block was empty on every row, which left 4,512
+            # inventory events that could not be joined to anything at all.
+            context=make_context(test_case_key=case_key),
             agent=make_agent(AGENT_NAME),
             link=make_link("heuristic", 0.0),
         )
@@ -461,6 +465,11 @@ class AioPoller:
             context=make_context(
                 jira_issue_key=None,
                 repo_full_name=None,
+                # Measured 2026-08-26: `jira_issue_key` was NULL on all 8,539
+                # runs in the IML export, so metric 7's own events joined to
+                # nothing. These two are what the run is actually about.
+                test_case_key=case_key,
+                test_cycle_key=cycle.get("key"),
             ),
             agent=make_agent(AGENT_NAME),
             # A test run is observed, never explicitly bound to an agent run.

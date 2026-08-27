@@ -461,6 +461,14 @@ class WeekAggregate:
         self.link_methods: Counter = Counter()
         self.event_types: Counter = Counter()
 
+        #: What each event can be attributed to. Counted per source surface,
+        #: because the answer differs completely between them and an overall
+        #: percentage hides that: measured 2026-08-26, laptop events carried a
+        #: person on 0 of 935 while AIO and Bitbucket carried one on all of
+        #: theirs. Reported in §10 rather than left to be discovered.
+        self.joinable: Counter = Counter()
+        self.by_surface: Counter = Counter()
+
     # -- ingestion ---------------------------------------------------------
 
     def add(self, event: Dict[str, Any]) -> None:
@@ -472,6 +480,17 @@ class WeekAggregate:
 
         self.event_types[kind] += 1
         self.link_methods[((event.get("link") or {}).get("method") or "unknown")] += 1
+
+        surface = agent.get("surface") or "unknown"
+        self.by_surface[surface] += 1
+        for field, present in (
+                ("person", bool(actor.get("person_id"))),
+                ("jira issue", bool(context.get("jira_issue_key"))),
+                ("test case", bool(context.get("test_case_key"))),
+                ("test cycle", bool(context.get("test_cycle_key"))),
+                ("repository", bool(context.get("repo_full_name")))):
+            if present:
+                self.joinable[(surface, field)] += 1
 
         if actor.get("person_id") or actor.get("person_email_hash"):
             self.people.add(actor.get("person_id") or actor.get("person_email_hash"))
@@ -1631,6 +1650,35 @@ def render_markdown(
             f"| excluded from the gate pass rate |")
         add(f"| Sessions with no context recorded | {current.context_unknown} "
             f"| multi-model; excluded from the §6 context levels |")
+        add("")
+
+    # Joinability. The question this answers is not "is the data clean" but
+    # "can any of it be attributed to anything", and for a QA team the columns
+    # that matter are the test case and the person -- the cycle is the delivery
+    # record, not the pull request (CONTRACT.md §3 row 22).
+    #
+    # Reported per surface because an overall figure conceals the only finding
+    # worth having. Measured 2026-08-26: AIO and Bitbucket carried a person on
+    # every event and joined to each other perfectly; the laptop events carried
+    # one on none of 935, so no AI usage could be attributed to any test, any
+    # ticket or anyone.
+    if current.by_surface:
+        add("**Joinability — what these events can be attributed to**")
+        add("")
+        add("| Surface | Events | Person | Jira issue | Test case | Test cycle | Repository |")
+        add("|---|---:|---:|---:|---:|---:|---:|")
+        for surface, total in current.by_surface.most_common():
+            cells = " | ".join(
+                fmt_pct(ratio(current.joinable.get((surface, field), 0), total, 1))
+                for field in ("person", "jira issue", "test case",
+                              "test cycle", "repository"))
+            add(f"| `{surface}` | {total:,} | {cells} |")
+        add("")
+        add("> A surface at 0% on **person** cannot be joined to anything else "
+            "in this report: not to the test runs that person executed, not to "
+            "their pull requests. `importers/pull.py --identities` is what "
+            "supplies it, and without that file laptop events stay unattributed "
+            "however much of them arrives.")
         add("")
 
     missing = [

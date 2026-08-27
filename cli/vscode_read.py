@@ -227,15 +227,40 @@ def scan_for_key(request: Dict[str, Any],
     gave nothing -- see CONTRACT.md §2.4, and note that `heuristic` rows are
     already barred from the cost metrics.
     """
+    return scan_for_keys(request, projects)["jira_issue_key"]
+
+
+def scan_for_keys(request: Dict[str, Any],
+                  projects: Collection[str]) -> Dict[str, Optional[str]]:
+    """Every key the prompt names -- Jira issue, AIO test case, AIO test cycle.
+
+    The AIO pair is here because for a QA engineer that is the work unit: the
+    test cycle is the delivery record and the pull request is not (CONTRACT.md
+    §3 row 22). Reading only Jira meant a prompt saying "fix the flaky
+    IML-TC-1234" named exactly the thing it was about, and we threw it away --
+    and worse, `JIRA_KEY_RE` mined the tail of it and offered `TC-1234`, which
+    is the fabrication `extract_jira_key`'s docstring already records.
+
+    Everything `scan_for_key` says about the allow-list applies unchanged, and
+    applies to the AIO prefixes too. The prompt is read and discarded; what
+    survives is at most three keys, each matching a project somebody confirmed.
+    """
+    blank: Dict[str, Optional[str]] = {"jira_issue_key": None,
+                                       "test_case_key": None,
+                                       "test_cycle_key": None}
     if not projects:
-        return None
+        return blank
     for path in SCAN:
         text = dig(request, path)
-        if isinstance(text, str) and text:
-            key = common.extract_jira_key(text, projects=projects)
-            if key:
-                return key
-    return None
+        if not isinstance(text, str) or not text:
+            continue
+        found = dict(blank)
+        found["jira_issue_key"] = common.extract_jira_key(
+            text, projects=projects)
+        found.update(common.extract_test_keys(text, projects=projects))
+        if any(found.values()):
+            return found
+    return blank
 
 
 def stamp(epoch_ms: Any) -> Optional[str]:
@@ -611,16 +636,19 @@ def session_events(path: str, session_id: str,
     #: One entry per distinct branch this session touched. A session is
     #: normally held on one, so this is normally one build; a session that
     #: spanned a checkout gets the right answer on both sides of it.
-    built: Dict[Optional[str], Tuple[Dict[str, Any], Optional[str]]] = {}
+    built: Dict[Optional[str], Tuple[Dict[str, Any], bool]] = {}
 
-    def for_branch(name: Optional[str]) -> Tuple[Dict[str, Any], Optional[str]]:
+    def for_branch(name: Optional[str]) -> Tuple[Dict[str, Any], bool]:
         if name not in built:
-            key = common.extract_jira_key(name, projects=projects)
+            keys = common.extract_test_keys(name, projects=projects)
+            keys["jira_issue_key"] = common.extract_jira_key(
+                name, projects=projects)
             built[name] = (common.make_context(
-                jira_issue_key=key, repo_full_name=repo, branch_name=name), key)
+                repo_full_name=repo, branch_name=name, **keys),
+                any(keys.values()))
         return built[name]
 
-    context, branch_key = for_branch(branch)
+    context, branch_named_something = for_branch(branch)
     agent = common.make_agent("copilot.chat", surface=SURFACE)
     # The journal reader nulls this for the same reason: the agent's version is
     # not something the surface records, and the poller's own version number
@@ -669,24 +697,25 @@ def session_events(path: str, session_id: str,
         # than of the working tree. `branch_at` returns None for a session
         # older than the reflog, and None is the answer -- see its docstring.
         if history is not None:
-            here, here_key = for_branch(branch_at(history, when))
+            here, here_named = for_branch(branch_at(history, when))
         else:
-            here, here_key = context, branch_key
+            here, here_named = context, branch_named_something
 
         # The branch wins where it has an answer, and the prompt is consulted
         # only where it does not. So this can turn a null into a key and can
         # never overwrite one -- no figure that exists today moves because of
         # it, which is the only safe way to introduce a weaker signal.
-        if here_key:
+        if here_named:
             current["context"], current["confidence"] = here, 0.9
         else:
-            prompt_key = scan_for_key(request, projects)
+            named = scan_for_keys(request, projects)
+            told = any(named.values())
             current["context"] = common.make_context(
-                jira_issue_key=prompt_key,
                 repo_full_name=repo,
                 branch_name=here.get("branch_name"),
-            ) if prompt_key else here
-            current["confidence"] = 0.5 if prompt_key else 0.9
+                **named
+            ) if told else here
+            current["confidence"] = 0.5 if told else 0.9
 
         # -- the human turn -------------------------------------------------
         # `chars` is deliberately NOT taken. It would require measuring the

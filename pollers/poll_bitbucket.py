@@ -60,6 +60,7 @@ from common import (  # noqa: E402
     deterministic_id,
     email_from_raw_author,
     extract_jira_key,
+    extract_test_keys,
     fail,
     has_ai_commit_marker,
     has_ai_pr_title_marker,
@@ -764,15 +765,24 @@ class BitbucketPoller:
         destination = (
             ((pull_request.get("destination") or {}).get("branch") or {})
             .get("name") or None)
-        jira_key = extract_jira_key(
-            branch, pull_request.get("title"),
-            pull_request.get("description"), destination,
-            projects=validated_projects(self.config.jira_project_keys))
+        allowed = validated_projects(self.config.jira_project_keys)
+        fields = (branch, pull_request.get("title"),
+                  pull_request.get("description"), destination)
+        jira_key = extract_jira_key(*fields, projects=allowed)
+        # The same four fields, read for the other key space. A QA repository's
+        # pull requests are automation scripts, and the thing an automation
+        # script is *about* is a test case -- so a PR that says "automates
+        # IML-TC-1234" is naming its own subject in the one vocabulary that
+        # reaches metric 2. Before 2026-08-27 that sentence produced nothing,
+        # and `IML-TC-1234` was additionally mined for the false ticket
+        # `TC-1234`.
+        test_keys = extract_test_keys(*fields, projects=allowed)
         return (
             make_context(
                 jira_issue_key=jira_key,
                 repo_full_name=self.repo_full_name,
                 branch_name=branch,
+                **test_keys,
             ),
             jira_key,
         )

@@ -40,7 +40,10 @@ already prevented a wrong number from shipping.
 
 - **Never synthesise a join key** (AR-1). Measured: `extract_jira_key` invented
   `AUG-25` (a date) from `fix/AUG-25`; fabricated keys outnumbered real ones
-  14 to 5. Always pass `projects=` — real keys here are `IML`, `APR`, `AERLABS`.
+  14 to 5. Always pass `projects=` — real keys here are `IML`, `APR`, `AERLABS`,
+  `IOTA3`. The AIO test key space (`IML-TC-5`, `IML-CY-199`) is separate and
+  is read by `extract_test_keys`; it lands in `context.test_case_key` /
+  `context.test_cycle_key`, never in `jira_issue_key`.
 - **Absent is never zero.** An unmeasured quantity and a measured zero must not
   render the same. VS Code stores no token counts, so those fields are NULL
   forever, not 0.

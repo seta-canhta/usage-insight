@@ -299,6 +299,10 @@ ACTOR_FIELDS = ("person_id", "person_email_hash", "team_id", "role")
 CONTEXT_FIELDS = (
     "jira_issue_key", "jira_project_key", "repo_full_name", "branch_name",
     "product_profile", "environment",
+    # The AIO TCMS key space, added 2026-08-27. `_subset` fills from this list,
+    # so a client that predates them yields NULLs rather than failing -- which
+    # is what lets the fleet upgrade over a working day instead of at once.
+    "test_case_key", "test_cycle_key",
 )
 AGENT_FIELDS = (
     "agent_name", "agent_version", "skill_name", "skill_version", "surface",

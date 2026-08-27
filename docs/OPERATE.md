@@ -159,7 +159,8 @@ Schedule: Bitbucket hourly, Jira and AIO nightly.
 
 ```bash
 export INSIGHT_ADMIN_TOKEN=...
-python3 importers/pull.py --week 2026-W34 --inbox inbox/ --roster roster.txt
+python3 importers/pull.py --week 2026-W34 --inbox inbox/ --roster roster.txt \
+  --identities identities.txt
 python3 importers/bundle.py --inbox inbox/ --out events.ndjson \
   --state state/bundles.json
 python3 importers/watch.py --roster roster.txt      # hourly, next to the endpoint
@@ -171,6 +172,37 @@ names who did not report; read that line before the numbers.
 
 `pull` stops at `inbox/`. `bundle.py` is what parses, checksums, re-checks the
 allow-list and dedupes.
+
+### `--identities` — without it, laptop events join to nothing
+
+`identities.txt` is one `email accountId` line per person, `#` for comments:
+
+```
+ngoc.nguyen@aeris.net   712020:198a0913-d658-4d93-9e9d-1b9747429f1b
+linh.hoang@aeris.net    712020:28cc987e-5263-4564-83c6-7f76fa32574e
+```
+
+A laptop cannot know its own Atlassian accountId — that is a Jira fact, not a
+machine one — so it emits `person_id: null` and a `person_email_hash` salted
+with a `uuid4()` generated at `init`, which is deliberately unlinkable and
+therefore useless as a join key. CONTRACT.md §2.1 makes the accountId the
+canonical person key, and the endpoint is the only party that knows who
+uploaded a bundle, so `pull.py` is where the address becomes an id.
+
+The address itself never enters the event path (§1.1). `pull.py` writes
+`inbox/_identities.json`, which maps *file name* to accountId, and
+`bundle.py` stamps `actor.person_id` from it — filling a null, never
+overwriting a value the client supplied.
+
+Measured 2026-08-26 without it: 935 laptop events, `person_id` null on every
+one, while AIO runs, AIO cases and Bitbucket all keyed on the same accountIds
+and joined to each other perfectly. No AI usage could be attributed to any test
+run, any pull request or anyone. `pull.py` now names the addresses it could not
+map in its `unmapped` output — named rather than counted, because the fix is
+one line in this file and nobody adds a line for a number.
+
+Get an accountId from Jira: profile URL, or the admin user list. Where a person
+has no entry, their events stay NULL rather than being guessed.
 
 ## 4. Report
 

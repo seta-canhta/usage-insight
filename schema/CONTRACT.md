@@ -79,6 +79,28 @@ Every event is one JSON object with exactly these top-level keys.
 | `branch_name` | string\|null | ✓ | |
 | `product_profile` | string\|null | ✓ | `watchtower` `automotive` … |
 | `environment` | enum\|null | ✓ | `dev` `sit` `pre` `prd` `local` |
+| `test_case_key` | string\|null | ✓ | AIO TCMS case, e.g. `IML-TC-5`. **Added 2026-08-27** |
+| `test_cycle_key` | string\|null | ✓ | AIO TCMS cycle, e.g. `IML-CY-199`. **Added 2026-08-27** |
+
+**On the two AIO fields.** They are context, not attributes, because they say
+what an event is *about* — the same job `jira_issue_key` does — and because
+`attributes` is per-event-type while this question is asked of every event
+alike. For a QA team this is the more important key space of the two: the test
+cycle is the delivery record and the pull request is not (§3 row 22).
+
+Nothing could read them before 2026-08-27. `JIRA_KEY_RE` is
+`\b([A-Z][A-Z0-9]+-\d+)\b`, which needs digits straight after one dash, so
+`IML-TC-5` did not match — and its *tail* did, offering the false ticket
+`TC-5`. That is two of the four fabrications recorded against
+`extract_jira_key`: `TC-12018` and `CY-199`. AIO keys are now masked before the
+Jira scan, so an unconfigured reader cannot mint one either. The allow-list
+applies to the project prefix here by the same rule: `NOPE-TC-5` yields
+nothing. AR-1 does not care which vocabulary is being fabricated.
+
+**No schema bump.** `collector/main.py:_subset` builds the context block from
+its own declared field list, so a client that predates these fields yields
+NULLs and one that carries them is read. An older client stays valid — which is
+what lets a fleet upgrade over a working day rather than all at once.
 
 ### 2.3 `agent`
 
