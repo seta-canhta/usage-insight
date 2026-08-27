@@ -48,6 +48,7 @@ for _p in (os.path.join(_ROOT, "cli"), _HERE):
         sys.path.insert(0, _p)
 
 import identity  # noqa: E402  -- the client's own whitelist rules, not a copy
+import dashboard as dashboard_mod  # noqa: E402
 import registry as registry_mod  # noqa: E402
 import store as store_mod  # noqa: E402
 
@@ -318,6 +319,14 @@ class Handler(BaseHTTPRequestHandler):
     install_script: Optional[bytes] = None
     #: ``/install.json``, derived from it at startup. Same fixed-bytes rule.
     install_manifest: Optional[bytes] = None
+    #: The daybook -- ``server/dashboard.py``. All four are None when no
+    #: passcode is configured, and then every ``/dashboard`` path 404s: a
+    #: deployment that has not asked for a browser page does not grow one.
+    sessions: Any = None
+    attendance: Any = None
+    activity: Any = None
+    daybook_page: Optional[bytes] = None
+    tz_label: str = dashboard_mod.DEFAULT_TZ_OFFSET
 
     # -- plumbing ---------------------------------------------------------
 
@@ -447,6 +456,11 @@ class Handler(BaseHTTPRequestHandler):
     def do_POST(self) -> None:     # noqa: N802
         try:
             path = urlparse(self.path).path
+            if path.startswith("/dashboard/"):
+                if not self.read_routes:
+                    raise Rejected(404, "no such route")
+                self._daybook_post(path)
+                return
             if path == "/v1/enroll":
                 self._enroll()
                 return
@@ -692,6 +706,15 @@ class Handler(BaseHTTPRequestHandler):
                 # that does not serve these does not need to admit they exist.
                 raise Rejected(404, "no such route")
 
+            # The daybook authenticates with a passcode and a cookie, not the
+            # admin token, so its dispatch has to come before the token check.
+            # It is reachable only from here -- this listener is the loopback
+            # one -- which is what makes a six-digit passcode a defensible
+            # credential rather than a careless one.
+            if parsed.path == "/dashboard" or parsed.path.startswith("/dashboard/"):
+                self._daybook_get(parsed)
+                return
+
             self._require_admin()
 
             if parsed.path == "/v1/people":
@@ -745,6 +768,160 @@ class Handler(BaseHTTPRequestHandler):
             log.exception("unhandled error on GET")
             self._send(500, {"error": "internal error"})
 
+    # -- the daybook ------------------------------------------------------
+
+    def _daybook_ready(self) -> None:
+        """404 unless a passcode was configured. Never 403.
+
+        The same shape as the read-routes guard above and the install script
+        below it: a deployment that does not serve this does not admit the
+        route exists, so nothing is learned by asking.
+        """
+        if not (self.sessions and self.sessions.enabled and self.daybook_page):
+            raise Rejected(404, "no such route")
+
+    def _cookie(self) -> Optional[str]:
+        raw = self.headers.get("Cookie") or ""
+        for part in raw.split(";"):
+            name, _, value = part.strip().partition("=")
+            if name == dashboard_mod.COOKIE:
+                return value
+        return None
+
+    def _require_session(self) -> None:
+        if not self.sessions.valid(self._cookie()):
+            raise Rejected(401, "sign in")
+
+    def _send_json_cookie(self, status: int, payload: Dict[str, Any],
+                          cookie: Optional[str]) -> None:
+        """``_send``, plus a session cookie. HttpOnly and SameSite=Strict.
+
+        No ``Secure``: this listener is loopback and reached over an SSH
+        tunnel, so the browser sees ``http://127.0.0.1`` and would drop a
+        Secure cookie on the floor -- which would look exactly like a passcode
+        that does not work. The transport is the tunnel, not TLS.
+        """
+        body = json.dumps(payload, sort_keys=True).encode("utf-8")
+        self.send_response(status)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", "no-store")
+        if cookie is not None:
+            self.send_header("Set-Cookie", cookie)
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _who(self) -> str:
+        return self.client_address[0] if self.client_address else "?"
+
+    def _daybook_get(self, parsed: Any) -> None:
+        self._daybook_ready()
+
+        if parsed.path == "/dashboard":
+            # Fixed bytes read at startup, and no data in them: the page is the
+            # same for a signed-in operator and for somebody who has only
+            # reached the prompt. Everything worth protecting arrives over
+            # /dashboard/data, which needs the cookie.
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(self.daybook_page)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(self.daybook_page)
+            return
+
+        if parsed.path == "/dashboard/session":
+            self._send(200, {"signed_in": self.sessions.valid(self._cookie())})
+            return
+
+        if parsed.path == "/dashboard/data":
+            self._require_session()
+            query = parse_qs(parsed.query)
+            start = (query.get("from") or [""])[0]
+            end = (query.get("to") or [""])[0]
+            if not start or not end:
+                raise Rejected(400, "from and to are required")
+            try:
+                payload = dashboard_mod.build_payload(
+                    self.people, self.attendance, self.activity,
+                    start, end, self.tz_label)
+            except dashboard_mod.DashboardError as exc:
+                raise Rejected(400, str(exc))
+            except ValueError:
+                raise Rejected(400, "from and to must look like 2026-08-27")
+            self._send(200, payload)
+            return
+
+        raise Rejected(404, "no such route")
+
+    def _daybook_post(self, path: str) -> None:
+        self._daybook_ready()
+        payload = self._json_body()
+
+        if path == "/dashboard/login":
+            wait = self.sessions.locked_for(self._who())
+            if wait:
+                log.info(json.dumps({"event": "daybook_locked",
+                                     "retry_after": wait}, sort_keys=True))
+                self._send(429, {"error": "too many attempts",
+                                 "retry_after": wait})
+                return
+            given = str(payload.get("passcode") or "")
+            if not self.sessions.attempt(given, self._who()):
+                # Never says whether the passcode was close, long, or short.
+                log.info(json.dumps({"event": "daybook_refused"}, sort_keys=True))
+                self._send(401, {"error": "wrong passcode"})
+                return
+            log.info(json.dumps({"event": "daybook_opened"}, sort_keys=True))
+            self._send_json_cookie(200, {"signed_in": True}, _cookie_line(
+                self.sessions.issue(), dashboard_mod.SESSION_SECONDS))
+            return
+
+        if path == "/dashboard/logout":
+            self._send_json_cookie(200, {"signed_in": False},
+                                   _cookie_line("", 0))
+            return
+
+        if path == "/dashboard/day":
+            self._require_session()
+            email = str(payload.get("email") or "")
+            known = {row["email"] for row in self.people.people()}
+            if email.strip().lower() not in known:
+                # Only people the endpoint already knows. Otherwise the daybook
+                # becomes a second, quieter roster that nothing else reads.
+                raise Rejected(400, "not on the roster or the whitelist")
+            state = payload.get("state")
+            if state is not None:
+                state = str(state)
+            try:
+                row = self.attendance.set(
+                    email, str(payload.get("date") or ""), state,
+                    str(payload.get("in") or ""), str(payload.get("out") or ""))
+            except dashboard_mod.DashboardError as exc:
+                raise Rejected(400, str(exc))
+            log.info(json.dumps({"event": "attendance_set", "person": email,
+                                 "date": payload.get("date"),
+                                 "state": state}, sort_keys=True))
+            self._send(200, {"email": email, "date": payload.get("date"),
+                             "record": row})
+            return
+
+        raise Rejected(404, "no such route")
+
+    def _json_body(self) -> Dict[str, Any]:
+        body = self._read_body()
+        if not body:
+            return {}
+        try:
+            parsed = json.loads(body.decode("utf-8"))
+        except (ValueError, UnicodeDecodeError):
+            raise Rejected(400, "body is not JSON")
+        if not isinstance(parsed, dict):
+            raise Rejected(400, "body is not a JSON object")
+        return parsed
+
     def _reject(self, exc: Rejected) -> None:
         log.info(json.dumps({"event": "rejected", "status": exc.status,
                              "detail": exc.message}, sort_keys=True))
@@ -765,6 +942,12 @@ class Handler(BaseHTTPRequestHandler):
         """
         parts = key.split("/")
         return self.people.email_for_person_key(parts[2]) if len(parts) > 2 else None
+
+
+def _cookie_line(token: str, max_age: int) -> str:
+    """The session cookie. ``max_age=0`` is how signing out is spelled."""
+    return ("{}={}; Path=/dashboard; Max-Age={}; HttpOnly; SameSite=Strict"
+            .format(dashboard_mod.COOKIE, token, max_age))
 
 
 def _machine_from(key: str) -> str:
@@ -804,12 +987,13 @@ def _now() -> str:
 def build_handler(store: Any, people: Any,
                   admin_token: str, read_routes: bool = True,
                   install_script: Optional[bytes] = None,
-                  manifest: Optional[bytes] = None) -> type:
+                  manifest: Optional[bytes] = None,
+                  daybook: Optional[Dict[str, Any]] = None) -> type:
     if isinstance(people, dict):
         # A plain whitelist still works, for a deployment with no files to
         # write to and no enrolment. It just cannot grow by itself.
         people = registry_mod.Registry(allowed=people)
-    return type("BoundHandler", (Handler,), {
+    bound = {
         "store": store,
         "people": people,
         "admin_token": admin_token,
@@ -817,7 +1001,13 @@ def build_handler(store: Any, people: Any,
         "install_script": install_script,
         "install_manifest": manifest if manifest is not None
         else install_manifest(install_script),
-    })
+    }
+    # Absent means every /dashboard path 404s, which is what an existing
+    # deployment gets until somebody sets a passcode. The upload-only listener
+    # is never given this dict at all -- belt as well as the read_routes
+    # braces, because the page is the whole team on one screen.
+    bound.update(daybook or {})
+    return type("BoundHandler", (Handler,), bound)
 
 
 def main(argv: Optional[List[str]] = None) -> int:
@@ -855,6 +1045,25 @@ def main(argv: Optional[List[str]] = None) -> int:
                         default=os.environ.get("INSIGHT_INSTALL_SCRIPT"),
                         help="the install.sh served at GET /install. Read once "
                              "at startup; unset means that route 404s")
+    parser.add_argument("--attendance-file",
+                        default=os.environ.get("INSIGHT_ATTENDANCE_FILE"),
+                        help="the daybook's attendance file: <email> <date> "
+                             "<in|out|off> <in> <out>, tab separated. Written "
+                             "by the page, editable by hand, re-read on change")
+    parser.add_argument("--dashboard-password-file",
+                        default=os.environ.get("INSIGHT_DASHBOARD_PASSWORD_FILE"),
+                        help="file holding the daybook passcode, instead of "
+                             "the environment where `docker inspect` shows it. "
+                             "No passcode anywhere means /dashboard 404s")
+    parser.add_argument("--dashboard-page",
+                        default=os.environ.get("INSIGHT_DASHBOARD_PAGE"),
+                        help="the daybook's HTML, read once at startup. "
+                             "Defaults to server/assets/dashboard.html")
+    parser.add_argument("--tz-offset",
+                        default=os.environ.get("INSIGHT_TZ_OFFSET",
+                                               dashboard_mod.DEFAULT_TZ_OFFSET),
+                        help="which day an event belongs to. Event times are "
+                             "UTC and a working day is not (default +07:00)")
     parser.add_argument("--admin-token-file",
                         default=os.environ.get("INSIGHT_ADMIN_TOKEN_FILE"),
                         help="file holding the admin token, instead of putting "
@@ -895,6 +1104,34 @@ def main(argv: Optional[List[str]] = None) -> int:
     except store_mod.StoreError as exc:
         raise SystemExit(str(exc))
 
+    # The daybook. Opt-in, and the passcode is the switch: without one the
+    # routes do not exist, so a redeploy of an endpoint nobody asked this of
+    # behaves exactly as it did.
+    daybook = None
+    passcode = dashboard_mod.read_passcode(
+        os.environ.get("INSIGHT_DASHBOARD_PASSWORD"),
+        args.dashboard_password_file)
+    if passcode:
+        try:
+            tz = dashboard_mod.parse_offset(args.tz_offset)
+        except dashboard_mod.DashboardError as exc:
+            raise SystemExit(str(exc))
+        if not args.attendance_file:
+            # Refused at startup rather than at the first click. A page whose
+            # only writable half silently does nothing is worse than one that
+            # was never served.
+            raise SystemExit(
+                "a daybook passcode is set but no --attendance-file -- the "
+                "page would render and refuse every entry. Point it at the "
+                "writable registry mount, beside roster.txt")
+        daybook = {
+            "sessions": dashboard_mod.Sessions(passcode),
+            "attendance": dashboard_mod.Attendance(args.attendance_file),
+            "activity": dashboard_mod.ActivityIndex(store, tz),
+            "daybook_page": dashboard_mod.load_page(args.dashboard_page),
+            "tz_label": args.tz_offset,
+        }
+
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         log.warning(json.dumps({
             "event": "public_bind", "host": args.host,
@@ -903,11 +1140,12 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     server = ThreadingHTTPServer((args.host, args.port), build_handler(
         store, people, admin_token, install_script=install_script,
-        manifest=manifest))
+        manifest=manifest, daybook=daybook))
     log.info(json.dumps({"event": "listening", "host": args.host,
                          "port": args.port, "store": args.store,
                          "people": people.count(),
                          "install_script": bool(install_script),
+                         "daybook": bool(daybook),
                          "serving_version": json.loads(manifest)["version"]
                          if manifest else None},
                         sort_keys=True))

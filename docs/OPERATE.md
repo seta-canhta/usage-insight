@@ -115,6 +115,67 @@ route, and re-running it *is* the upgrade: the archive is versioned, the swap
 is atomic, it rolls back if the new one fails its own smoke test, and the
 config, machine id, salt and upload secret are untouched.
 
+## 1b. The daybook
+
+A browser page on the endpoint's **read** listener: today's attendance for
+every person, and one contribution calendar per person for the AI activity
+already in the bucket. Opt-in — with no passcode set the routes do not exist,
+so an endpoint nobody has asked this of is untouched by a redeploy.
+
+**It is not one of the ten metrics.** Attendance is typed in by hand, so it is
+self-reported and must never be counted into a figure (`CLAUDE.md`). What it is
+for is the denominator: telemetry cannot tell a day off from a day somebody
+worked without AI, and the page puts the two side by side so the difference is
+visible.
+
+Turn it on:
+
+```bash
+printf '981022\n' | sudo tee /etc/insight/daybook.passcode
+sudo chmod 600 /etc/insight/daybook.passcode
+# in the compose .env, beside INSIGHT_INSTALL_SCRIPT:
+INSIGHT_DASHBOARD_PASSWORD_FILE=/etc/insight/daybook.passcode
+docker compose up -d
+```
+
+`INSIGHT_ATTENDANCE_FILE` defaults to `/var/lib/insight-registry/attendance.tsv`
+in `compose.yaml` — the **writable** mount, beside `roster.txt` and never beside
+the admin token, because the page writes it. A passcode with no attendance file
+stops the process at startup rather than serving a page that refuses every
+entry.
+
+Reach it over the tunnel that already exists for `pull`:
+
+```bash
+ssh -L 8479:127.0.0.1:8479 <host>
+open http://127.0.0.1:8479/dashboard
+```
+
+**Why loopback only.** A passcode is a weaker credential than
+`INSIGHT_ADMIN_TOKEN`, and this page lists every engineer on one screen. It is
+served on port 8479 and never on 8480, so it is not reachable from the internet
+even if the gateway forwards every path. Eight wrong passcodes from one address
+locks that address out for a minute; sessions are signed with a key minted per
+process, so a restart signs everyone out.
+
+The attendance file is tab separated and meant to be edited by hand:
+
+```
+ngoc.nguyen@aeris.net	2026-08-27	out	09:12	18:40
+linh.hoang@aeris.net	2026-08-27	off
+```
+
+It is re-read when it changes, so an edit needs no restart. `in` is arrived and
+still here, `out` is arrived and left, `off` is not working — and **no line at
+all** is the fourth state, "nobody has said", which the page draws as a hole
+rather than as a zero. Clearing a day removes the line; it does not write `off`.
+
+The calendars read bundles straight out of the store and cache what they parse
+by object key, which never needs invalidating because keys are content digests
+and the store is write-once. A cold process reads up to 96 bundles per request
+and the page says how many are still queued rather than quietly serving a short
+answer.
+
 ## 2. Pollers
 
 Credentials come from the environment; a `.env` in any parent directory is a

@@ -31,7 +31,12 @@ RUN python -m pip install --no-cache-dir -r /app/server/requirements.txt
 # Every server/*.py the process imports has to be named here. A module added to
 # server/ and not to this line is a container that starts, passes its health
 # check, and fails on the first request that reaches the missing import.
-COPY server/proxy.py server/store.py server/registry.py /app/server/
+COPY server/proxy.py server/store.py server/registry.py server/dashboard.py /app/server/
+# The daybook page: markup, style and script in one file, read once at
+# startup and served as fixed bytes. One file because three would be
+# three routes; in the image because a page that ships separately from
+# the process that serves it is a page that will one day not ship.
+COPY server/assets/dashboard.html /app/server/assets/dashboard.html
 COPY cli/identity.py /app/cli/identity.py
 
 # The watchdog, which runs from this same image with a different entrypoint

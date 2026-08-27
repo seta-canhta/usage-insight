@@ -65,6 +65,19 @@ services:
       # defines a project, and it must not sit beside the admin token.
       INSIGHT_PROJECTS_FILE: /var/lib/insight-registry/projects.env
       INSIGHT_ADMIN_TOKEN_FILE: /etc/insight/admin.token
+      # The daybook -- presence typed in by hand beside each person's activity
+      # calendar. Empty by default and therefore not served, for the same
+      # reason as the installer below: a redeploy must not start failing on a
+      # feature nobody asked for yet. Set INSIGHT_DASHBOARD_PASSWORD_FILE in
+      # `.env` and drop the passcode next to admin.token to turn it on.
+      #
+      # The page is only ever on port 8479 -- the read listener, which is not
+      # published -- because it lists every engineer on one screen.
+      INSIGHT_DASHBOARD_PASSWORD_FILE: "${INSIGHT_DASHBOARD_PASSWORD_FILE-}"
+      # Written by the page, so it belongs in the writable mount beside the
+      # roster and never beside the admin token.
+      INSIGHT_ATTENDANCE_FILE: /var/lib/insight-registry/attendance.tsv
+      INSIGHT_TZ_OFFSET: "${INSIGHT_TZ_OFFSET:-+07:00}"
       # The installer served at GET /install, so onboarding is one curl instead
       # of a git clone. Copy the install.sh from the release into ./etc beside
       # the other two files -- it is the same read-only mount, and it holds the

@@ -1,0 +1,714 @@
+<!doctype html>
+<html lang="en" data-state="loading">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex, nofollow">
+<title>Daybook</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' rx='3' fill='%23216E39'/%3E%3Cpath d='M4 5h8M4 8h8M4 11h5' stroke='%23fff' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" referrerpolicy="no-referrer"
+      href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&family=IBM+Plex+Sans:wght@400;500;600&display=swap">
+<style>
+:root {
+  --page:   #FFFFFF;
+  --panel:  #F6F8FA;
+  --rule:   #D8DEE4;
+  --rule-2: #EAEEF2;
+  --ink:    #1F2328;
+  --muted:  #59636E;
+  --faint:  #8C959F;
+  --green:  #1F883D;
+  --flag:   #CF222E;
+
+  /* Absolute and identical for everyone: a per-person quantile ramp would make
+     the same colour mean a different thing on the row below. Tuned to this
+     team's volume (a busy day here is ~40 events), not to GitHub's commits. */
+  --a0: #E3E7EB;   /* measured, and it was zero */
+  --a1: #9BE9A8;
+  --a2: #40C463;
+  --a3: #30A14E;
+  --a4: #216E39;
+  --nil: #C3CBD3;  /* the dot that means nobody was looking */
+
+  --cell: 16px;
+  --gap: 4px;
+  --daycol: 28px;
+  --strip: 6px;
+
+  --sans: "IBM Plex Sans", -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+* { box-sizing: border-box; }
+html, body { margin: 0; padding: 0; background: var(--page); color: var(--ink); }
+body { font-family: var(--sans); font-size: 13px; line-height: 1.5; -webkit-font-smoothing: antialiased; }
+:focus-visible { outline: 2px solid var(--green); outline-offset: 2px; border-radius: 3px; }
+button { font: inherit; color: inherit; background: none; border: none; cursor: pointer; }
+input { font: inherit; color: inherit; }
+
+.wrap { max-width: 1240px; margin: 0 auto; padding: 0 32px; }
+
+/* --- sign in ------------------------------------------------------------ */
+
+.gate { min-height: 100vh; display: grid; place-items: center; padding: 32px 20px; }
+html[data-state="in"] .gate { display: none; }
+html[data-state="loading"] .gate { visibility: hidden; }
+
+.gate-card { width: min(320px, 100%); border: 1px solid var(--rule); border-radius: 8px; padding: 24px; }
+.gate-card h1 { font-size: 18px; font-weight: 600; margin: 0 0 20px; }
+.gate label span { display: block; font-size: 12px; color: var(--muted); margin-bottom: 6px; }
+.gate input {
+  width: 100%; font-family: var(--mono); font-size: 16px; letter-spacing: .28em;
+  border: 1px solid var(--rule); border-radius: 6px; padding: 9px 12px;
+}
+.gate input:focus { outline: none; border-color: var(--green); box-shadow: 0 0 0 3px rgba(31,136,61,.15); }
+.gate .go {
+  margin-top: 12px; width: 100%; padding: 9px; border-radius: 6px;
+  background: var(--green); color: #fff; font-weight: 500;
+}
+.gate .go:hover { background: #1A7F37; }
+.gate .go[disabled] { opacity: .55; cursor: default; }
+.notice { margin: 10px 0 0; min-height: 18px; font-size: 12px; color: var(--flag); }
+
+/* --- shell -------------------------------------------------------------- */
+
+.shell { display: none; }
+html[data-state="in"] .shell { display: block; }
+
+.masthead { border-bottom: 1px solid var(--rule); background: var(--panel); }
+.masthead .wrap { display: flex; align-items: center; gap: 12px; padding-top: 8px; padding-bottom: 8px; }
+.masthead h1 { font-size: 13px; font-weight: 600; margin: 0; }
+.masthead .spacer { flex: 1 1 auto; }
+
+.quiet { padding: 4px 10px; border: 1px solid var(--rule); border-radius: 6px; background: var(--page); color: var(--muted); font-size: 12px; }
+.quiet:hover { background: var(--panel); color: var(--ink); }
+
+.day-bar { display: flex; align-items: baseline; gap: 12px; padding: 20px 0 8px; flex-wrap: wrap; }
+.day-bar h2 { font-size: 18px; font-weight: 600; margin: 0; }
+.day-bar .count { color: var(--muted); font-size: 12px; }
+.day-bar .spacer { flex: 1 1 auto; }
+.day-bar .where { font-size: 11px; color: var(--faint); font-family: var(--mono); }
+
+.stepper { display: flex; align-items: center; gap: 4px; }
+.stepper button { min-width: 26px; height: 26px; border: 1px solid var(--rule); border-radius: 6px; background: var(--page); color: var(--muted); line-height: 1; }
+.stepper button:hover:not([disabled]) { background: var(--panel); color: var(--ink); }
+.stepper button[disabled] { opacity: .4; cursor: default; }
+.stepper .today { padding: 0 10px; font-size: 12px; }
+
+/* --- the roll call ------------------------------------------------------ */
+
+.roll { border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; }
+
+.person {
+  display: grid;
+  grid-template-columns: 176px 156px 152px minmax(0, 1fr) 84px;
+  align-items: center; gap: 16px; padding: 6px 16px; min-height: 32px;
+}
+.person + .person { border-top: 1px solid var(--rule-2); }
+.person:hover { background: var(--panel); }
+.person[aria-selected="true"] { background: #EFF5F1; box-shadow: inset 3px 0 0 var(--green); }
+
+.pick { text-align: left; min-width: 0; padding: 2px 0; }
+.pick .nm { font-size: 13px; font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.pick .note { font-size: 11px; color: var(--muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+.seg { display: flex; border: 1px solid var(--rule); border-radius: 6px; overflow: hidden; background: var(--page); }
+.seg button { flex: 1 1 0; padding: 4px 0; font-size: 12px; color: var(--muted); }
+.seg button + button { border-left: 1px solid var(--rule); }
+.seg button:hover:not([disabled]) { background: var(--panel); color: var(--ink); }
+.seg button[disabled] { opacity: .4; cursor: default; }
+.seg button[aria-pressed="true"] { background: var(--ink); color: #fff; }
+.seg button.off[aria-pressed="true"] { background: var(--muted); color: #fff; }
+
+.slot { display: flex; align-items: center; gap: 4px; font-family: var(--mono); font-size: 11px; color: var(--faint); }
+.slot input { width: 44px; font-family: var(--mono); font-size: 11px; text-align: center; border: 1px solid var(--rule); border-radius: 5px; padding: 3px 0; color: var(--ink); }
+.slot input:focus { outline: none; border-color: var(--green); }
+.slot .unset { margin-left: 2px; padding: 3px 5px; border-radius: 5px; color: var(--faint); font-size: 11px; }
+.slot .unset:hover { background: var(--rule-2); color: var(--ink); }
+
+/* One column per week for the whole range: the cross-person comparison the
+   single big calendar below cannot make. */
+.strip { display: flex; gap: 2px; }
+.strip span { width: var(--strip); height: 14px; border-radius: 1px; background: var(--a0); }
+.strip span.w1 { background: var(--a1); }
+.strip span.w2 { background: var(--a2); }
+.strip span.w3 { background: var(--a3); }
+.strip span.w4 { background: var(--a4); }
+.strip span.nil {
+  background: linear-gradient(var(--nil), var(--nil)) center / 100% 2px no-repeat;
+}
+
+.total { font-family: var(--mono); font-size: 11px; text-align: right; color: var(--muted); }
+.total.zero { color: var(--faint); }
+
+.saving { min-height: 18px; padding: 6px 2px 0; font-size: 12px; color: var(--muted); }
+.saving.bad { color: var(--flag); }
+
+/* --- the calendar ------------------------------------------------------- */
+
+.cal-card { border: 1px solid var(--rule); border-radius: 8px; margin-top: 20px; }
+.cal-head { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; padding: 10px 20px; border-bottom: 1px solid var(--rule); background: var(--panel); border-radius: 8px 8px 0 0; }
+.cal-head .nm { font-size: 13px; font-weight: 600; }
+.cal-head .meta { font-family: var(--mono); font-size: 11px; color: var(--muted); }
+.cal-head .spacer { flex: 1 1 auto; }
+
+.key { display: flex; align-items: center; gap: 4px 14px; flex-wrap: wrap; font-size: 11px; color: var(--muted); }
+.key i { display: flex; align-items: center; gap: 5px; font-style: normal; }
+.key b { width: 12px; height: 12px; border-radius: 2px; display: inline-block; background: var(--a0); }
+.key .scale { display: flex; gap: 3px; }
+
+.cal-body { padding: 20px; overflow-x: auto; }
+.cal-grid { display: grid; grid-template-columns: var(--daycol) max-content; }
+.months { grid-column: 2; display: grid; grid-auto-flow: column; grid-auto-columns: var(--cell); gap: var(--gap); height: 18px; font-size: 11px; color: var(--muted); }
+.months div { position: relative; overflow: visible; white-space: nowrap; }
+.weekdays { grid-row: 2; display: grid; grid-template-rows: repeat(7, var(--cell)); gap: var(--gap); font-size: 11px; color: var(--muted); align-items: center; }
+.cal { grid-row: 2; grid-column: 2; display: grid; grid-template-rows: repeat(7, var(--cell)); grid-auto-flow: column; grid-auto-columns: var(--cell); gap: var(--gap); }
+
+/* A measured zero is a tile. A day nobody measured is a hole in the field of
+   tiles -- a dot, not a paler shade, so the two never collapse into "grey". */
+.day { width: var(--cell); height: var(--cell); border-radius: 3px; background: var(--a0); position: relative; cursor: pointer; }
+.day.a1 { background: var(--a1); }
+.day.a2 { background: var(--a2); }
+.day.a3 { background: var(--a3); }
+.day.a4 { background: var(--a4); }
+.day.nil { background: radial-gradient(circle at 50% 50%, var(--nil) 0 3px, transparent 3px); }
+.day.pad { background: none; cursor: default; }
+
+/* Presence by position, never by opacity: a half-width bar is legible at 16px
+   and a 45%-opacity one is not. */
+.day.here::after { content: ""; position: absolute; left: 0; right: 0; bottom: 0; height: 4px; border-radius: 0 0 3px 3px; background: var(--ink); }
+.day.here.on-dark::after { background: #FFFFFF; }
+.day.left::after { left: 50%; border-radius: 0 0 3px 0; }
+.day.away { background: linear-gradient(-45deg, transparent 46%, var(--nil) 46% 54%, transparent 54%) , var(--panel); }
+.day.away::after { content: none; }
+
+.day:hover { outline: 1.5px solid var(--faint); outline-offset: 1px; }
+.day.picked { outline: 2px solid var(--ink); outline-offset: 1px; }
+
+.enrolled-rule { grid-row: 2; grid-column: 2; }
+
+.foot { padding-bottom: 32px; }
+
+/* --- narrow screens ----------------------------------------------------- */
+/* The week strip needs width to be a comparison and has none here, so it goes;
+   everything else stays and the calendar scrolls to today. */
+
+@media (max-width: 900px) {
+  .wrap { padding: 0 16px; }
+  .person {
+    grid-template-columns: 1fr auto;
+    grid-template-areas: "pick total" "seg seg" "slot slot";
+    row-gap: 8px; padding: 10px 14px;
+  }
+  .pick { grid-area: pick; }
+  .seg { grid-area: seg; }
+  .seg button { padding: 9px 0; font-size: 13px; }
+  .slot { grid-area: slot; }
+  .slot:empty { display: none; }
+  .slot input { width: 60px; padding: 6px 0; font-size: 13px; }
+  .slot .unset { padding: 6px 8px; }
+  .strip { display: none; }
+  .total { grid-area: total; }
+  .stepper button { min-width: 32px; height: 32px; }
+  .cal-body { padding: 16px 12px; }
+  .day-bar { padding-top: 16px; }
+  .day-bar .where { flex-basis: 100%; }
+}
+</style>
+</head>
+<body>
+
+<main class="gate" id="gate">
+  <div class="gate-card">
+    <h1>Daybook</h1>
+    <form id="gate-form">
+      <label><span>Passcode</span>
+        <input id="passcode" type="password" inputmode="numeric"
+               autocomplete="current-password" autofocus></label>
+      <button class="go" type="submit" id="go">Open</button>
+      <p class="notice" id="gate-notice" role="status" aria-live="polite"></p>
+    </form>
+  </div>
+</main>
+
+<div class="shell" id="shell">
+
+  <header class="masthead">
+    <div class="wrap">
+      <h1>Daybook</h1>
+      <span class="spacer"></span>
+      <button class="quiet" id="signout">Sign out</button>
+    </div>
+  </header>
+
+  <div class="wrap foot">
+    <div class="day-bar">
+      <h2 id="day-title">—</h2>
+      <span class="count" id="day-count"></span>
+      <span class="spacer"></span>
+      <span class="where" id="where"></span>
+      <div class="stepper">
+        <button id="prev" aria-label="Previous day">‹</button>
+        <button id="next" aria-label="Next day">›</button>
+        <button class="today" id="jump-today">Today</button>
+      </div>
+    </div>
+
+    <div class="roll" id="roll"></div>
+    <p class="saving" id="saving" role="status" aria-live="polite"></p>
+
+    <div class="cal-card">
+      <div class="cal-head">
+        <span class="nm" id="cal-name">—</span>
+        <span class="meta" id="cal-meta"></span>
+        <span class="spacer"></span>
+        <div class="key">
+          <i><b class="nil-swatch" style="background:radial-gradient(circle at 50% 50%,var(--nil) 0 3px,transparent 3px)"></b>Not measured</i>
+          <i><b style="background:var(--a2);border-bottom:4px solid var(--ink)"></b>Present</i>
+          <i><b style="background:linear-gradient(-45deg,transparent 46%,var(--nil) 46% 54%,transparent 54%),var(--panel)"></b>Off</i>
+          <i>Less
+            <span class="scale">
+              <b style="background:var(--a0)"></b><b style="background:var(--a1)"></b>
+              <b style="background:var(--a2)"></b><b style="background:var(--a3)"></b>
+              <b style="background:var(--a4)"></b>
+            </span>More</i>
+        </div>
+      </div>
+      <div class="cal-body" id="cal-body"></div>
+    </div>
+  </div>
+</div>
+
+<script>
+(function () {
+  "use strict";
+
+  var root = document.documentElement;
+  var app = { data: null, day: null, who: 0, index: {}, weeks: [] };
+
+  var WEEKS_BACK = 53;
+  var DAY_NAMES = ["Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday"];
+  var MONTHS = ["January", "February", "March", "April", "May", "June",
+                "July", "August", "September", "October", "November", "December"];
+
+  function $(id) { return document.getElementById(id); }
+
+  function api(method, path, body) {
+    return fetch(path, {
+      method: method,
+      headers: body ? { "Content-Type": "application/json" } : {},
+      body: body ? JSON.stringify(body) : null,
+      credentials: "same-origin"
+    }).then(function (response) {
+      return response.json().catch(function () { return {}; }).then(function (payload) {
+        if (!response.ok) {
+          var error = new Error(payload.error || ("HTTP " + response.status));
+          error.status = response.status;
+          error.payload = payload;
+          throw error;
+        }
+        return payload;
+      });
+    });
+  }
+
+  function iso(date) { return date.toISOString().slice(0, 10); }
+  function at(day) { return new Date(day + "T00:00:00Z"); }
+  function today() { var now = new Date(); now.setUTCHours(12, 0, 0, 0); return iso(now); }
+  function shift(day, days) { var d = at(day); d.setUTCDate(d.getUTCDate() + days); return iso(d); }
+
+  function spell(day) {
+    var d = at(day);
+    return DAY_NAMES[d.getUTCDay()] + " " + d.getUTCDate() + " "
+      + MONTHS[d.getUTCMonth()] + " " + d.getUTCFullYear();
+  }
+
+  function level(count) {
+    if (count === null || count === undefined) return null;
+    if (count === 0) return 0;
+    if (count < 10) return 1;
+    if (count < 40) return 2;
+    if (count < 120) return 3;
+    return 4;
+  }
+
+  function weekLevel(total) {
+    if (total === null) return null;
+    if (total === 0) return 0;
+    if (total < 50) return 1;
+    if (total < 200) return 2;
+    if (total < 600) return 3;
+    return 4;
+  }
+
+  function said(record) {
+    if (!record) return "no record";
+    if (record.state === "off") return "off";
+    var times = [record["in"], record.out].filter(Boolean).join("–");
+    return record.state + (times ? " " + times : "");
+  }
+
+  function shortName(person) {
+    if (!person.email) return person.label;
+    return person.email.split("@")[0].split(".").map(function (part) {
+      return part.charAt(0).toUpperCase() + part.slice(1);
+    }).join(" ");
+  }
+
+  function standing(person) {
+    // Three different absences. None of them is an error, so none is red.
+    if (!person.enrolled && person.on_roster) return "On the roster, never enrolled";
+    if (person.enrolled && person.bundles === 0) return "Enrolled, no bundle received";
+    if (!person.email) return "Not in the whitelist";
+    return person.email;
+  }
+
+  // ---- sign in ----------------------------------------------------------
+
+  $("gate-form").addEventListener("submit", function (event) {
+    event.preventDefault();
+    var notice = $("gate-notice");
+    notice.textContent = "";
+    $("go").disabled = true;
+    api("POST", "/dashboard/login", { passcode: $("passcode").value })
+      .then(function () { $("passcode").value = ""; enter(); })
+      .catch(function (error) {
+        notice.textContent = error.status === 429
+          ? "Too many attempts. Try again in " + (error.payload.retry_after || 60) + " seconds."
+          : "Wrong passcode.";
+        $("passcode").select();
+      })
+      .then(function () { $("go").disabled = false; });
+  });
+
+  $("signout").addEventListener("click", function () {
+    api("POST", "/dashboard/logout", {}).then(function () {
+      root.setAttribute("data-state", "out");
+      $("passcode").focus();
+    });
+  });
+
+  function enter() { root.setAttribute("data-state", "in"); load(); }
+
+  // ---- data -------------------------------------------------------------
+
+  function load() {
+    var end = today();
+    var from = shift(end, -(WEEKS_BACK * 7 - 1));
+    from = shift(from, -((at(from).getUTCDay() + 6) % 7));   // begin on a Monday
+    api("GET", "/dashboard/data?from=" + from + "&to=" + end)
+      .then(function (payload) {
+        app.data = payload;
+        app.index = {};
+        payload.days.forEach(function (day, col) { app.index[day] = col; });
+        if (app.index[app.day] === undefined) app.day = payload.days[payload.days.length - 1];
+        app.weeks = weeksOf(payload.days);
+        $("where").textContent = payload.people.length + " people · local days at UTC"
+          + payload.tz + (payload.pending_bundles
+            ? " · still reading " + payload.pending_bundles + " bundles" : "");
+        drawRoll();
+        drawCalendar();
+      })
+      .catch(function (error) {
+        if (error.status === 401) { root.setAttribute("data-state", "out"); return; }
+        $("where").textContent = error.message;
+      });
+  }
+
+  // Weeks as columns of weekdays. The range always starts on a Monday, so only
+  // the final week can be short.
+  function weeksOf(days) {
+    var weeks = [];
+    days.forEach(function (day, col) {
+      var weekday = (at(day).getUTCDay() + 6) % 7;
+      if (weekday === 0 || !weeks.length) weeks.push([]);
+      weeks[weeks.length - 1].push({ day: day, col: col, weekday: weekday });
+    });
+    return weeks;
+  }
+
+  // ---- the roll call ----------------------------------------------------
+
+  function drawRoll() {
+    var data = app.data;
+    var col = app.index[app.day];
+    var roll = $("roll");
+    roll.innerHTML = "";
+
+    var recorded = 0;
+    data.people.forEach(function (person) { if (person.attendance[col]) recorded += 1; });
+
+    $("day-title").textContent = spell(app.day);
+    $("day-count").textContent = recorded + " of " + data.people.length + " recorded";
+    $("next").disabled = app.day >= data.days[data.days.length - 1];
+    $("prev").disabled = app.day <= data.days[0];
+    $("jump-today").style.display = app.day === today() ? "none" : "";
+
+    data.people.forEach(function (person, row) {
+      roll.appendChild(personRow(person, row, col));
+    });
+  }
+
+  function personRow(person, row, col) {
+    var mark = person.attendance[col];
+    var count = person.activity[col];
+
+    var line = document.createElement("div");
+    line.className = "person";
+    line.setAttribute("aria-selected", String(app.who === row));
+
+    var pick = document.createElement("button");
+    pick.className = "pick";
+    pick.innerHTML = '<div class="nm"></div><div class="note"></div>';
+    pick.firstChild.textContent = shortName(person);
+    pick.lastChild.textContent = standing(person);
+    pick.title = (person.email || person.label) + " — show this calendar";
+    pick.addEventListener("click", function () {
+      app.who = row;
+      drawRoll();
+      drawCalendar();
+    });
+    line.appendChild(pick);
+
+    var seg = document.createElement("div");
+    seg.className = "seg";
+    [["in", "In"], ["out", "Out"], ["off", "Off"]].forEach(function (pair) {
+      var button = document.createElement("button");
+      button.textContent = pair[1];
+      button.className = pair[0] === "off" ? "off" : "";
+      button.setAttribute("aria-pressed", String(Boolean(mark) && mark.state === pair[0]));
+      button.disabled = !person.email;
+      button.addEventListener("click", function () { record(row, pair[0]); });
+      seg.appendChild(button);
+    });
+    line.appendChild(seg);
+
+    var slot = document.createElement("div");
+    slot.className = "slot";
+    if (mark) {
+      if (mark.state === "off") {
+        slot.innerHTML = "<span>off all day</span>";
+      } else {
+        slot.innerHTML = '<input maxlength="5" placeholder="09:00" aria-label="Arrived">'
+          + "<span>→</span>" + '<input maxlength="5" placeholder="18:00" aria-label="Left">';
+        slot.children[0].value = mark["in"] || "";
+        slot.children[2].value = mark.out || "";
+        [0, 2].forEach(function (which) {
+          slot.children[which].addEventListener("change", function () {
+            record(row, mark.state, slot.children[0].value.trim(),
+                   slot.children[2].value.trim());
+          });
+        });
+      }
+      var unset = document.createElement("button");
+      unset.className = "unset";
+      unset.textContent = "✕";
+      unset.title = "Clear — back to no record";
+      unset.setAttribute("aria-label", "Clear " + shortName(person) + " on " + app.day);
+      unset.addEventListener("click", function () { record(row, ""); });
+      slot.appendChild(unset);
+    }
+    line.appendChild(slot);
+
+    line.appendChild(weekStrip(person));
+
+    var total = document.createElement("div");
+    total.className = "total" + (count ? "" : " zero");
+    total.textContent = count === null ? "—" : count.toLocaleString();
+    total.title = count === null ? "Not measured on " + app.day
+      : count + " events on " + app.day;
+    line.appendChild(total);
+
+    return line;
+  }
+
+  function weekStrip(person) {
+    var strip = document.createElement("div");
+    strip.className = "strip";
+    app.weeks.forEach(function (week) {
+      var total = null;
+      week.forEach(function (slot) {
+        var value = person.activity[slot.col];
+        if (value !== null) total = (total || 0) + value;
+      });
+      var step = weekLevel(total);
+      var box = document.createElement("span");
+      box.className = step === null ? "nil" : (step ? "w" + step : "");
+      box.title = week[0].day + " · " + (total === null ? "not measured" : total + " events");
+      strip.appendChild(box);
+    });
+    return strip;
+  }
+
+  function record(row, state, at_in, at_out) {
+    var person = app.data.people[row];
+    if (!person.email) return;
+    var col = app.index[app.day];
+    var saving = $("saving");
+    saving.className = "saving";
+    saving.textContent = "Saving…";
+
+    api("POST", "/dashboard/day", {
+      email: person.email,
+      date: app.day,
+      state: state === "" ? null : state,
+      "in": at_in === undefined ? (person.attendance[col] || {})["in"] || "" : at_in,
+      out: at_out === undefined ? (person.attendance[col] || {}).out || "" : at_out
+    }).then(function (payload) {
+      person.attendance[col] = payload.record;
+      saving.textContent = shortName(person) + " · " + app.day + " · " + said(payload.record);
+      drawRoll();
+      if (app.who === row) repaint();
+    }).catch(function (error) {
+      saving.className = "saving bad";
+      saving.textContent = error.message;
+    });
+  }
+
+  $("prev").addEventListener("click", function () { goto(shift(app.day, -1)); });
+  $("next").addEventListener("click", function () { goto(shift(app.day, 1)); });
+  $("jump-today").addEventListener("click", function () { goto(today()); });
+
+  function goto(day) {
+    if (app.index[day] === undefined) return;
+    app.day = day;
+    drawRoll();
+    mark();
+  }
+
+  // ---- the calendar -----------------------------------------------------
+
+  function drawCalendar() {
+    var person = app.data.people[app.who];
+    if (!person) return;
+    var body = $("cal-body");
+    body.innerHTML = "";
+
+    $("cal-name").textContent = shortName(person);
+    $("cal-meta").textContent = person.bundles
+      ? person.events.toLocaleString() + " events · " + person.bundles + " bundles"
+        + (person.first_bundle ? " · since " + person.first_bundle : "")
+      : standing(person);
+
+    var grid = document.createElement("div");
+    grid.className = "cal-grid";
+
+    var months = document.createElement("div");
+    months.className = "months";
+    var last = null;
+    var lastAt = -99;
+    app.weeks.forEach(function (week, index) {
+      var box = document.createElement("div");
+      var month = at(week[0].day).getUTCMonth();
+      // A label is wider than the column it sits in, so it needs clearance or
+      // it prints over the one before it.
+      if (month !== last && index - lastAt >= 3 && week.length > 2) {
+        box.textContent = MONTHS[month].slice(0, 3);
+        last = month;
+        lastAt = index;
+      }
+      months.appendChild(box);
+    });
+    grid.appendChild(months);
+
+    var weekdays = document.createElement("div");
+    weekdays.className = "weekdays";
+    ["Mon", "", "Wed", "", "Fri", "", ""].forEach(function (label) {
+      var box = document.createElement("div");
+      box.textContent = label;
+      weekdays.appendChild(box);
+    });
+    grid.appendChild(weekdays);
+
+    var cal = document.createElement("div");
+    cal.className = "cal";
+    cal.setAttribute("role", "grid");
+    cal.setAttribute("aria-label", shortName(person) + "'s days");
+    app.weeks.forEach(function (week) {
+      for (var weekday = 0; weekday < 7; weekday += 1) {
+        var slot = week[weekday];
+        cal.appendChild(slot ? square(person, slot) : pad());
+      }
+    });
+    grid.appendChild(cal);
+
+    body.appendChild(grid);
+    // After layout, or scrollWidth is still the previous render's and a narrow
+    // screen opens on last August instead of today.
+    window.requestAnimationFrame(function () { body.scrollLeft = body.scrollWidth; });
+    mark();
+  }
+
+  function pad() {
+    var cell = document.createElement("div");
+    cell.className = "day pad";
+    return cell;
+  }
+
+  function square(person, slot) {
+    var count = person.activity[slot.col];
+    var record = person.attendance[slot.col];
+    var step = level(count);
+    var here = record && (record.state === "in" || record.state === "out");
+
+    var cell = document.createElement("div");
+    cell.className = "day"
+      + (step === null ? " nil" : (step ? " a" + step : ""))
+      + (step !== null && step >= 3 ? " on-dark" : "")
+      + (record && record.state === "off" ? " away" : "")
+      + (here ? " here" : "")
+      + (record && record.state === "out" ? " left" : "");
+    cell.dataset.day = slot.day;
+    cell.setAttribute("role", "gridcell");
+    cell.title = slot.day + " · "
+      + (count === null ? "not measured" : count + " events") + " · " + said(record);
+    cell.setAttribute("aria-label", cell.title);
+    cell.addEventListener("click", function () { goto(slot.day); });
+    return cell;
+  }
+
+  function mark() {
+    Array.prototype.forEach.call($("cal-body").querySelectorAll(".day.picked"),
+      function (node) { node.classList.remove("picked"); });
+    var chosen = $("cal-body").querySelector('.day[data-day="' + app.day + '"]');
+    if (chosen) chosen.classList.add("picked");
+  }
+
+  function repaint() {
+    var person = app.data.people[app.who];
+    Array.prototype.forEach.call($("cal-body").querySelectorAll(".day:not(.pad)"),
+      function (cell) {
+        var col = app.index[cell.dataset.day];
+        var record = person.attendance[col];
+        var count = person.activity[col];
+        var here = record && (record.state === "in" || record.state === "out");
+        cell.classList.toggle("away", Boolean(record && record.state === "off"));
+        cell.classList.toggle("here", Boolean(here));
+        cell.classList.toggle("left", Boolean(record && record.state === "out"));
+        cell.title = cell.dataset.day + " · "
+          + (count === null ? "not measured" : count + " events") + " · " + said(record);
+        cell.setAttribute("aria-label", cell.title);
+      });
+  }
+
+  document.addEventListener("keydown", function (event) {
+    if (root.getAttribute("data-state") !== "in") return;
+    if (/^(INPUT|TEXTAREA)$/.test(event.target.tagName)) return;
+    if (event.key === "ArrowLeft") { event.preventDefault(); goto(shift(app.day, -1)); }
+    if (event.key === "ArrowRight") { event.preventDefault(); goto(shift(app.day, 1)); }
+  });
+
+  // ---- start ------------------------------------------------------------
+
+  api("GET", "/dashboard/session")
+    .then(function (payload) {
+      if (payload.signed_in) { enter(); }
+      else { root.setAttribute("data-state", "out"); $("passcode").focus(); }
+    })
+    .catch(function () { root.setAttribute("data-state", "out"); });
+})();
+</script>
+</body>
+</html>
