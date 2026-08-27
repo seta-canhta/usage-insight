@@ -51,6 +51,7 @@ import identity  # noqa: E402  -- the client's own whitelist rules, not a copy
 import dashboard as dashboard_mod  # noqa: E402
 import registry as registry_mod  # noqa: E402
 import store as store_mod  # noqa: E402
+import webapp as webapp_mod  # noqa: E402
 
 #: Matches the client's own cap in ``cli/ship.py``. Both sides agreeing is what
 #: makes a 413 mean the same thing in both places.
@@ -327,6 +328,12 @@ class Handler(BaseHTTPRequestHandler):
     activity: Any = None
     daybook_page: Optional[bytes] = None
     tz_label: str = dashboard_mod.DEFAULT_TZ_OFFSET
+    #: The insights app -- ``server/webapp.py``. A ``webapp.AppBundle`` read at
+    #: startup and a ``webapp.Snapshot`` that re-stats. Both ride in beside the
+    #: daybook because they share its passcode; neither reaches the upload-only
+    #: listener, for the same reason the daybook does not.
+    insights_app: Any = None
+    snapshot: Any = None
 
     # -- plumbing ---------------------------------------------------------
 
@@ -715,6 +722,20 @@ class Handler(BaseHTTPRequestHandler):
                 self._daybook_get(parsed)
                 return
 
+            # The insights app, on the same passcode and the same listener. It
+            # is dispatched here, before the admin check, for the reason the
+            # daybook is: a browser cannot send a bearer header.
+            if parsed.path == "/insights/data":
+                self._insights_data()
+                return
+            if parsed.path in ("/insights", "/insights/",
+                               "/activities", "/activities/"):
+                self._app_shell()
+                return
+            if parsed.path.startswith("/app/"):
+                self._app_asset(parsed.path[len("/app/"):])
+                return
+
             self._require_admin()
 
             if parsed.path == "/v1/people":
@@ -910,6 +931,104 @@ class Handler(BaseHTTPRequestHandler):
 
         raise Rejected(404, "no such route")
 
+    # -- the insights app -------------------------------------------------
+
+    def _send_web(self, body: bytes, content_type: str,
+                  cache_control: str) -> None:
+        """A response to a browser, with the two headers a browser needs.
+
+        ``nosniff`` and ``no-referrer`` are on every one of these, not only on
+        the HTML: the app serves ``.svg`` and ``.json``, and a sniffed content
+        type is how one of those becomes script.
+        """
+        self.send_response(200)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Cache-Control", cache_control)
+        self.send_header("Referrer-Policy", "no-referrer")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _insights_ready(self) -> None:
+        """404 unless a passcode was configured -- the daybook's guard exactly.
+
+        Tied to the passcode and not to its own switch because it is the same
+        credential: a deployment that has not asked for a browser page does not
+        grow one, and one that has does not get a second lock to set.
+        """
+        if not (self.sessions and self.sessions.enabled):
+            raise Rejected(404, "no such route")
+
+    def _app_ready(self) -> None:
+        self._insights_ready()
+        if not (self.insights_app and self.insights_app.built):
+            # Said plainly rather than as a bare 404. This is the one 404 here
+            # that is not hiding anything: whoever reaches it is signed in on
+            # loopback and the answer they need is "the frontend has not been
+            # built", which no amount of retrying the URL will tell them.
+            raise Rejected(404, "the insights app is not built -- nothing was "
+                                "found in server/assets/app. The rest of the "
+                                "endpoint is unaffected.")
+
+    def _app_shell(self) -> None:
+        """``/insights`` and ``/activities`` -- one bundle, two URLs.
+
+        Identical bytes: which screen is shown is decided in the browser. Served
+        without a session for the reason ``/dashboard`` is -- the shell carries
+        no data and a sign-in form nobody can fetch is not a sign-in form.
+        Everything worth protecting arrives over ``/insights/data``.
+        """
+        self._app_ready()
+        asset = self.insights_app.index
+        self._send_web(asset.body, asset.content_type, asset.cache_control)
+
+    def _app_asset(self, name: str) -> None:
+        """``/app/<name>`` -- an exact-key lookup, and nothing else.
+
+        The string out of the request is a **key**, never a file name. It is
+        not joined to a directory, not resolved, not normalised, and not
+        percent-decoded -- the keys are the byte-for-byte names the build
+        produced, so ``../``, a leading ``/`` and ``%2e%2e%2f`` are all just
+        keys nobody put in the dict. That is the same property that makes
+        ``/install`` and ``/dashboard`` safe (see the comment in ``do_GET``),
+        bought here without holding the whole app in one file.
+        """
+        self._app_ready()
+        asset = self.insights_app.get(name)
+        if asset is None:
+            raise Rejected(404, "no such asset")
+        self._send_web(asset.body, asset.content_type, asset.cache_control)
+
+    def _insights_data(self) -> None:
+        """The snapshot. Needs the cookie; does not need the app to be built.
+
+        Not gated on the bundle deliberately: the numbers are produced by
+        ``report/dashboard_data.py`` and are worth fetching whether or not
+        anybody has run the frontend build.
+        """
+        self._insights_ready()
+        self._require_session()
+        try:
+            body = self.snapshot.body()
+        except webapp_mod.SnapshotMissing as exc:
+            # 503 and a sentence -- never ``{}`` and never zeros. An empty
+            # payload renders as a team that produced nothing, which is a
+            # different fact from a file that has not been written yet, and
+            # telling them apart is a rule this project has in writing
+            # (``CLAUDE.md``: absent is never zero).
+            log.error(json.dumps({"event": "snapshot_missing",
+                                  "path": self.snapshot.path,
+                                  "detail": str(exc)}, sort_keys=True))
+            self._send(503, {
+                "error": str(exc),
+                "detail": "run report/dashboard_data.py to write it. This is "
+                          "not a zero: nothing has been measured into the file "
+                          "yet, and an empty payload would read as a team that "
+                          "did nothing."})
+            return
+        self._send_web(body, "application/json; charset=utf-8", "no-store")
+
     def _json_body(self) -> Dict[str, Any]:
         body = self._read_body()
         if not body:
@@ -945,8 +1064,15 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def _cookie_line(token: str, max_age: int) -> str:
-    """The session cookie. ``max_age=0`` is how signing out is spelled."""
-    return ("{}={}; Path=/dashboard; Max-Age={}; HttpOnly; SameSite=Strict"
+    """The session cookie. ``max_age=0`` is how signing out is spelled.
+
+    ``Path=/`` and not ``/dashboard``: one passcode now opens three screens,
+    and a cookie scoped to the first of them is simply not sent to
+    ``/insights/data`` -- which looks exactly like a passcode that does not
+    work. Path is not a security boundary in any case; every path it now
+    covers is authenticated by this same cookie or by the admin token.
+    """
+    return ("{}={}; Path=/; Max-Age={}; HttpOnly; SameSite=Strict"
             .format(dashboard_mod.COOKIE, token, max_age))
 
 
@@ -1059,6 +1185,18 @@ def main(argv: Optional[List[str]] = None) -> int:
                         default=os.environ.get("INSIGHT_DASHBOARD_PAGE"),
                         help="the daybook's HTML, read once at startup. "
                              "Defaults to server/assets/dashboard.html")
+    parser.add_argument("--insights-app",
+                        default=os.environ.get("INSIGHT_INSIGHTS_APP"),
+                        help="the built /insights and /activities bundle, read "
+                             "once at startup. Defaults to server/assets/app. "
+                             "A directory that is not there is not an error -- "
+                             "those two routes 404 and nothing else changes")
+    parser.add_argument("--insights-snapshot",
+                        default=os.environ.get("INSIGHT_INSIGHTS_SNAPSHOT"),
+                        help="the JSON served at GET /insights/data, written "
+                             "by report/dashboard_data.py. Defaults to "
+                             "server/assets/insights.json; re-read when it "
+                             "changes, so a redeploy needs no restart")
     parser.add_argument("--tz-offset",
                         default=os.environ.get("INSIGHT_TZ_OFFSET",
                                                dashboard_mod.DEFAULT_TZ_OFFSET),
@@ -1130,7 +1268,19 @@ def main(argv: Optional[List[str]] = None) -> int:
             "activity": dashboard_mod.ActivityIndex(store, tz),
             "daybook_page": dashboard_mod.load_page(args.dashboard_page),
             "tz_label": args.tz_offset,
+            # Read here rather than lazily, and unlike `load_page` a failure to
+            # find anything is not fatal -- see `webapp.load_app`.
+            "insights_app": webapp_mod.load_app(args.insights_app),
+            "snapshot": webapp_mod.Snapshot(args.insights_snapshot),
         }
+        if daybook["insights_app"].skipped:
+            # Named at deploy time, because the alternative is an engineer
+            # finding a blank screen and a 404 in a browser console.
+            log.warning(json.dumps({
+                "event": "insights_app_skipped",
+                "files": sorted(daybook["insights_app"].skipped),
+                "detail": "not a media type this serves, unreadable, or over "
+                          "the per-file cap"}, sort_keys=True))
 
     if args.host not in ("127.0.0.1", "localhost", "::1"):
         log.warning(json.dumps({
@@ -1146,6 +1296,10 @@ def main(argv: Optional[List[str]] = None) -> int:
                          "people": people.count(),
                          "install_script": bool(install_script),
                          "daybook": bool(daybook),
+                         "insights_app": len(daybook["insights_app"].files)
+                         if daybook else 0,
+                         "insights_snapshot": daybook["snapshot"].state()
+                         if daybook else None,
                          "serving_version": json.loads(manifest)["version"]
                          if manifest else None},
                         sort_keys=True))

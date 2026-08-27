@@ -31,12 +31,21 @@ RUN python -m pip install --no-cache-dir -r /app/server/requirements.txt
 # Every server/*.py the process imports has to be named here. A module added to
 # server/ and not to this line is a container that starts, passes its health
 # check, and fails on the first request that reaches the missing import.
-COPY server/proxy.py server/store.py server/registry.py server/dashboard.py /app/server/
+COPY server/proxy.py server/store.py server/registry.py server/dashboard.py \
+     server/webapp.py /app/server/
 # The daybook page: markup, style and script in one file, read once at
 # startup and served as fixed bytes. One file because three would be
 # three routes; in the image because a page that ships separately from
 # the process that serves it is a page that will one day not ship.
 COPY server/assets/dashboard.html /app/server/assets/dashboard.html
+# The /insights and /activities bundle and its snapshot are deliberately
+# NOT copied here. `server/assets/app` is written by a frontend build that
+# is not part of a checkout, and a COPY of a directory that may not exist
+# fails the image build outright -- so an image would stop being buildable
+# from a clean tree. Both are mounted at deploy time, which is also what
+# lets a regenerated insights.json be picked up without a new image:
+# --insights-app and --insights-snapshot point at the mount, and their
+# absence is a 404 and a 503 that say so rather than a broken container.
 COPY cli/identity.py /app/cli/identity.py
 
 # The watchdog, which runs from this same image with a different entrypoint
