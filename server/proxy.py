@@ -901,6 +901,15 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if path == "/dashboard/logout":
+            # Clearing the cookie only takes the browser's copy away. The token
+            # has to be revoked as well, or anyone still holding it -- a copy
+            # from a shared machine, a terminal that kept it -- stays signed in
+            # for the rest of the twelve hours.
+            ended = self.sessions.revoke(self._cookie())
+            log.info(json.dumps({"event": "daybook_closed", "ended": ended},
+                                sort_keys=True))
+            # The response is the same either way: a caller must not be able to
+            # learn from a sign-out whether the token it sent was real.
             self._send_json_cookie(200, {"signed_in": False},
                                    _cookie_line("", 0))
             return

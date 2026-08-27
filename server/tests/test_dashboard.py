@@ -25,6 +25,7 @@ import shutil
 import sys
 import tempfile
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
@@ -432,3 +433,61 @@ class PublicListenerTests(RouteTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class SessionRevocationTests(unittest.TestCase):
+    """Signing out has to end the session, not just the browser's copy.
+
+    The token was `expiry.signature(expiry)` and nothing else, so it carried no
+    identity: two people signing in during the same second got the same cookie,
+    and `/dashboard/logout` could only ask the browser to forget one. The token
+    stayed valid for its full life.
+    """
+
+    def sessions(self):
+        return dashboard_mod.Sessions("123456", ttl=60)
+
+    def test_two_sessions_are_not_the_same_token(self):
+        s = self.sessions()
+        self.assertNotEqual(s.issue(), s.issue())
+
+    def test_a_revoked_token_stops_working(self):
+        s = self.sessions()
+        token = s.issue()
+        self.assertTrue(s.valid(token))
+        self.assertTrue(s.revoke(token))
+        self.assertFalse(s.valid(token))
+
+    def test_revoking_one_session_leaves_the_others_alone(self):
+        s = self.sessions()
+        mine, theirs = s.issue(), s.issue()
+        s.revoke(mine)
+        self.assertFalse(s.valid(mine))
+        self.assertTrue(s.valid(theirs),
+                        "signing out on one machine must not sign out the rest")
+
+    def test_revoking_rubbish_is_not_an_error_and_changes_nothing(self):
+        s = self.sessions()
+        live = s.issue()
+        for junk in (None, "", "nonsense", "1.2", "9999999999.x.y"):
+            self.assertFalse(s.revoke(junk))
+        self.assertTrue(s.valid(live))
+
+    def test_a_second_revoke_reports_nothing_left_to_end(self):
+        s = self.sessions()
+        token = s.issue()
+        self.assertTrue(s.revoke(token))
+        self.assertFalse(s.revoke(token))
+
+    def test_the_revoked_set_does_not_grow_without_bound(self):
+        # Entries are dropped once their own expiry has passed -- by then the
+        # signature has stopped verifying anyway, so keeping them buys nothing.
+        s = dashboard_mod.Sessions("123456", ttl=1)
+        stale = s.issue()
+        s.revoke(stale)
+        time.sleep(1.1)
+        live = dashboard_mod.Sessions("123456", ttl=60)
+        live._key = s._key
+        live._revoked = dict(s._revoked)
+        live.revoke(live.issue())
+        self.assertNotIn(stale.split(".")[1], live._revoked)
+

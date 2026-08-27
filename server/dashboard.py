@@ -511,8 +511,16 @@ class Sessions:
 
     The signing key is minted per process and never written down, so every
     restart signs everyone out. That is the right trade for a page whose whole
-    audience is one or two admins on a tunnel: there is no session store to
-    keep, nothing on disk to steal, and the failure mode is logging in again.
+    audience is one or two admins: there is no session store to keep, nothing
+    on disk to steal, and the failure mode is signing in again.
+
+    Every session carries its own random id, and that is not decoration. The
+    token used to be `expiry.signature(expiry)` and nothing else, which had two
+    consequences worth stating: two people signing in during the same second
+    were handed the identical cookie, and there was nothing to revoke -- so
+    signing out only cleared the browser's copy while the token itself stayed
+    valid for its full twelve hours. Anyone still holding it, including a copy
+    taken from a shared machine, stayed signed in.
     """
 
     def __init__(self, passcode: str, ttl: int = SESSION_SECONDS) -> None:
@@ -521,6 +529,11 @@ class Sessions:
         self._key = secrets.token_bytes(32)
         self._lock = threading.Lock()
         self._failures: Dict[str, List[float]] = {}
+        #: session id -> the expiry it was issued with. Revoked ids only; a
+        #: live session is not tracked, so the normal case stores nothing.
+        #: Bounded because an entry is dropped once its own expiry has passed
+        #: -- by then the signature has stopped verifying anyway.
+        self._revoked: Dict[str, int] = {}
 
     @property
     def enabled(self) -> bool:
@@ -532,18 +545,61 @@ class Sessions:
 
     def issue(self) -> str:
         expiry = str(int(time.time()) + self.ttl)
-        return "{}.{}".format(expiry, self._sign(expiry))
+        sid = secrets.token_urlsafe(12)
+        payload = "{}.{}".format(expiry, sid)
+        return "{}.{}".format(payload, self._sign(payload))
+
+    def _parse(self, token: Optional[str]) -> Optional[Tuple[str, str]]:
+        """`(expiry, sid)` for a token this process signed, else None."""
+        if not token:
+            return None
+        parts = token.split(".")
+        if len(parts) != 3:
+            return None
+        expiry, sid, signature = parts
+        if not hmac.compare_digest(signature,
+                                   self._sign("{}.{}".format(expiry, sid))):
+            return None
+        return expiry, sid
 
     def valid(self, token: Optional[str]) -> bool:
-        if not token or "." not in token:
+        parsed = self._parse(token)
+        if parsed is None:
             return False
-        expiry, _, signature = token.partition(".")
-        if not hmac.compare_digest(signature, self._sign(expiry)):
-            return False
+        expiry, sid = parsed
         try:
-            return int(expiry) > time.time()
+            if int(expiry) <= time.time():
+                return False
         except ValueError:
             return False
+        with self._lock:
+            return sid not in self._revoked
+
+    def revoke(self, token: Optional[str]) -> bool:
+        """Signing out ends the session, not just the browser's copy of it.
+
+        Returns whether there was a live session to end, which is only used for
+        the log line -- the response says the same either way, because a caller
+        should not learn from a sign-out whether the token it sent was real.
+        """
+        parsed = self._parse(token)
+        if parsed is None:
+            return False
+        expiry, sid = parsed
+        try:
+            when = int(expiry)
+        except ValueError:
+            return False
+        now = time.time()
+        with self._lock:
+            # Drop anything whose signature has already stopped verifying, so
+            # this cannot grow without bound on a long-lived process.
+            self._revoked = {k: v for k, v in self._revoked.items() if v > now}
+            if when <= now:
+                return False
+            fresh = sid not in self._revoked
+            self._revoked[sid] = when
+            return fresh
 
     # -- throttle ---------------------------------------------------------
 
