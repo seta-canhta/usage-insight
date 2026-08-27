@@ -581,3 +581,168 @@ class TestBranchAtTheTimeOfTheSession(unittest.TestCase):
         branches = [e["context"].get("branch_name") for e in events]
         self.assertIn("feature/b", branches)
         self.assertIn("main", branches)
+
+
+class ToolPathCaseKeyTests(unittest.TestCase):
+    """The path route: a tool call's file name naming an AIO case.
+
+    Added 0.9.0. It is the only route from a chat session to an AIO case that
+    needs nobody to type a key, and it reads an object that sits next to the
+    file's own content -- so half of what follows is about the content staying
+    unread.
+    """
+
+    PROJECTS = ("IML", "APR")
+
+    def call(self, **arguments):
+        return {"name": "replace_string_in_file", "arguments": arguments}
+
+    def test_a_spec_file_named_after_a_case_yields_that_case(self):
+        found = vscode_read.scan_tool_for_keys(
+            self.call(filePath="tests/e2e/IML-TC-12893.spec.ts",
+                      content=SECRET),
+            self.PROJECTS)
+        self.assertEqual(found["test_case_key"], "IML-TC-12893")
+
+    def test_the_content_beside_the_path_is_never_read(self):
+        """`content` sits in the same dict. Naming keys, not the dict, is why."""
+        found = vscode_read.scan_tool_for_keys(
+            self.call(filePath="src/util.ts",
+                      content="see IML-TC-99999 in the docstring"),
+            self.PROJECTS)
+        self.assertIsNone(found["test_case_key"])
+
+    def test_the_path_itself_never_comes_back(self):
+        found = vscode_read.scan_tool_for_keys(
+            self.call(filePath="/Users/someone/IML-TC-1.spec.ts"),
+            self.PROJECTS)
+        self.assertEqual(set(found), {"test_case_key", "test_cycle_key"})
+        self.assertNotIn("/Users/someone", json.dumps(found))
+
+    def test_no_allow_list_reads_nothing(self):
+        """AR-1. The permissive path is what minted `AUG-25`."""
+        self.assertEqual(
+            vscode_read.scan_tool_for_keys(
+                self.call(filePath="tests/IML-TC-12893.spec.ts"), ()),
+            {"test_case_key": None, "test_cycle_key": None})
+
+    def test_a_project_outside_the_allow_list_is_not_taken(self):
+        self.assertIsNone(
+            vscode_read.scan_tool_for_keys(
+                self.call(filePath="tests/ZZZ-TC-1.spec.ts"),
+                self.PROJECTS)["test_case_key"])
+
+    def test_no_jira_key_is_ever_taken_from_a_path(self):
+        """A directory named after a branch is exactly the `AUG-25` shape."""
+        found = vscode_read.scan_tool_for_keys(
+            self.call(filePath="fix/IML-6532/regression.ts"), self.PROJECTS)
+        self.assertNotIn("jira_issue_key", found)
+
+    def test_a_cycle_key_is_taken_too(self):
+        self.assertEqual(
+            vscode_read.scan_tool_for_keys(
+                self.call(path="cycles/IML-CY-214/run.json"),
+                self.PROJECTS)["test_cycle_key"],
+            "IML-CY-214")
+
+    def test_arguments_that_are_not_a_dict_are_survivable(self):
+        self.assertEqual(
+            vscode_read.scan_tool_for_keys(
+                {"name": "x", "arguments": "IML-TC-5"}, self.PROJECTS),
+            {"test_case_key": None, "test_cycle_key": None})
+
+
+class KeyCaptureTests(unittest.TestCase):
+    """The capture rate is printed because a zero nobody prints is a zero
+    somebody rediscovers in a report six weeks later."""
+
+    def event(self, confidence, **context):
+        return {"context": context, "link": {"confidence": confidence}}
+
+    def test_routes_are_counted_separately(self):
+        out = vscode_read.key_capture([
+            self.event(0.9, branch_name="fix/IML-1", jira_issue_key="IML-1"),
+            self.event(0.7, branch_name="main", test_case_key="IML-TC-5"),
+            self.event(0.5, jira_issue_key="IML-2"),
+        ])
+        self.assertEqual(out["by_route"],
+                         {"branch": 1, "path": 1, "prompt": 1})
+        self.assertEqual(out["with_branch_name"], 2)
+        self.assertEqual(out["named_nothing"], 0)
+
+    def test_a_branch_consulted_with_no_answer_is_not_a_branch_capture(self):
+        """0.9 with no key means the branch was asked and had nothing."""
+        out = vscode_read.key_capture([self.event(0.9, branch_name="main")])
+        self.assertEqual(out["by_route"]["branch"], 0)
+        self.assertEqual(out["named_nothing"], 1)
+
+    def test_an_empty_run_reports_zeroes_rather_than_nothing(self):
+        out = vscode_read.key_capture([])
+        self.assertEqual(out["events"], 0)
+        self.assertEqual(out["named_nothing"], 0)
+        self.assertIn("by_route", out)
+
+
+class ToolPathWiringTests(unittest.TestCase):
+    """End to end: the path route reaching a real `tool.call` event."""
+
+    def setUp(self):
+        self.root = tempfile.mkdtemp(prefix="vscode-path-")
+        self.addCleanup(shutil.rmtree, self.root, ignore_errors=True)
+
+    def session(self, file_path, branch):
+        request = a_request()
+        request["result"]["metadata"]["toolCallRounds"] = [{
+            "id": "round-0",
+            "toolCalls": [{"name": "replace_string_in_file",
+                           "arguments": {"filePath": file_path,
+                                         "content": SECRET}}],
+        }]
+        storage = os.path.join(self.root, "workspaceStorage", "ws1")
+        os.makedirs(os.path.join(storage, "chatSessions"), exist_ok=True)
+        with open(os.path.join(storage, "workspace.json"), "w",
+                  encoding="utf-8") as handle:
+            json.dump({"folder": "file:///nowhere/repo"}, handle)
+        path = os.path.join(storage, "chatSessions", "s1.jsonl")
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(jsonl_workspace_lines([request]))
+        return vscode_read.session_events(
+            path, "s1", "acme/repo", branch,
+            jira_projects=("IML", "APR"))
+
+    def tool_events(self, events):
+        return [e for e in events if e["event_type"] == "tool.call"]
+
+    def test_the_case_reaches_the_tool_call_event_at_0_7(self):
+        events = self.session("tests/e2e/IML-TC-12893.spec.ts", "main")
+        tools = self.tool_events(events)
+        self.assertTrue(tools)
+        self.assertEqual(tools[0]["context"]["test_case_key"], "IML-TC-12893")
+        self.assertEqual(tools[0]["link"]["confidence"], 0.7)
+        self.assertEqual(tools[0]["link"]["method"], "heuristic")
+
+    def test_it_does_not_leak_onto_the_prompt_or_the_model_call(self):
+        """The tool call touched the file. The turn did not."""
+        events = self.session("tests/e2e/IML-TC-12893.spec.ts", "main")
+        for event in events:
+            if event["event_type"] != "tool.call":
+                self.assertIsNone(event["context"]["test_case_key"])
+
+    def test_a_branch_that_already_named_a_case_is_not_overwritten(self):
+        """Fills, never overwrites -- the branch is the better evidence."""
+        events = self.session("tests/e2e/IML-TC-999.spec.ts",
+                              "IML-TC-12893/rework")
+        for event in self.tool_events(events):
+            self.assertEqual(event["context"]["test_case_key"], "IML-TC-12893")
+            self.assertEqual(event["link"]["confidence"], 0.9)
+
+    def test_an_ordinary_path_changes_nothing(self):
+        events = self.session("src/util.ts", "main")
+        tools = self.tool_events(events)
+        self.assertTrue(tools)
+        self.assertIsNone(tools[0]["context"]["test_case_key"])
+        self.assertEqual(tools[0]["link"]["confidence"], 0.9)
+
+    def test_the_file_content_never_appears_in_any_event(self):
+        events = self.session("tests/e2e/IML-TC-12893.spec.ts", "main")
+        self.assertNotIn(SECRET, json.dumps(events))

@@ -208,6 +208,23 @@ def keep(request: Dict[str, Any]) -> Dict[str, Any]:
 #: system's ticket references.
 SCAN: Tuple[str, ...] = ("message.text",)
 
+#: Read, never kept. The second and last path whose text is looked at, and the
+#: reason it is a tuple of *keys* rather than the word `arguments`.
+#:
+#: A tool call's `arguments` object carries the file the model just wrote --
+#: `content` sits beside `filePath` in the same dict. Reading `arguments` would
+#: therefore read the content, which is the one thing this module exists to not
+#: do. So this names the path-bearing keys and nothing else: a projection, the
+#: way `KEEP` is, not a blanket.
+#:
+#: What leaves `scan_tool_for_keys` is at most an AIO key of the form
+#: `IML-TC-5`, and only when a real project claims the prefix. The path is
+#: matched and dropped inside that function -- never returned, never stored,
+#: never logged. `classify_path` in `poll_bitbucket.py` already reads and drops
+#: exactly these paths on the Bitbucket side (CONTRACT.md §11.3); this is the
+#: same trade on the surface where the work actually happened.
+SCAN_TOOL_ARG: Tuple[str, ...] = ("filePath", "path", "uri")
+
 
 def scan_for_key(request: Dict[str, Any],
                  projects: Collection[str]) -> Optional[str]:
@@ -260,6 +277,44 @@ def scan_for_keys(request: Dict[str, Any],
         found.update(common.extract_test_keys(text, projects=projects))
         if any(found.values()):
             return found
+    return blank
+
+
+def scan_tool_for_keys(call: Dict[str, Any],
+                       projects: Collection[str]) -> Dict[str, Optional[str]]:
+    """The AIO case or cycle a tool call's path names. The path is discarded.
+
+    This is the only route from a chat session to an AIO case that does not
+    depend on somebody typing a key, and it is the same route the Bitbucket
+    poller already takes through `test_case_keys` -- there, from the file names
+    a pull request changed; here, from the file the assistant actually opened
+    or edited. Measured 2026-08-27 on the August pull of `wt-playwrite-taf`:
+    the repository really does name spec files after cases (41 distinct
+    `IML-TC-*` keys), but only 2 of 36 merged pull requests carried one, so
+    this is a thin signal and is described as one. It can populate a case key
+    where nothing else did; it cannot make case-level attribution work.
+
+    **No Jira key is taken from a path.** `extract_jira_key` on a directory
+    name is exactly the permissive call that minted `AUG-25` from
+    `fix/AUG-25`, and a path has far more key-shaped noise than a branch does.
+    The AIO prefixes are narrower (`-TC-`, `-CY-`) and the allow-list still
+    applies, so only these two are read out. AR-1.
+    """
+    blank: Dict[str, Optional[str]] = {"test_case_key": None,
+                                       "test_cycle_key": None}
+    if not projects:
+        return blank
+    arguments = call.get("arguments")
+    if not isinstance(arguments, dict):
+        return blank
+    for key in SCAN_TOOL_ARG:
+        value = arguments.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        found = common.extract_test_keys(value, projects=projects)
+        if found.get("test_case_key") or found.get("test_cycle_key"):
+            return {"test_case_key": found.get("test_case_key"),
+                    "test_cycle_key": found.get("test_cycle_key")}
     return blank
 
 
@@ -665,20 +720,23 @@ def session_events(path: str, session_id: str,
     current = {"context": context, "confidence": 0.9}
 
     def emit(event_type: str, when: Optional[str], attributes: Dict[str, Any],
-             suffix: str) -> None:
+             suffix: str, context: Optional[Dict[str, Any]] = None,
+             confidence: Optional[float] = None) -> None:
         events.append(common.build_event(
             event_type=event_type,
             event_time=when,
             natural_key=(session_id, suffix),
             attributes=attributes,
             actor=actor,
-            context=current["context"],
+            context=context if context is not None else current["context"],
             agent=agent,
             # `heuristic` 0.9, not `explicit`: the request is a real record,
             # but nothing in it names a run, and the repository is resolved
             # from where the window happened to be open. 0.5 where the ticket
             # came from the prompt rather than the branch -- see `scan_for_key`.
-            link=common.make_link("heuristic", current["confidence"]),
+            link=common.make_link(
+                "heuristic",
+                current["confidence"] if confidence is None else confidence),
             trace_id=session_id,
             # No run: VS Code chat has no run concept, and inventing one to
             # satisfy a column would manufacture a join key (AR-1). Null is
@@ -779,6 +837,32 @@ def session_events(path: str, session_id: str,
                 name = call.get("name")
                 if not isinstance(name, str) or not name:
                     continue
+                # The AIO case this call's path names, where nothing
+                # stronger already named one. Fills, never overwrites: a key
+                # the branch supplied is better evidence and stays.
+                base = current["context"] or {}
+                found = scan_tool_for_keys(call, projects)
+                fills = {k: v for k, v in found.items()
+                         if v and not base.get(k)}
+                here_ctx: Optional[Dict[str, Any]] = None
+                here_conf: Optional[float] = None
+                if fills:
+                    here_ctx = common.make_context(
+                        repo_full_name=base.get("repo_full_name"),
+                        branch_name=base.get("branch_name"),
+                        jira_issue_key=base.get("jira_issue_key"),
+                        test_case_key=(fills.get("test_case_key")
+                                       or base.get("test_case_key")),
+                        test_cycle_key=(fills.get("test_cycle_key")
+                                        or base.get("test_cycle_key")),
+                    )
+                    # 0.7: between the branch's 0.9 and a prompt mention's 0.5.
+                    # Opening `IML-TC-12893.spec.ts` is working on that case in
+                    # a way that naming it in prose is not -- but the assistant
+                    # may have read the file for reference rather than changed
+                    # it, and this reader cannot tell those apart. Still
+                    # `heuristic`, so still barred from the cost metrics.
+                    here_conf = 0.7
                 emit("tool.call", when, {
                     "tool_name": name,
                     "tool_kind": TOOL_KINDS.get(name, "other"),
@@ -788,7 +872,8 @@ def session_events(path: str, session_id: str,
                     "status": None,
                     "duration_ms": None,
                     "error_class": None,
-                }, "tool:{}:{}".format(request_id, position))
+                }, "tool:{}:{}".format(request_id, position),
+                    context=here_ctx, confidence=here_conf)
                 position += 1
 
     return events
@@ -802,7 +887,8 @@ def to_events(root: Optional[str] = None,
     root = root or default_root()
     if not root or not os.path.isdir(os.path.join(root, "workspaceStorage")):
         return {"present": False, "root": root, "events": [], "sessions": 0,
-                "requests": 0, "coverage": coverage(0, 0, 0)}
+                "requests": 0, "coverage": coverage(0, 0, 0),
+                "key_capture": key_capture([])}
 
     events: List[Dict[str, Any]] = []
     sessions = with_requests = 0
@@ -834,7 +920,51 @@ def to_events(root: Optional[str] = None,
             sessions, with_requests,
             sum(1 for e in events if e["event_type"] == "model.call"
                 and e["attributes"].get("input_tokens") is not None)),
+        "key_capture": key_capture(events),
     }
+
+
+def key_capture(events: List[Dict[str, Any]]) -> Dict[str, Any]:
+    """How often each route actually named something. Published every run.
+
+    Measured 2026-08-26, all three routes were at or near zero and nobody knew
+    for weeks: 0 of 82 branch names carried a Jira key, 1 prompt in 5,036 named
+    any ticket, and the path route did not exist yet. A capture rate nobody
+    prints is a zero somebody rediscovers in a report, so this prints it.
+
+    On this surface `link.confidence` *is* the route tag, because each route
+    sets exactly one value and nothing else writes them: **0.9** the branch,
+    **0.7** a tool-call path, **0.5** a key named in the prompt. An event at
+    0.9 carrying no key at all is the common case and is counted under
+    `named_nothing`, not under the branch -- the branch was consulted and had
+    no answer, which is a different fact from the branch not being consulted.
+    """
+    routes = {0.9: "branch", 0.7: "path", 0.5: "prompt"}
+    out: Dict[str, Any] = {
+        "events": len(events),
+        "with_branch_name": 0,
+        "with_jira_issue_key": 0,
+        "with_test_case_key": 0,
+        "with_test_cycle_key": 0,
+        "by_route": {name: 0 for name in routes.values()},
+        "named_nothing": 0,
+    }
+    for event in events:
+        context = event.get("context") or {}
+        if context.get("branch_name"):
+            out["with_branch_name"] += 1
+        keyed = False
+        for field in ("jira_issue_key", "test_case_key", "test_cycle_key"):
+            if context.get(field):
+                out["with_" + field] += 1
+                keyed = True
+        if not keyed:
+            out["named_nothing"] += 1
+            continue
+        route = routes.get((event.get("link") or {}).get("confidence"))
+        if route:
+            out["by_route"][route] += 1
+    return out
 
 
 def coverage(sessions: int, with_requests: int,

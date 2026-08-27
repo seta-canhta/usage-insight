@@ -97,6 +97,31 @@ Jira scan, so an unconfigured reader cannot mint one either. The allow-list
 applies to the project prefix here by the same rule: `NOPE-TC-5` yields
 nothing. AR-1 does not care which vocabulary is being fabricated.
 
+**How they get filled on the chat surface — added 0.9.0.** Three routes, and
+`link.confidence` says which one answered: **0.9** the branch, **0.7** the path
+of a file a tool call opened or edited, **0.5** a key named in the prompt. Each
+fills only what the one above it left empty, so a weaker signal can turn a NULL
+into a key and can never move a key that already existed.
+
+The path route is the only one that needs nobody to type anything, and it is
+the same route `test_case_keys` takes on the Bitbucket side (§3 rows 17–18) —
+there from the file names a pull request changed, here from the file the
+assistant actually touched. **Measured 2026-08-27** on the August pull of
+`aeriscom/wt-playwrite-taf`: the repository does name spec files after cases —
+41 distinct `IML-TC-*` keys — but only **2 of 36** merged pull requests carried
+one. It is a thin signal and must be reported as one; it does not make
+case-level attribution work.
+
+**Only the AIO keys are read from a path, never `jira_issue_key`.** A directory
+component is exactly the shape that minted `AUG-25` from `fix/AUG-25`. The AIO
+prefixes are narrower and the allow-list still applies. AR-1.
+
+**The path is read and dropped.** `cli/vscode_read.py` names the argument keys
+it looks at (`filePath`, `path`, `uri`) rather than the `arguments` object,
+because `content` — the file the model just wrote — sits in that same object.
+Naming keys is a projection; reading `arguments` would be a blanket, and a
+blanket over a dict that contains the source is how content ships.
+
 **No schema bump.** `collector/main.py:_subset` builds the context block from
 its own declared field list, so a client that predates these fields yields
 NULLs and one that carries them is read. An older client stays valid — which is
@@ -120,6 +145,14 @@ what lets a fleet upgrade over a working day rather than all at once.
 | `confidence` | float | ✓ | 0.0–1.0. `explicit` ⇒ 1.0 |
 
 **Rule:** only `method='explicit'` rows may be used for cost-per-output metrics.
+
+**On `confidence`, for `heuristic` rows from the chat surface.** The value is
+not a mood: each key-resolution route sets exactly one, and nothing else
+writes them — 0.9 branch, 0.7 tool-call path, 0.5 prompt mention (§2.2). That
+makes the field readable as *which route answered*, which is what
+`vscode_read.key_capture` counts and publishes on every run. An event at 0.9
+carrying no key at all means the branch was consulted and had nothing, which
+is a different fact from a route not having been tried.
 
 **Poller events carry `run_id = null` unless the commit carries an `AI-Run-Id` trailer.**
 Never synthesise a `run_id` to force a join — that manufactures a join key and breaches
