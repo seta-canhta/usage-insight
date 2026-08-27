@@ -168,6 +168,22 @@ class ChangeColumnTests(unittest.TestCase):
         self.assertEqual(ws.cell(row=1, column=4 + len(weeks) + 1).value,
                          "W32->W34")
 
+    def test_an_empty_pull_renders_rather_than_dividing_by_zero(self):
+        """No test-cycle events must not crash, and must not read as 0%.
+
+        Absent is not zero -- "0% automated" is the most damaging possible way
+        to render a source that simply was not pulled.
+        """
+        import openpyxl
+        wb = openpyxl.Workbook()
+        weeks = ["2026-W32", "2026-W33"]
+        data = sheets.collect([], PEOPLE, weeks, PRICES)
+        sheets.render(wb, data, weeks, weeks, {})
+        text = " ".join(str(c.value) for row in wb["Start Here"].iter_rows()
+                        for c in row if c.value)
+        self.assertIn("not measured", text)
+        self.assertNotIn("0.0%", text)
+
     def test_full_weeks_outside_the_span_are_refused(self):
         with self.assertRaises(SystemExit):
             sheets.main(["nonexistent.xlsx", "--person", "A=1",

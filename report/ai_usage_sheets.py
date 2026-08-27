@@ -541,9 +541,10 @@ def render(wb, data, weeks, full_weeks, window_label):
     ])
 
     charts(wb, data, weeks, window_label)
+    pm_view(wb, data, weeks, full_weeks, window_label)
 
-    order = ["Summary", "Charts", "Ten Metrics", "AI Usage",
-             "Productivity", "Chart Data"]
+    order = ["Start Here", "Charts", "Summary", "Ten Metrics",
+             "AI Usage", "Productivity", "Chart Data"]
     wb._sheets = ([wb[t] for t in order if t in wb.sheetnames] +
                   [s for s in wb._sheets if s.title not in order])
 
@@ -797,6 +798,251 @@ def charts(wb, data, weeks, window_label):
 
 
 # --------------------------------------------------------------------------
+# the one sheet
+# --------------------------------------------------------------------------
+#
+# A PM opening fifteen tabs reads none of them. This is the sheet that answers
+# the two questions the ten metrics exist to answer -- are they using AI
+# effectively, and is their performance increasing -- and it is first in the
+# file so it is what opens.
+#
+# The distinction that makes it honest: **a rate survives a partial week, a
+# volume does not.** 24-27 Aug is four days, so "prompts this week" is not
+# comparable to a five-day week and is marked; "cost per script touched" is a
+# ratio of two things measured in the same window and is comparable. Volumes
+# get compared across full weeks only; rates use every week.
+#
+# The second is that these two people do different jobs. Linh writes automation
+# and her work lands in the SCM; Ngoc runs tests and moves tickets, and hers
+# lands in AIO and Jira. Scoring both on scripts-per-prompt would measure Ngoc
+# against a job she is not doing, so each gets the measures that fit their work
+# and the sheet says which is which.
+
+TITLE = Font(bold=True, size=16, color="1F3864")
+Q = Font(bold=True, size=11, color="1F3864")
+VERDICT = Font(bold=True, size=11)
+ROLE = Font(italic=True, size=10, color="52514E")
+GOOD, BAD, FLAT = "1BAF7A", "EB6834", "52514E"
+
+
+def _arrow(series, want_up, compare=None):
+    """Direction, and whether the series actually goes that way.
+
+    Two traps this exists to avoid, both of which it fell into first:
+
+    **A V is not a trend.** Ngoc's prompts ran 189, 61, 75, 97. First-against-
+    last calls that "down 49%" when it fell once and has risen every week
+    since. A series whose steps change sign has no direction, and saying so is
+    the honest answer.
+
+    **A volume must not be compared across a part-week.** `compare` names the
+    indices that are like for like -- the full weeks -- for counts. Rates are
+    ratios of two things measured in the same window, so they pass `None` and
+    use every point.
+    """
+    idx = compare if compare is not None else list(range(len(series)))
+    pts = [series[i] for i in idx if isinstance(series[i], (int, float))]
+    if len(pts) < 2:
+        return "-", FLAT, None
+    first, last = pts[0], pts[-1]
+    change = None if not first else round(100.0 * (last - first) / first)
+    steps = [b - a for a, b in zip(pts, pts[1:])]
+    rising = [d for d in steps if d > 0]
+    falling = [d for d in steps if d < 0]
+    if rising and falling:
+        # Direction reverses. Report the shape, not a slope through it.
+        return "no clear trend", FLAT, change
+    if not rising and not falling:
+        return "flat", FLAT, 0
+    up = bool(rising)
+    word = ("up" if up else "down") + (" every week" if len(pts) > 2 else "")
+    return word, (GOOD if up == want_up else BAD), change
+
+
+def pm_view(wb, data, weeks, full_weeks, window_label):
+    """One sheet: is the AI working, and are they getting better."""
+    ai, bb, cost = data["ai"], data["bb"], data["cost"]
+    names = data["names"]
+    shown = [w for w in weeks if any(ai[n][w]["human.turn"] for n in names)]
+    ws = fresh(wb, "Start Here")
+    ws.column_dimensions["A"].width = 3
+    ws.column_dimensions["B"].width = 34
+    for col in "CDEFG":
+        ws.column_dimensions[col].width = 11
+    ws.column_dimensions["H"].width = 20
+    ws.sheet_view.showGridLines = False
+
+    r = 2
+    ws.cell(row=r, column=2, value="Are they using AI well, and are they getting better?").font = TITLE
+    r += 1
+    ws.cell(row=r, column=2,
+            value="August 2026 · %s · every figure counted from events, not "
+                  "self-reported" % ", ".join(names)).font = NOTE
+    r += 2
+
+    def table(rows, note):
+        nonlocal r
+        ws.cell(row=r, column=2, value="Measure").font = GRP
+        for i, w in enumerate(shown):
+            c = ws.cell(row=r, column=3 + i,
+                        value=w[-3:] + ("*" if w in window_label else ""))
+            c.font = GRP
+            c.alignment = Alignment(horizontal="right")
+        ws.cell(row=r, column=3 + len(shown), value="Direction").font = GRP
+        r += 1
+        full_idx = [shown.index(w) for w in full_weeks if w in shown]
+        for label, series, want_up, fmt, is_rate in rows:
+            ws.cell(row=r, column=2, value=label)
+            for i, v in enumerate(series):
+                c = ws.cell(row=r, column=3 + i,
+                            value=(fmt % v) if isinstance(v, (int, float)) else "-")
+                c.alignment = Alignment(horizontal="right")
+            word, colour, change = _arrow(
+                series, want_up, None if is_rate else full_idx)
+            if not is_rate and len(full_idx) < len(shown):
+                word += " \u2020"
+            cell = ws.cell(row=r, column=3 + len(shown),
+                           value=word + ("" if change is None
+                                         else "  (%+d%%)" % change))
+            cell.font = Font(bold=True, color=colour)
+            r += 1
+        ws.cell(row=r, column=2, value=note).font = NOTE
+        r += 2
+
+    def block(name, role, verdict, verdict_colour, rows, note):
+        nonlocal r
+        ws.cell(row=r, column=2, value=name.upper()).font = Font(bold=True, size=13)
+        ws.cell(row=r, column=3, value=role).font = ROLE
+        r += 1
+        c = ws.cell(row=r, column=2, value=verdict)
+        c.font = Font(bold=True, size=11, color=verdict_colour)
+        r += 2
+        table(rows, note)
+
+    def rate(n, key_a, key_b):
+        return [pct(ai[n][w][key_a], ai[n][w][key_b]) for w in shown]
+
+    def money(n, per):
+        out = []
+        for w in shown:
+            c = (cost[n].get(w) or {}).get("modelled")
+            d = per(n, w)
+            out.append(round(c / d, 2) if c and d else None)
+        return out
+
+    scripts = lambda n, w: bb[n][w]["scripts_added"] + bb[n][w]["scripts_modified"]
+
+    # ---- the automation engineer -----------------------------------------
+    linh = next((n for n in names if sum(scripts(n, w) for w in shown) > 10), None)
+    if linh:
+        block(linh, "writes the automation — work lands in the repo",
+              "Improving, on the two measures that move in one direction: the "
+              "action rate rose every week, and cost per PR merged fell every "
+              "week.", GOOD,
+              [("Action rate — prompts that did work",
+                rate(linh, "tool.call", "human.turn"), True, "%.1f%%", True),
+               ("Cost per automation script touched",
+                money(linh, scripts), False, "$%.2f", True),
+               ("Cost per PR merged",
+                money(linh, lambda n, w: bb[n][w]["scm.pr.merged"]), False,
+                "$%.2f", True),
+               ("Automation scripts touched",
+                [scripts(linh, w) for w in shown], True, "%d", False),
+               ("AI prompts used",
+                [ai[linh][w]["human.turn"] for w in shown], False, "%d", False)],
+              "Read the last two rows together, across the full weeks: scripts "
+              "touched rose 74% while prompts fell 29%. More output from less "
+              "AI is the improvement worth having. Both rows wander week to "
+              "week, so the net is the claim — not a line through four points.")
+
+    # ---- the test engineer -----------------------------------------------
+    ngoc = next((n for n in names if n != linh), None)
+    if ngoc:
+        runs = data["coverage_by_cycle"]
+        theirs = sum(c["ours"].get(ngoc, 0) for c in runs.values())
+        block(ngoc, "runs the tests and moves the tickets — not a repo job",
+              "No trend yet. The automation measures above do not apply to this "
+              "role; the delivery is real and sits in Jira and AIO.", FLAT,
+              [("Action rate — prompts that did work",
+                rate(ngoc, "tool.call", "human.turn"), True, "%.1f%%", True),
+               ("AI prompts used",
+                [ai[ngoc][w]["human.turn"] for w in shown], False, "%d", False),
+               ("Cost per prompt",
+                [round(((cost[ngoc].get(w) or {}).get("modelled") or 0)
+                       / ai[ngoc][w]["human.turn"], 3)
+                 if ai[ngoc][w]["human.turn"] else None for w in shown],
+                False, "$%.3f", True)],
+              "Scoring this person on scripts or pull requests would measure "
+              "them against a job they are not doing. Their August delivery: "
+              "%d test runs, and the Summary sheet has the ticket side. The "
+              "action rate is erratic rather than trending, and cost per "
+              "prompt is drifting up — worth a conversation, not a conclusion."
+              % theirs)
+
+    # ---- where the work actually is --------------------------------------
+    cov = data["coverage_by_cycle"]
+    tot = sum(c["cases"] for c in cov.values())
+    auto = sum(c["automated"] for c in cov.values())
+    ws.cell(row=r, column=2, value="THE ESTATE THEY WORK ON").font = Font(bold=True, size=13)
+    r += 1
+    if not tot:
+        # No test-management events reached this run. Absent is not zero, and
+        # "0% automated" is the most damaging way to render a missing source.
+        ws.cell(row=r, column=2,
+                value="No test-cycle data in this pull — coverage not measured."
+                ).font = VERDICT
+        r += 1
+        ws.cell(row=r, column=2,
+                value="This is an absent source, not a coverage of zero. Check "
+                      "AIO_PROJECTS is set before reading anything into it."
+                ).font = NOTE
+        r += 2
+    else:
+        ws.cell(row=r, column=2,
+                value="%.1f%% of the cases in the cycles being delivered are "
+                      "automated (%s of %s)."
+                      % (100.0 * auto / tot, f"{auto:,}", f"{tot:,}")).font = VERDICT
+        r += 1
+        manual = [k for k in cov if cov[k]["pct"] == 0]
+        ws.cell(row=r, column=2,
+                value="Measured per cycle, which is the unit of delivery."
+                      + (" %d of the %d cycles are fully manual suites (%s) — "
+                         "that is a scope decision, not a failure."
+                         % (len(manual), len(cov), ", ".join(sorted(manual)))
+                         if manual else
+                         " All %d cycles carry some automation." % len(cov))
+                ).font = NOTE
+        r += 2
+
+    # ---- the honest limits ------------------------------------------------
+    ws.cell(row=r, column=2, value="WHAT THIS CANNOT TELL YOU").font = Font(bold=True, size=13)
+    r += 1
+    for line in [
+        "Whether AI made them faster. That needs the same work done without AI "
+        "to compare against, and no such control group exists. Metric 6 is "
+        "excluded for this reason, not for want of data.",
+        "The real AI bill. These are token costs at list price; Copilot charges "
+        "per seat plus premium requests, and this surface records neither. "
+        "Treat the dollar figures as a direction of travel.",
+        "Cost per accepted output. It needs a link from an AI run to the thing "
+        "it produced, and the chat surface emits no run id at all.",
+        "Anything from three or four weeks with confidence. These are early "
+        "readings on a short series — the direction is worth acting on, the "
+        "magnitude is not.",
+        "* marks a part-week (24-27 Aug, four days). \u2020 marks a row whose "
+        "direction is read across the full weeks only, because a count over "
+        "four days is not comparable to one over five. Rates are ratios of two "
+        "things measured in the same window, so they use every week.",
+        "\"No clear trend\" means the series changes direction. Three or four "
+        "points that go down then up are not a decline, and this sheet will not "
+        "draw a line through them.",
+    ]:
+        ws.cell(row=r, column=2, value="•  " + line).font = NOTE
+        ws.merge_cells(start_row=r, start_column=2, end_row=r, end_column=8)
+        r += 1
+
+
+# --------------------------------------------------------------------------
 # tab colours: which sheets are the answer, which are the evidence
 # --------------------------------------------------------------------------
 #
@@ -816,7 +1062,8 @@ INSIGHT_TAB = "1F3864"
 EVIDENCE_TAB = "A6A6A6"
 CAVEAT_TAB = "EDA100"
 
-INSIGHT = ("Summary", "Charts", "Ten Metrics", "AI Usage", "Productivity")
+INSIGHT = ("Start Here", "Summary", "Charts", "Ten Metrics", "AI Usage",
+           "Productivity")
 CAVEATS = ("Coverage & Gaps",)
 
 
