@@ -2,39 +2,33 @@
 
 Working checklist, not documentation. Delete a line when it is done.
 
-## Deploy v0.5.0 — done 2026-08-27, except the wait
+## Deploy — done 2026-08-27
 
-The endpoint serves **0.5.0**. `/install.json` reports version 0.5.0 and the
-digest of `insight-0.5.0.pyz`; `/healthz` 200; `insight-proxy` healthy;
-`insight-watch` completed a cycle after the restart.
+Endpoint serves **0.6.0**. `/install.json` carries the digest of
+`insight-0.6.0.pyz`, which matches the local build byte for byte; `/healthz`
+200; `/update` returns the same bytes as `/install`; `insight-proxy` healthy.
 
-What was done, on `future` (`/home/ubuntu/aeris-insight`, compose project
-`aeris-insight`):
+Project **WatchtowerQD** = `AERLABS, APR, IML, IOTA3` →
+`linh.hoang@aeris.net`, `ngoc.nguyen@aeris.net`. Verified against production
+with a throwaway address: a member enrolling receives all four boards, a
+rostered non-member receives `[]`. Probe removed, no residue.
 
-- [x] **1. Redeployed.** `git archive v0.5.0` into `src/` (old tree kept as
-      `src.old-20260827-0221`), the release `install.sh` into `etc/`
-      (sha256 `708c955a…`, matching the release asset; old one kept beside it),
-      then `docker compose -p aeris-insight --project-directory . -f
-      src/server/compose.yaml --env-file .env up -d --build`.
-      `INSIGHT_PROJECTS_FILE` needed no `.env` edit — it is in `compose.yaml`.
-- [x] **2. Project defined.** `WatchtowerQD` → `AERLABS, APR, IML` →
-      `linh.hoang@aeris.net, ngoc.nguyen@aeris.net`. `registry/projects.env`
-      holds one line and both addresses were already on the roster.
-- [x] **3. Verified both directions** with a throwaway `probe.deploy@aeris.net`:
-      rostered but in no project returned `"jira_projects": []`; added to the
-      project and re-enrolled after a `reset` it returned
-      `["AERLABS","APR","IML"]`. Probe removed, membership restored, no probe
-      bundles on the store.
-- [ ] **4. Confirm the fleet self-repairs.** Nothing more to push — a laptop
-      takes no inbound commands. Expect up to **~25 hours**, not one: the
-      self-update check in `cli/update.py` is throttled to
-      `CHECK_INTERVAL = 24 * 3600`, and the swapped archive only takes effect
-      on the *next* `insight auto`, which is hourly. So: update check → up to
-      24 h; upgrade lands → next hour; that run re-enrols, because `cmd_auto`
-      re-enrols while `config["jira_projects"]` is empty.
-      Check by watching `docker logs insight-proxy` for `"event": "enrolled"`
-      from the two real addresses, then check a later bundle carries real keys
-      or none — never `AUG-25`.
+Verified live on a sandbox install from `/update`: 0.6.0 installs on stock
+macOS python 3.9.6, and `pack --since 2026-08-19 --until 2026-09-01` produced
+three bundles filed under W34, W35 and W36. The same range as one bundle would
+have gone to W31.
+
+- [ ] **IOTA3 is unverified.** It was added on the user's word, which is the
+      intended way to fill an allow-list — AR-1 is about not *deriving* keys
+      from strings. But the Atlassian account reachable from here is
+      `all-it.atlassian.net`, which holds neither IOTA3 nor IML, so it is not
+      the pilot's Jira and nothing was checked against the real site. Worth one
+      look by somebody who can see it.
+- [ ] **Wait for the fleet.** Both laptops were on 0.4.0. The update check is
+      now hourly rather than daily, so a machine that gets used should be on
+      0.6.0 within about two hours of use — but nothing can be pushed, and a
+      machine nobody opens stays behind. Watch `docker logs insight-proxy` for
+      `"event": "enrolled"` from the two real addresses.
 
 ## Re-collect the laptop data
 
@@ -43,8 +37,9 @@ invented keys. Measured 2026-08-26: `fix/AUG-25` became ticket `AUG-25` on 28
 of 28 of Linh's events; a Bitbucket export held 45 fabricated keys against 9
 real ones.
 
-- [ ] After step 4 above shows both laptops on 0.5.0, have Ngoc and Linh run
-      `insight backfill --since 2026-08-01`.
+- [ ] Once both laptops report 0.6.0, have Ngoc and Linh run
+      `insight backfill --since 2026-08-01`. It now produces one bundle per
+      ISO week, so W31-W35 each land in their own folder.
 - [ ] Re-pull W34 and regenerate the report; the current
       `reports/2026-W34/exports/` was repaired by hand (originals in
       `superseded/`).
